@@ -1,16 +1,14 @@
 mod password_file;
 mod relay;
+mod viewer;
 
 use std::{
-    fmt, fs, io,
+    fmt,
     path::Path,
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 use thiserror::Error;
 use tokio::{
@@ -26,8 +24,11 @@ use crate::{
     ssh::{ProxyTicket, TrustedSshProxy},
 };
 
+#[cfg(test)]
+use password_file::PasswordFilePolicy;
 use password_file::VncPasswordFile;
 use relay::RelayPolicy;
+use viewer::{ViewerSnapshot, ViewerSnapshotError, ViewerSnapshotPolicy};
 
 const FALLBACK_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -43,6 +44,7 @@ pub struct FallbackPreferences {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FallbackErrorKind {
     ViewerPath,
+    ViewerSnapshot,
     PasswordFile,
     Listener,
     ViewerSpawn,
@@ -232,13 +234,18 @@ impl Drop for FallbackSession {
             if let Some(cancel) = self.cancel.take() {
                 let _ = cancel.send(Instant::now() + self.close_timeout);
             }
-            self.task.take();
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
         }
     }
 }
 
 struct OpenPolicy {
     relay: RelayPolicy,
+    viewer_snapshot: ViewerSnapshotPolicy,
+    #[cfg(test)]
+    password_file: PasswordFilePolicy,
     close_timeout: Duration,
     #[cfg(test)]
     bound: Option<oneshot::Sender<std::net::SocketAddr>>,
@@ -252,6 +259,9 @@ impl OpenPolicy {
     fn production() -> Self {
         Self {
             relay: RelayPolicy::production(FALLBACK_CLOSE_TIMEOUT),
+            viewer_snapshot: ViewerSnapshotPolicy::production(),
+            #[cfg(test)]
+            password_file: PasswordFilePolicy::production(),
             close_timeout: FALLBACK_CLOSE_TIMEOUT,
             #[cfg(test)]
             bound: None,
@@ -274,23 +284,45 @@ async fn open_with_parts<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    if let Err(error) = validate_viewer_path(viewer_path) {
-        drop(ticket);
-        let deadline = Instant::now() + policy.close_timeout;
-        return Err(with_open_cleanup(
-            error,
-            relay::close_proxy(&mut proxy, deadline).await,
-        ));
-    }
+    let mut viewer_snapshot =
+        match ViewerSnapshot::create(runtime, viewer_path, policy.viewer_snapshot) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                drop(ticket);
+                let primary = fallback_snapshot_error(&error);
+                drop(error);
+                let deadline = Instant::now() + policy.close_timeout;
+                return Err(with_open_cleanup(
+                    primary,
+                    relay::close_proxy(&mut proxy, deadline).await,
+                ));
+            }
+        };
 
-    let mut password_file = match VncPasswordFile::create(runtime, ticket) {
+    #[cfg(test)]
+    let password_file_result =
+        VncPasswordFile::create_with_policy(runtime, ticket, policy.password_file);
+    #[cfg(not(test))]
+    let password_file_result = VncPasswordFile::create(runtime, ticket);
+    let mut password_file = match password_file_result {
         Ok(file) => file,
-        Err(_) => {
+        Err(mut password_error) => {
             let deadline = Instant::now() + policy.close_timeout;
-            let cleanup = relay::close_proxy(&mut proxy, deadline).await;
-            return Err(with_open_cleanup(
+            let cleanup_failed_before_retry = password_error.has_cleanup_failure();
+            let retry_cleanup = password_error.retry_cleanup();
+            let password_cleanup = if cleanup_failed_before_retry || retry_cleanup.is_err() {
+                Err(())
+            } else {
+                Ok(())
+            };
+            drop(password_error);
+            let snapshot_cleanup = viewer_snapshot.remove();
+            let proxy_cleanup = relay::close_proxy(&mut proxy, deadline).await;
+            return Err(with_three_open_cleanups(
                 FallbackError::new(FallbackErrorKind::PasswordFile),
-                cleanup,
+                password_cleanup,
+                snapshot_cleanup,
+                proxy_cleanup,
             ));
         }
     };
@@ -304,10 +336,12 @@ where
         Err(_) => {
             let deadline = Instant::now() + policy.close_timeout;
             let password_cleanup = password_file.remove().map_err(|_| ());
+            let snapshot_cleanup = viewer_snapshot.remove();
             let proxy_cleanup = relay::close_proxy(&mut proxy, deadline).await;
-            return Err(with_two_open_cleanups(
+            return Err(with_three_open_cleanups(
                 FallbackError::new(FallbackErrorKind::Listener),
                 password_cleanup,
+                snapshot_cleanup,
                 proxy_cleanup,
             ));
         }
@@ -318,26 +352,35 @@ where
             drop(listener);
             let deadline = Instant::now() + policy.close_timeout;
             let password_cleanup = password_file.remove().map_err(|_| ());
+            let snapshot_cleanup = viewer_snapshot.remove();
             let proxy_cleanup = relay::close_proxy(&mut proxy, deadline).await;
-            return Err(with_two_open_cleanups(
+            return Err(with_three_open_cleanups(
                 FallbackError::new(FallbackErrorKind::Listener),
                 password_cleanup,
+                snapshot_cleanup,
                 proxy_cleanup,
             ));
         }
     };
     let endpoint = format!("127.0.0.1::{}", address.port());
-    let viewer = spawn_viewer(viewer_path, password_file.path(), &endpoint, preferences);
+    let viewer = spawn_viewer(
+        viewer_snapshot,
+        password_file.path(),
+        &endpoint,
+        preferences,
+    );
     let viewer = match viewer {
         Ok(viewer) => viewer,
-        Err(_) => {
+        Err(mut viewer_snapshot) => {
             drop(listener);
             let deadline = Instant::now() + policy.close_timeout;
             let password_cleanup = password_file.remove().map_err(|_| ());
+            let snapshot_cleanup = viewer_snapshot.remove();
             let proxy_cleanup = relay::close_proxy(&mut proxy, deadline).await;
-            return Err(with_two_open_cleanups(
+            return Err(with_three_open_cleanups(
                 FallbackError::new(FallbackErrorKind::ViewerSpawn),
                 password_cleanup,
+                snapshot_cleanup,
                 proxy_cleanup,
             ));
         }
@@ -349,7 +392,7 @@ where
     }
     #[cfg(test)]
     if let Some(viewer_pid) = policy.viewer_pid.take() {
-        if let Some(pid) = viewer.id() {
+        if let Some(pid) = viewer.child.id() {
             let _ = viewer_pid.send(pid);
         }
     }
@@ -358,11 +401,9 @@ where
     let close_timeout = policy.close_timeout;
     let terminal = Arc::new(Mutex::new(None));
     let task_terminal = Arc::clone(&terminal);
-    #[cfg(test)]
-    ACTIVE_OWNER_TASKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let task = tokio::spawn(async move {
         #[cfg(test)]
-        let _owner_guard = OwnerTaskGuard;
+        let _owner_guard = OwnerTaskGuard::enter();
         let result = relay::run(
             listener,
             viewer,
@@ -386,36 +427,40 @@ where
 }
 
 fn validate_viewer_path(viewer_path: &Path) -> Result<(), FallbackError> {
-    if !viewer_path.is_absolute() {
-        return Err(FallbackError::new(FallbackErrorKind::ViewerPath));
-    }
-    let metadata =
-        fs::metadata(viewer_path).map_err(|_| FallbackError::new(FallbackErrorKind::ViewerPath))?;
-    if !metadata.is_file() {
-        return Err(FallbackError::new(FallbackErrorKind::ViewerPath));
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o111 == 0 {
-        return Err(FallbackError::new(FallbackErrorKind::ViewerPath));
-    }
-    Ok(())
+    viewer::validate_viewer_path(viewer_path).map_err(|error| fallback_snapshot_error(&error))
+}
+
+struct OwnedViewer {
+    // Field order is intentional: kill-on-drop is invoked before the snapshot
+    // cleanup guard removes the interpreter-visible executable path.
+    child: Child,
+    snapshot: ViewerSnapshot,
 }
 
 fn spawn_viewer(
-    viewer_path: &Path,
+    snapshot: ViewerSnapshot,
     password_path: &Path,
     endpoint: &str,
     preferences: FallbackPreferences,
-) -> io::Result<Child> {
-    let mut command = tokio::process::Command::new(viewer_path);
+) -> Result<OwnedViewer, ViewerSnapshot> {
+    let mut command = tokio::process::Command::new(snapshot.path());
     command
         .args(viewer_arguments(password_path, endpoint, preferences))
-        .env_remove("LC_PVE_TICKET")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    for variable in ["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"] {
+        if let Some(value) = std::env::var_os(variable) {
+            command.env(variable, value);
+        }
+    }
+    match command.spawn() {
+        Ok(child) => Ok(OwnedViewer { child, snapshot }),
+        Err(_) => Err(snapshot),
+    }
 }
 
 fn viewer_arguments(
@@ -448,12 +493,27 @@ fn with_open_cleanup(error: FallbackError, cleanup: Result<(), ()>) -> FallbackE
     }
 }
 
-fn with_two_open_cleanups(
+fn fallback_snapshot_error(snapshot_error: &ViewerSnapshotError) -> FallbackError {
+    let kind = if snapshot_error.is_source() {
+        FallbackErrorKind::ViewerPath
+    } else {
+        FallbackErrorKind::ViewerSnapshot
+    };
+    let error = FallbackError::new(kind);
+    if snapshot_error.has_cleanup_failure() {
+        error.with_cleanup_failure()
+    } else {
+        error
+    }
+}
+
+fn with_three_open_cleanups(
     error: FallbackError,
     first: Result<(), ()>,
     second: Result<(), ()>,
+    third: Result<(), ()>,
 ) -> FallbackError {
-    if first.is_err() || second.is_err() {
+    if first.is_err() || second.is_err() || third.is_err() {
         error.with_cleanup_failure()
     } else {
         error
@@ -462,6 +522,14 @@ fn with_two_open_cleanups(
 
 #[cfg(test)]
 struct OwnerTaskGuard;
+
+#[cfg(test)]
+impl OwnerTaskGuard {
+    fn enter() -> Self {
+        ACTIVE_OWNER_TASKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
 
 #[cfg(test)]
 impl Drop for OwnerTaskGuard {
@@ -493,13 +561,15 @@ mod tests {
     use tokio::{
         io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
         net::TcpStream,
+        process::Command as TokioCommand,
         sync::oneshot,
         time::{sleep, timeout},
     };
 
     use super::{
-        active_owner_tasks, open_with_parts, validate_viewer_path, viewer_arguments,
-        FallbackErrorKind, FallbackPreferences, FallbackSession, OpenPolicy, RelayPolicy,
+        active_owner_tasks, open_with_parts, password_file::PasswordFileFault,
+        validate_viewer_path, viewer::ViewerSnapshotFault, viewer_arguments, FallbackErrorKind,
+        FallbackPreferences, FallbackSession, OpenPolicy, RelayPolicy,
     };
     use crate::{
         model::{NodeName, PveProfile, SshTarget, VmId},
@@ -527,34 +597,42 @@ mod tests {
         fn new(behavior: ViewerBehavior) -> Self {
             let directory = tempdir().unwrap();
             let path = directory.path().join("synthetic-viewer");
-            let body = match behavior {
+            let template = match behavior {
                 ViewerBehavior::Hang => {
                     r#"#!/bin/sh
-printf '%s\n' "$@" > "$0.argv"
-if [ "${LC_PVE_TICKET+x}" = x ]; then printf 'present\n'; else printf 'absent\n'; fi > "$0.ticket-env"
-printf '%s\n' "$$" > "$0.pid"
+printf '%s\n' "$@" > @ARGV@
+if [ "${LC_PVE_TICKET+x}" = x ]; then printf 'present\n'; else printf 'absent\n'; fi > @TICKET_ENV@
+printf '%s\n' "$$" > @PID@
 while :; do sleep 1; done
 "#
                 }
                 ViewerBehavior::ExitImmediately => {
                     r#"#!/bin/sh
-printf '%s\n' "$@" > "$0.argv"
-if [ "${LC_PVE_TICKET+x}" = x ]; then printf 'present\n'; else printf 'absent\n'; fi > "$0.ticket-env"
-printf '%s\n' "$$" > "$0.pid"
+printf '%s\n' "$@" > @ARGV@
+if [ "${LC_PVE_TICKET+x}" = x ]; then printf 'present\n'; else printf 'absent\n'; fi > @TICKET_ENV@
+printf '%s\n' "$$" > @PID@
 exit 0
 "#
                 }
                 ViewerBehavior::ExitOnMarker => {
                     r#"#!/bin/sh
-printf '%s\n' "$@" > "$0.argv"
-if [ "${LC_PVE_TICKET+x}" = x ]; then printf 'present\n'; else printf 'absent\n'; fi > "$0.ticket-env"
-printf '%s\n' "$$" > "$0.pid"
-while [ ! -f "$0.exit" ]; do sleep 1; done
+printf '%s\n' "$@" > @ARGV@
+if [ "${LC_PVE_TICKET+x}" = x ]; then printf 'present\n'; else printf 'absent\n'; fi > @TICKET_ENV@
+printf '%s\n' "$$" > @PID@
+while [ ! -f @EXIT@ ]; do sleep 1; done
 exit 0
 "#
                 }
                 ViewerBehavior::SpawnFailure => "#!/synthetic/missing-interpreter\n",
             };
+            let body = template
+                .replace("@ARGV@", &shell_quote(&Self::artifact_path(&path, ".argv")))
+                .replace(
+                    "@TICKET_ENV@",
+                    &shell_quote(&Self::artifact_path(&path, ".ticket-env")),
+                )
+                .replace("@PID@", &shell_quote(&Self::artifact_path(&path, ".pid")))
+                .replace("@EXIT@", &shell_quote(&Self::artifact_path(&path, ".exit")));
             fs::write(&path, body).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self {
@@ -564,8 +642,23 @@ exit 0
         }
 
         fn artifact(&self, suffix: &str) -> PathBuf {
-            PathBuf::from(format!("{}{suffix}", self.path.display()))
+            Self::artifact_path(&self.path, suffix)
         }
+
+        fn artifact_path(path: &Path, suffix: &str) -> PathBuf {
+            PathBuf::from(format!("{}{suffix}", path.display()))
+        }
+    }
+
+    #[cfg(unix)]
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[cfg(unix)]
@@ -609,6 +702,31 @@ exit 0
         }
     }
 
+    struct ParentEnvironment(Vec<(String, Option<std::ffi::OsString>)>);
+
+    impl ParentEnvironment {
+        fn install(values: &[(&str, &str)]) -> Self {
+            let mut previous = Vec::with_capacity(values.len());
+            for (key, value) in values {
+                previous.push(((*key).to_owned(), std::env::var_os(key)));
+                std::env::set_var(key, value);
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for ParentEnvironment {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..).rev() {
+                if let Some(previous) = previous {
+                    std::env::set_var(key, previous);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+
     struct TestChannels {
         bound: oneshot::Receiver<std::net::SocketAddr>,
         accepted: oneshot::Receiver<()>,
@@ -629,6 +747,8 @@ exit 0
                     close_timeout,
                     accepted: Some(accepted_tx),
                 },
+                viewer_snapshot: super::viewer::ViewerSnapshotPolicy::production(),
+                password_file: super::password_file::PasswordFilePolicy::production(),
                 close_timeout,
                 bound: Some(bound_tx),
                 viewer_pid: Some(pid_tx),
@@ -691,6 +811,38 @@ exit 0
             .collect()
     }
 
+    fn executable_snapshots(runtime: &RuntimeDir) -> Vec<PathBuf> {
+        fs::read_dir(runtime.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".vnc-viewer-"))
+            })
+            .collect()
+    }
+
+    async fn assert_password_files_are_gone(runtime: &RuntimeDir) {
+        timeout(Duration::from_secs(5), async {
+            while !password_files(runtime).is_empty() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fallback password artifact remained present");
+    }
+
+    async fn assert_executable_snapshots_are_gone(runtime: &RuntimeDir) {
+        timeout(Duration::from_secs(5), async {
+            while !executable_snapshots(runtime).is_empty() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fallback executable snapshot remained present");
+    }
+
     fn exact_pid_is_alive(pid: u32) -> bool {
         Command::new("/bin/kill")
             .args(["-0", &pid.to_string()])
@@ -721,6 +873,26 @@ exit 0
         .expect("fallback owner task remained alive");
     }
 
+    async fn assert_owner_started() {
+        timeout(Duration::from_secs(5), async {
+            while active_owner_tasks() == 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fallback owner task never started");
+    }
+
+    async fn assert_port_is_closed(address: std::net::SocketAddr) {
+        timeout(Duration::from_secs(5), async {
+            while TcpStream::connect(address).await.is_ok() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exact fallback listener port remained open");
+    }
+
     fn helper_pid(path: &Path) -> u32 {
         fs::read_to_string(path).unwrap().trim().parse().unwrap()
     }
@@ -743,18 +915,239 @@ exit 0
         let non_executable = directory.path().join("not-executable");
         fs::write(&non_executable, b"fixture").unwrap();
         fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o600)).unwrap();
+        let oversized = directory.path().join("oversized-executable");
+        let oversized_file = fs::File::create(&oversized).unwrap();
+        oversized_file.set_len(64 * 1024 * 1024 + 1).unwrap();
+        drop(oversized_file);
+        fs::set_permissions(&oversized, fs::Permissions::from_mode(0o700)).unwrap();
         for rejected in [
             relative,
             missing.as_path(),
             broken.as_path(),
             directory.path(),
             non_executable.as_path(),
+            oversized.as_path(),
         ] {
             assert_eq!(
                 validate_viewer_path(rejected).unwrap_err().kind(),
                 FallbackErrorKind::ViewerPath
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opened_symlink_bytes_are_pinned_in_a_private_executable_snapshot() {
+        let _guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let directory = tempdir().unwrap();
+        let original = directory.path().join("viewer-original");
+        let replacement = directory.path().join("viewer-replacement");
+        let configured = directory.path().join("viewer-link");
+        let marker = directory.path().join("executed-marker");
+        let marker_path = shell_quote(&marker);
+        write_executable(
+            &original,
+            &format!(
+                "#!/bin/sh\nprintf 'opened-descriptor\\n' > {marker_path}\nwhile :; do sleep 1; done\n"
+            ),
+        );
+        write_executable(
+            &replacement,
+            &format!(
+                "#!/bin/sh\nprintf 'replacement-path\\n' > {marker_path}\nwhile :; do sleep 1; done\n"
+            ),
+        );
+        symlink(&original, &configured).unwrap();
+
+        let (proxy, _peer) = duplex(64);
+        let (mut policy, channels) = test_policy(Duration::from_secs(5), Duration::from_secs(1));
+        let hook_path = configured.clone();
+        let hook_replacement = replacement.clone();
+        policy.viewer_snapshot.after_open = Some(Box::new(move || {
+            fs::remove_file(&hook_path).unwrap();
+            symlink(&hook_replacement, &hook_path).unwrap();
+        }));
+        let mut session = open_test(
+            &runtime,
+            &configured,
+            proxy,
+            FallbackPreferences::default(),
+            policy,
+        )
+        .await
+        .unwrap();
+        let _address = channels.bound.await.unwrap();
+        let pid = channels.pid.await.unwrap();
+        wait_for(&marker).await;
+
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "opened-descriptor\n");
+        assert_eq!(fs::read_link(&configured).unwrap(), replacement);
+        let snapshots = executable_snapshots(&runtime);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            fs::metadata(&snapshots[0]).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+
+        session.close().await.unwrap();
+        assert_exact_pid_is_gone(pid).await;
+        assert_executable_snapshots_are_gone(&runtime).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn viewer_child_receives_only_the_fixed_minimal_environment() {
+        let _guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let directory = tempdir().unwrap();
+        let viewer = directory.path().join("environment-viewer");
+        let capture = directory.path().join("environment-capture");
+        let template = r#"#!/bin/sh
+printf '%s\n' "$PATH" "$HOME" "$TMPDIR" "$LANG" "$LC_ALL" "$LC_CTYPE" "${ROC_SYNTHETIC_SECRET-absent}" "${DYLD_INSERT_LIBRARIES-absent}" "${LD_PRELOAD-absent}" "${SSH_AUTH_SOCK-absent}" "${SSH_AGENT_PID-absent}" "${LC_PVE_TICKET-absent}" > @CAPTURE@
+while :; do sleep 1; done
+"#;
+        write_executable(
+            &viewer,
+            &template.replace("@CAPTURE@", &shell_quote(&capture)),
+        );
+        let _environment = ParentEnvironment::install(&[
+            ("PATH", "/synthetic/parent-path"),
+            ("HOME", "/synthetic/home"),
+            ("TMPDIR", "/synthetic/tmp"),
+            ("LANG", "C"),
+            ("LC_ALL", "C"),
+            ("LC_CTYPE", "C"),
+            ("ROC_SYNTHETIC_SECRET", "blocked-arbitrary"),
+            ("DYLD_INSERT_LIBRARIES", "blocked-loader"),
+            ("LD_PRELOAD", "blocked-loader"),
+            ("SSH_AUTH_SOCK", "blocked-ssh"),
+            ("SSH_AGENT_PID", "blocked-ssh"),
+            ("LC_PVE_TICKET", "blocked-ticket"),
+        ]);
+        let (proxy, _peer) = duplex(64);
+        let (policy, channels) = test_policy(Duration::from_secs(5), Duration::from_secs(1));
+        let mut session = open_test(
+            &runtime,
+            &viewer,
+            proxy,
+            FallbackPreferences::default(),
+            policy,
+        )
+        .await
+        .unwrap();
+        let _address = channels.bound.await.unwrap();
+        let pid = channels.pid.await.unwrap();
+        wait_for(&capture).await;
+        assert_eq!(
+            fs::read_to_string(&capture)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "/usr/bin:/bin",
+                "/synthetic/home",
+                "/synthetic/tmp",
+                "C",
+                "C",
+                "C",
+                "absent",
+                "absent",
+                "absent",
+                "absent",
+                "absent",
+                "absent",
+            ]
+        );
+
+        session.close().await.unwrap();
+        assert_exact_pid_is_gone(pid).await;
+        assert_executable_snapshots_are_gone(&runtime).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_setup_faults_are_typed_redacted_and_remove_the_executable() {
+        let _guard = crate::ssh::process_test_guard().await;
+        for fault in [
+            ViewerSnapshotFault::Create,
+            ViewerSnapshotFault::Write,
+            ViewerSnapshotFault::Sync,
+        ] {
+            let runtime = RuntimeDir::create().unwrap();
+            let fixture = ViewerFixture::new(ViewerBehavior::Hang);
+            let (proxy, _peer) = duplex(64);
+            let (mut policy, _channels) =
+                test_policy(Duration::from_secs(1), Duration::from_secs(1));
+            policy.viewer_snapshot.fault = Some(fault);
+            let error = open_test(
+                &runtime,
+                &fixture.path,
+                proxy,
+                FallbackPreferences::default(),
+                policy,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), FallbackErrorKind::ViewerSnapshot);
+            assert!(!error.has_cleanup_failure());
+            assert_executable_snapshots_are_gone(&runtime).await;
+            assert!(password_files(&runtime).is_empty());
+            let rendered = format!("{error:?} {error}");
+            assert!(!rendered.contains(TICKET));
+            assert!(!rendered.contains(CIPHERTEXT_HEX));
+            assert!(!rendered.contains(&runtime.path().to_string_lossy().into_owned()));
+        }
+
+        let runtime = RuntimeDir::create().unwrap();
+        let fixture = ViewerFixture::new(ViewerBehavior::Hang);
+        let (proxy, _peer) = duplex(64);
+        let (mut policy, _channels) = test_policy(Duration::from_secs(1), Duration::from_secs(1));
+        policy.viewer_snapshot.fault = Some(ViewerSnapshotFault::Write);
+        policy.viewer_snapshot.remove_failures = 1;
+        let error = open_test(
+            &runtime,
+            &fixture.path,
+            proxy,
+            FallbackPreferences::default(),
+            policy,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), FallbackErrorKind::ViewerSnapshot);
+        assert!(error.has_cleanup_failure());
+        assert_executable_snapshots_are_gone(&runtime).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn password_setup_cleanup_failure_propagates_and_raii_retry_removes_artifact() {
+        let _guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let fixture = ViewerFixture::new(ViewerBehavior::Hang);
+        let (proxy, _peer) = duplex(64);
+        let (mut policy, _channels) = test_policy(Duration::from_secs(1), Duration::from_secs(1));
+        policy.password_file.fault = Some(PasswordFileFault::WriteAfter(3));
+        policy.password_file.remove_failures = 1;
+
+        let error = open_test(
+            &runtime,
+            &fixture.path,
+            proxy,
+            FallbackPreferences::default(),
+            policy,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), FallbackErrorKind::PasswordFile);
+        assert!(error.has_cleanup_failure());
+        assert_password_files_are_gone(&runtime).await;
+        assert_executable_snapshots_are_gone(&runtime).await;
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(TICKET));
+        assert!(!rendered.contains(CIPHERTEXT_HEX));
+        assert!(!rendered.contains(&runtime.path().to_string_lossy().into_owned()));
     }
 
     #[test]
@@ -873,7 +1266,7 @@ exit 0
         drop(viewer);
         drop(proxy_peer);
         completed(&mut session).await.unwrap();
-        assert!(password_files(&runtime).is_empty());
+        assert_password_files_are_gone(&runtime).await;
         assert_exact_pid_is_gone(pid).await;
         assert_owner_is_gone().await;
     }
@@ -957,7 +1350,8 @@ exit 0
         .await
         .unwrap_err();
         assert_eq!(error.kind(), FallbackErrorKind::ViewerSpawn);
-        assert!(password_files(&runtime).is_empty());
+        assert_password_files_are_gone(&runtime).await;
+        assert_executable_snapshots_are_gone(&runtime).await;
         assert_eq!(active_owner_tasks(), 0);
 
         let runtime = RuntimeDir::create().unwrap();
@@ -976,7 +1370,8 @@ exit 0
         let pid = channels.pid.await.unwrap();
         let error = completed(&mut session).await.unwrap_err();
         assert_eq!(error.kind(), FallbackErrorKind::ViewerExitedBeforeConnect);
-        assert!(password_files(&runtime).is_empty());
+        assert_password_files_are_gone(&runtime).await;
+        assert_executable_snapshots_are_gone(&runtime).await;
         assert_exact_pid_is_gone(pid).await;
 
         let runtime = RuntimeDir::create().unwrap();
@@ -996,6 +1391,7 @@ exit 0
         let error = completed(&mut session).await.unwrap_err();
         assert_eq!(error.kind(), FallbackErrorKind::AcceptTimedOut);
         assert!(password_files(&runtime).is_empty());
+        assert_executable_snapshots_are_gone(&runtime).await;
         assert_exact_pid_is_gone(pid).await;
 
         let runtime = RuntimeDir::create().unwrap();
@@ -1019,6 +1415,7 @@ exit 0
         assert_eq!(error.kind(), FallbackErrorKind::PasswordFile);
         assert!(error.has_cleanup_failure());
         assert!(password_files(&runtime).is_empty());
+        assert_executable_snapshots_are_gone(&runtime).await;
         assert_exact_pid_is_gone(pid).await;
         assert_owner_is_gone().await;
     }
@@ -1053,6 +1450,89 @@ exit 0
         }
     }
 
+    struct StalledOwnedProxy {
+        _child: tokio::process::Child,
+    }
+
+    impl AsyncRead for StalledOwnedProxy {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for StalledOwnedProxy {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drop_aborts_stalled_owner_and_only_its_exact_resources() {
+        let _guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let fixture = ViewerFixture::new(ViewerBehavior::Hang);
+
+        let mut proxy_child = TokioCommand::new("/bin/sleep");
+        proxy_child.arg("60").kill_on_drop(true);
+        let proxy_child = proxy_child.spawn().unwrap();
+        let proxy_pid = proxy_child.id().unwrap();
+        let proxy = StalledOwnedProxy {
+            _child: proxy_child,
+        };
+
+        let mut unrelated = TokioCommand::new("/bin/sleep");
+        unrelated.arg("60").kill_on_drop(true);
+        let mut unrelated = unrelated.spawn().unwrap();
+        let unrelated_pid = unrelated.id().unwrap();
+
+        let (policy, channels) = test_policy(Duration::from_secs(60), Duration::from_secs(60));
+        let session = open_test(
+            &runtime,
+            &fixture.path,
+            proxy,
+            FallbackPreferences::default(),
+            policy,
+        )
+        .await
+        .unwrap();
+        let address = channels.bound.await.unwrap();
+        let viewer_pid = channels.pid.await.unwrap();
+        assert_owner_started().await;
+
+        drop(session);
+
+        assert_owner_is_gone().await;
+        assert_port_is_closed(address).await;
+        assert_exact_pid_is_gone(viewer_pid).await;
+        assert_exact_pid_is_gone(proxy_pid).await;
+        assert_password_files_are_gone(&runtime).await;
+        assert_executable_snapshots_are_gone(&runtime).await;
+        assert!(
+            exact_pid_is_alive(unrelated_pid),
+            "Drop touched an unrelated exact PID"
+        );
+
+        unrelated.start_kill().unwrap();
+        unrelated.wait().await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn relay_error_cancellation_drop_natural_exit_and_repeated_close_are_bounded() {
@@ -1076,6 +1556,7 @@ exit 0
         let error = completed(&mut session).await.unwrap_err();
         assert_eq!(error.kind(), FallbackErrorKind::Relay);
         assert!(password_files(&runtime).is_empty());
+        assert_executable_snapshots_are_gone(&runtime).await;
         assert_exact_pid_is_gone(pid).await;
 
         let runtime = RuntimeDir::create().unwrap();
@@ -1097,6 +1578,7 @@ exit 0
         session.close().await.unwrap();
         assert!(TcpStream::connect(address).await.is_err());
         assert!(password_files(&runtime).is_empty());
+        assert_executable_snapshots_are_gone(&runtime).await;
         assert_exact_pid_is_gone(pid).await;
 
         let runtime = RuntimeDir::create().unwrap();
@@ -1115,7 +1597,8 @@ exit 0
         let pid = channels.pid.await.unwrap();
         drop(session);
         assert_owner_is_gone().await;
-        assert!(password_files(&runtime).is_empty());
+        assert_password_files_are_gone(&runtime).await;
+        assert_executable_snapshots_are_gone(&runtime).await;
         assert_exact_pid_is_gone(pid).await;
 
         let runtime = RuntimeDir::create().unwrap();
@@ -1138,6 +1621,7 @@ exit 0
         fs::write(fixture.artifact(".exit"), b"synthetic control\n").unwrap();
         completed(&mut session).await.unwrap();
         assert!(password_files(&runtime).is_empty());
+        assert_executable_snapshots_are_gone(&runtime).await;
         assert_exact_pid_is_gone(pid).await;
         assert_owner_is_gone().await;
     }

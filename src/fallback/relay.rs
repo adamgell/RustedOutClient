@@ -3,12 +3,11 @@ use std::{io, net::Ipv4Addr, process::ExitStatus, time::Duration};
 use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    process::Child,
     sync::oneshot,
     time::{timeout, timeout_at, Instant},
 };
 
-use super::{password_file::VncPasswordFile, FallbackError, FallbackErrorKind};
+use super::{password_file::VncPasswordFile, FallbackError, FallbackErrorKind, OwnedViewer};
 
 const PRODUCTION_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -49,7 +48,7 @@ enum RelayOutcome {
 
 pub(super) async fn run<S>(
     listener: TcpListener,
-    mut viewer: Child,
+    mut viewer: OwnedViewer,
     mut proxy: S,
     mut password_file: VncPasswordFile,
     mut cancelled: oneshot::Receiver<Instant>,
@@ -69,7 +68,7 @@ where
                 Ok(accepted) => AcceptOutcome::Accepted(accepted),
                 Err(_) => AcceptOutcome::TimedOut,
             },
-            status = viewer.wait() => AcceptOutcome::Viewer(status),
+            status = viewer.child.wait() => AcceptOutcome::Viewer(status),
             deadline = &mut cancelled => AcceptOutcome::Cancelled(
                 deadline.unwrap_or_else(|_| Instant::now() + close_timeout)
             ),
@@ -104,7 +103,7 @@ where
                     tokio::pin!(relay);
                     tokio::select! {
                         result = &mut relay => RelayOutcome::Relay(result),
-                        status = viewer.wait() => RelayOutcome::Viewer(status),
+                        status = viewer.child.wait() => RelayOutcome::Viewer(status),
                         deadline = &mut cancelled => RelayOutcome::Cancelled(
                             deadline.unwrap_or_else(|_| Instant::now() + close_timeout)
                         ),
@@ -186,7 +185,7 @@ async fn finish_cleanup<S>(
     primary: Result<(), FallbackError>,
     deadline: Instant,
     viewer_reaped: bool,
-    viewer: &mut Child,
+    viewer: &mut OwnedViewer,
     proxy: &mut S,
     password_file: &mut VncPasswordFile,
 ) -> Result<(), FallbackError>
@@ -198,13 +197,20 @@ where
         if viewer_reaped {
             Ok(())
         } else {
-            stop_viewer(viewer, deadline).await
+            stop_viewer(&mut viewer.child, deadline).await
         }
     };
     let proxy_cleanup = close_proxy(proxy, deadline);
     let (viewer_result, proxy_result) = tokio::join!(viewer_cleanup, proxy_cleanup);
-    let cleanup_failed =
-        password_result.is_err() || viewer_result.is_err() || proxy_result.is_err();
+    let snapshot_result = if viewer_result.is_ok() {
+        viewer.snapshot.remove()
+    } else {
+        Ok(())
+    };
+    let cleanup_failed = password_result.is_err()
+        || viewer_result.is_err()
+        || snapshot_result.is_err()
+        || proxy_result.is_err();
     match (primary, cleanup_failed) {
         (Err(error), true) => Err(error.with_cleanup_failure()),
         (Err(error), false) => Err(error),
@@ -213,7 +219,7 @@ where
     }
 }
 
-async fn stop_viewer(viewer: &mut Child, deadline: Instant) -> Result<(), ()> {
+async fn stop_viewer(viewer: &mut tokio::process::Child, deadline: Instant) -> Result<(), ()> {
     match viewer.try_wait() {
         Ok(Some(_)) => return Ok(()),
         Ok(None) => {}

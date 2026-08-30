@@ -60,9 +60,14 @@ fn listener_process_and_password_artifacts_stay_inside_the_approved_boundary() {
     let relay = source("src/fallback/relay.rs");
     let password = source("src/fallback/password_file.rs");
     let fallback = source("src/fallback/mod.rs");
+    let viewer = source("src/fallback/viewer.rs");
     assert!(relay.contains("TcpListener::bind((Ipv4Addr::LOCALHOST, 0))"));
     assert!(relay.contains("copy_bidirectional"));
-    assert!(fallback.contains("tokio::process::Command::new(viewer_path)"));
+    assert!(viewer.contains("File::open(configured_path)"));
+    assert!(viewer.contains(".metadata()"));
+    assert!(viewer.contains("create_new(true)"));
+    assert!(fallback.contains("tokio::process::Command::new(snapshot.path())"));
+    assert!(!fallback.contains("tokio::process::Command::new(viewer_path)"));
     assert!(password.contains("0xE8, 0x4A, 0xD6, 0x60, 0xC4, 0x72, 0x1A, 0xE0"));
 
     for native in ["src/vnc", "src/connection.rs", "src/session/events.rs"] {
@@ -111,7 +116,11 @@ fn launch_and_lifecycle_constants_are_fixed_and_secret_free() {
             "missing fixed argument {argument}"
         );
     }
-    assert!(fallback.contains("env_remove(\"LC_PVE_TICKET\")"));
+    assert!(fallback.contains(".env_clear()"));
+    assert!(fallback.contains(".env(\"PATH\", \"/usr/bin:/bin\")"));
+    for allowed in ["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"] {
+        assert!(fallback.contains(allowed));
+    }
     assert!(relay.contains("Duration::from_secs(20)"));
     assert!(fallback.contains("Duration::from_secs(3)"));
     assert!(!fallback.contains("Stdio::piped"));
