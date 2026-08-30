@@ -34,7 +34,11 @@ pub struct CommandSpec {
 impl CommandSpec {
     /// Builds an OpenSSH process directly from separate program, argument, and
     /// environment values. It never invokes a command interpreter.
-    pub fn to_command(&self) -> Command {
+    ///
+    /// Task 4 consumes this crate-private execution boundary when it owns the
+    /// child lifecycle.
+    #[allow(dead_code)]
+    pub(crate) fn to_command(&self) -> Command {
         let mut command = Command::new(&self.program);
         command.args(&self.args);
         for (key, value) in &self.env {
@@ -58,19 +62,6 @@ impl SshCommandFactory {
     pub fn new(control_socket: PathBuf) -> Self {
         Self {
             executable: PathBuf::from(SYSTEM_SSH),
-            control_socket,
-        }
-    }
-
-    /// Creates a factory with a test-owned executable for integration tests.
-    ///
-    /// This is not wired to configuration, CLI flags, environment variables,
-    /// PATH lookup, or user input. Production construction always uses
-    /// `/usr/bin/ssh` through [`Self::new`].
-    #[doc(hidden)]
-    pub fn new_for_test(executable: PathBuf, control_socket: PathBuf) -> Self {
-        Self {
-            executable,
             control_socket,
         }
     }
@@ -155,5 +146,64 @@ impl SshCommandFactory {
 
     fn with_target(&self, spec: &mut CommandSpec, profile: &PveProfile) {
         spec.args.push(OsString::from(profile.ssh_target.as_str()));
+    }
+}
+
+#[cfg(test)]
+impl SshCommandFactory {
+    fn new_for_test(executable: PathBuf, control_socket: PathBuf) -> Self {
+        Self {
+            executable,
+            control_socket,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::model::{NodeName, SshTarget};
+
+    const SOCKET: &str = "/tmp/roc-test/c";
+
+    fn fixture_profile() -> PveProfile {
+        PveProfile {
+            name: "Test Proxmox".to_owned(),
+            ssh_target: SshTarget::parse("root@pve.example.invalid").unwrap(),
+            node: NodeName::parse("pve2").unwrap(),
+        }
+    }
+
+    #[test]
+    fn command_spec_materializes_a_direct_ssh_process_for_crate_execution() {
+        let spec = SshCommandFactory::new(PathBuf::from(SOCKET))
+            .inventory(&fixture_profile())
+            .unwrap();
+        let command = spec.to_command();
+
+        assert_eq!(command.get_program(), PathBuf::from("/usr/bin/ssh"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            spec.args
+                .iter()
+                .map(OsString::as_os_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(command.get_envs().count(), 0);
+    }
+
+    #[test]
+    fn test_owned_executable_injection_does_not_change_production_construction() {
+        let injected = PathBuf::from("/private/test-fixtures/fake-ssh");
+        let test_spec = SshCommandFactory::new_for_test(injected.clone(), PathBuf::from(SOCKET))
+            .inventory(&fixture_profile())
+            .unwrap();
+        let production_spec = SshCommandFactory::new(PathBuf::from(SOCKET))
+            .inventory(&fixture_profile())
+            .unwrap();
+
+        assert_eq!(test_spec.program, injected);
+        assert_eq!(production_spec.program, PathBuf::from("/usr/bin/ssh"));
     }
 }

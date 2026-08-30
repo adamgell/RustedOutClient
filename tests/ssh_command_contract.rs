@@ -122,34 +122,6 @@ fn inventory_and_proxy_keep_the_allowlisted_remote_commands_as_single_arguments(
 }
 
 #[test]
-fn command_spec_builds_the_direct_ssh_process_without_an_interpreter() {
-    let spec = fixture_factory().inventory(&fixture_profile()).unwrap();
-    let command = spec.to_command();
-
-    assert_eq!(command.get_program(), PathBuf::from("/usr/bin/ssh"));
-    assert_eq!(
-        command.get_args().collect::<Vec<_>>(),
-        spec.args
-            .iter()
-            .map(OsString::as_os_str)
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(command.get_envs().count(), 0);
-}
-
-#[test]
-fn test_owned_executable_seam_is_explicit_and_does_not_change_production_construction() {
-    let injected = PathBuf::from("/private/test-fixtures/fake-ssh");
-    let test_spec = SshCommandFactory::new_for_test(injected.clone(), PathBuf::from(SOCKET))
-        .inventory(&fixture_profile())
-        .unwrap();
-    let production_spec = fixture_factory().inventory(&fixture_profile()).unwrap();
-
-    assert_eq!(test_spec.program, injected);
-    assert_eq!(production_spec.program, PathBuf::from("/usr/bin/ssh"));
-}
-
-#[test]
 fn bounded_stderr_classification_distinguishes_safe_public_failure_kinds() {
     let cases = [
         (
@@ -163,6 +135,14 @@ fn bounded_stderr_classification_distinguishes_safe_public_failure_kinds() {
         ("root@pve.example.invalid: Permission denied (publickey).", SshFailureKind::Authentication),
         ("ssh: connect to host pve.example.invalid port 22: Operation timed out", SshFailureKind::Timeout),
         ("ssh: connect to host pve.example.invalid port 22: No route to host", SshFailureKind::Ssh),
+        (
+            "pvesh get: Permission denied while reading /nodes/pve2/qemu",
+            SshFailureKind::Ssh,
+        ),
+        (
+            "qm vncproxy: Operation timed out while waiting for the guest",
+            SshFailureKind::Ssh,
+        ),
     ];
 
     for (stderr, expected) in cases {

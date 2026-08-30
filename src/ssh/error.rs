@@ -54,12 +54,45 @@ pub fn classify_stderr(stderr: &[u8]) -> SshFailure {
         || stderr.contains("is not known") && stderr.contains("strict checking")
     {
         SshFailureKind::HostKeyUnknown
-    } else if stderr.contains("Permission denied") {
+    } else if stderr.lines().any(is_ssh_authentication_line) {
         SshFailureKind::Authentication
-    } else if stderr.contains("Operation timed out") || stderr.contains("Connection timed out") {
+    } else if stderr.lines().any(is_ssh_timeout_line) {
         SshFailureKind::Timeout
     } else {
         SshFailureKind::Ssh
     };
     SshFailure { kind }
+}
+
+fn is_ssh_authentication_line(line: &str) -> bool {
+    let line = line.trim_end_matches('\r');
+    let Some((target, methods)) = line.split_once(": Permission denied (") else {
+        return false;
+    };
+    let Some(methods) = methods.strip_suffix(").") else {
+        return false;
+    };
+
+    !target.is_empty()
+        && target.bytes().all(|byte| byte.is_ascii_graphic())
+        && !methods.is_empty()
+        && methods
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b',' | b'-' | b'_'))
+}
+
+fn is_ssh_timeout_line(line: &str) -> bool {
+    let Some(details) = line
+        .trim_end_matches('\r')
+        .strip_prefix("ssh: connect to host ")
+    else {
+        return false;
+    };
+    let Some((endpoint, message)) = details.rsplit_once(": ") else {
+        return false;
+    };
+
+    !endpoint.is_empty()
+        && endpoint.contains(" port ")
+        && matches!(message, "Operation timed out" | "Connection timed out")
 }
