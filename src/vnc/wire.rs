@@ -44,6 +44,7 @@ pub struct RfbError {
     kind: RfbErrorKind,
     field: &'static str,
     io_kind: Option<io::ErrorKind>,
+    cleanup_io_kind: Option<io::ErrorKind>,
 }
 
 impl RfbError {
@@ -53,6 +54,7 @@ impl RfbError {
             kind,
             field,
             io_kind: None,
+            cleanup_io_kind: None,
         }
     }
 
@@ -62,6 +64,7 @@ impl RfbError {
             kind: RfbErrorKind::Io,
             field: "wire I/O",
             io_kind: Some(source.kind()),
+            cleanup_io_kind: None,
         }
     }
 
@@ -87,6 +90,19 @@ impl RfbError {
 
     pub fn io_kind(&self) -> Option<io::ErrorKind> {
         self.io_kind
+    }
+
+    pub fn has_cleanup_failure(&self) -> bool {
+        self.cleanup_io_kind.is_some()
+    }
+
+    pub fn cleanup_io_kind(&self) -> Option<io::ErrorKind> {
+        self.cleanup_io_kind
+    }
+
+    pub(crate) fn with_cleanup_failure(mut self, source: io::Error) -> Self {
+        self.cleanup_io_kind = Some(source.kind());
+        self
     }
 }
 

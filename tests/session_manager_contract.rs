@@ -23,6 +23,7 @@ enum Operation {
     FetchInventory,
     SaveCache,
     Open(VmId),
+    CleanupFailedOpen(VmId),
     ReleaseKeys(VmId),
     CloseSession(VmId),
     CloseMaster,
@@ -31,8 +32,11 @@ enum Operation {
 #[derive(Default)]
 struct FakeState {
     cached: Option<InventorySnapshot>,
+    start_results: VecDeque<Result<(), PublicError>>,
     inventories: VecDeque<Result<InventorySnapshot, PublicError>>,
     open_results: VecDeque<Result<(), PublicError>>,
+    release_results: VecDeque<Result<(), PublicError>>,
+    close_results: VecDeque<Result<(), PublicError>>,
     session_events: VecDeque<SessionTransportEvent>,
     operations: Vec<Operation>,
     tickets_generated: usize,
@@ -87,26 +91,18 @@ impl ManagedSession for FakeSession {
     }
 
     fn release_all_keys(&mut self) -> Result<(), PublicError> {
-        self.control
-            .0
-            .lock()
-            .unwrap()
-            .operations
-            .push(Operation::ReleaseKeys(self.vmid));
-        Ok(())
+        let mut state = self.control.0.lock().unwrap();
+        state.operations.push(Operation::ReleaseKeys(self.vmid));
+        state.release_results.pop_front().unwrap_or(Ok(()))
     }
 
     fn close(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
         let vmid = self.vmid;
         let control = self.control.clone();
         Box::pin(async move {
-            control
-                .0
-                .lock()
-                .unwrap()
-                .operations
-                .push(Operation::CloseSession(vmid));
-            Ok(())
+            let mut state = control.0.lock().unwrap();
+            state.operations.push(Operation::CloseSession(vmid));
+            state.close_results.pop_front().unwrap_or(Ok(()))
         })
     }
 }
@@ -126,13 +122,9 @@ impl SessionBackend for FakeBackend {
     fn start_master(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
         let control = self.control.clone();
         Box::pin(async move {
-            control
-                .0
-                .lock()
-                .unwrap()
-                .operations
-                .push(Operation::StartMaster);
-            Ok(())
+            let mut state = control.0.lock().unwrap();
+            state.operations.push(Operation::StartMaster);
+            state.start_results.pop_front().unwrap_or(Ok(()))
         })
     }
 
@@ -176,8 +168,9 @@ impl SessionBackend for FakeBackend {
         Box::pin(async move {
             let mut state = control.0.lock().unwrap();
             state.operations.push(Operation::Open(vmid));
-            if let Some(result) = state.open_results.pop_front() {
-                result?;
+            if let Some(Err(error)) = state.open_results.pop_front() {
+                state.operations.push(Operation::CleanupFailedOpen(vmid));
+                return Err(error);
             }
             let current = state
                 .inventories
@@ -263,6 +256,103 @@ where
 
 async fn wait_for_live_inventory(manager: &mut SessionManager) {
     recv_matching(manager, |event| matches!(event, AppEvent::LiveInventory(_))).await;
+}
+
+fn operation_count(control: &FakeControl, expected: Operation) -> usize {
+    control
+        .operations()
+        .iter()
+        .filter(|operation| **operation == expected)
+        .count()
+}
+
+async fn open_to_negotiation(manager: &mut SessionManager) -> SessionId {
+    manager
+        .send(AppCommand::Open {
+            vmid: VmId::new(100).unwrap(),
+            options: OpenOptions::default(),
+        })
+        .await
+        .unwrap();
+    match recv_matching(manager, |event| {
+        matches!(event, AppEvent::SessionChanged(snapshot) if snapshot.phase == SessionPhase::NegotiatingRfb)
+    })
+    .await
+    {
+        AppEvent::SessionChanged(snapshot) => snapshot.session_id,
+        _ => unreachable!(),
+    }
+}
+
+async fn assert_one_error_then_disconnected(
+    manager: &mut SessionManager,
+    expected: PublicErrorKind,
+) {
+    let mut terminal_events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while terminal_events.len() < 2 {
+            match manager.recv().await.unwrap() {
+                AppEvent::Error(error) => {
+                    assert_eq!(error.kind(), expected);
+                    terminal_events.push("error");
+                }
+                AppEvent::SessionChanged(snapshot)
+                    if snapshot.phase == SessionPhase::Disconnected =>
+                {
+                    terminal_events.push("disconnected");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for terminal session events");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    while let Ok(event) = manager.try_recv() {
+        match event {
+            AppEvent::Error(error) => {
+                assert_eq!(error.kind(), expected);
+                terminal_events.push("error");
+            }
+            AppEvent::SessionChanged(snapshot) if snapshot.phase == SessionPhase::Disconnected => {
+                terminal_events.push("disconnected");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(terminal_events, ["error", "disconnected"]);
+}
+
+async fn assert_clean_disconnected(manager: &mut SessionManager) {
+    let mut error_count = 0;
+    let mut disconnected_count = 0;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while disconnected_count == 0 {
+            match manager.recv().await.unwrap() {
+                AppEvent::Error(_) => error_count += 1,
+                AppEvent::SessionChanged(snapshot)
+                    if snapshot.phase == SessionPhase::Disconnected =>
+                {
+                    disconnected_count += 1;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for clean disconnection");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    while let Ok(event) = manager.try_recv() {
+        match event {
+            AppEvent::Error(_) => error_count += 1,
+            AppEvent::SessionChanged(snapshot) if snapshot.phase == SessionPhase::Disconnected => {
+                disconnected_count += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(error_count, 0);
+    assert_eq!(disconnected_count, 1);
 }
 
 #[tokio::test]
@@ -546,6 +636,198 @@ async fn reconnect_closes_old_session_before_fresh_validation_and_proxy_open() {
 }
 
 #[tokio::test]
+async fn master_check_failure_uses_its_own_seam_and_closes_master_once() {
+    let control = FakeControl::default();
+    control
+        .0
+        .lock()
+        .unwrap()
+        .start_results
+        .push_back(Err(PublicError::new(PublicErrorKind::HostKeyChanged)));
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+
+    recv_matching(&mut manager, |event| {
+        matches!(event, AppEvent::Error(error) if error.kind() == PublicErrorKind::HostKeyChanged)
+    })
+    .await;
+    manager.shutdown().await.unwrap();
+
+    assert_eq!(operation_count(&control, Operation::StartMaster), 1);
+    assert_eq!(operation_count(&control, Operation::FetchInventory), 0);
+    assert_eq!(operation_count(&control, Operation::CloseMaster), 1);
+}
+
+#[tokio::test]
+async fn inventory_failure_uses_its_own_seam_and_closes_master_once() {
+    let control = FakeControl::default();
+    control
+        .0
+        .lock()
+        .unwrap()
+        .inventories
+        .push_back(Err(PublicError::new(PublicErrorKind::Inventory)));
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+
+    recv_matching(&mut manager, |event| {
+        matches!(event, AppEvent::Error(error) if error.kind() == PublicErrorKind::Inventory)
+    })
+    .await;
+    manager.shutdown().await.unwrap();
+
+    assert_eq!(operation_count(&control, Operation::StartMaster), 1);
+    assert_eq!(operation_count(&control, Operation::FetchInventory), 1);
+    assert_eq!(operation_count(&control, Operation::CloseMaster), 1);
+}
+
+#[tokio::test]
+async fn proxy_creation_failure_cleans_failed_open_and_never_reopens() {
+    let live = inventory(1, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    control
+        .0
+        .lock()
+        .unwrap()
+        .open_results
+        .push_back(Err(PublicError::new(PublicErrorKind::Proxy)));
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+
+    manager
+        .send(AppCommand::Open {
+            vmid: VmId::new(100).unwrap(),
+            options: OpenOptions::default(),
+        })
+        .await
+        .unwrap();
+    assert_one_error_then_disconnected(&mut manager, PublicErrorKind::Proxy).await;
+
+    let vmid = VmId::new(100).unwrap();
+    assert_eq!(operation_count(&control, Operation::Open(vmid)), 1);
+    assert_eq!(
+        operation_count(&control, Operation::CleanupFailedOpen(vmid)),
+        1
+    );
+    assert_eq!(operation_count(&control, Operation::ReleaseKeys(vmid)), 0);
+    assert_eq!(operation_count(&control, Operation::CloseSession(vmid)), 0);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rfb_negotiation_failure_closes_once_and_never_reopens() {
+    let live = inventory(1, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    open_to_negotiation(&mut manager).await;
+
+    control.push_session_event(SessionTransportEvent::Error(PublicError::new(
+        PublicErrorKind::RfbSecurity,
+    )));
+    assert_one_error_then_disconnected(&mut manager, PublicErrorKind::RfbSecurity).await;
+
+    let vmid = VmId::new(100).unwrap();
+    assert_eq!(operation_count(&control, Operation::Open(vmid)), 1);
+    assert_eq!(operation_count(&control, Operation::ReleaseKeys(vmid)), 1);
+    assert_eq!(operation_count(&control, Operation::CloseSession(vmid)), 1);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn first_frame_failure_closes_once_and_never_reopens() {
+    let live = inventory(1, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    open_to_negotiation(&mut manager).await;
+
+    control.push_session_event(SessionTransportEvent::Error(PublicError::new(
+        PublicErrorKind::Decoder,
+    )));
+    assert_one_error_then_disconnected(&mut manager, PublicErrorKind::Decoder).await;
+
+    let vmid = VmId::new(100).unwrap();
+    assert_eq!(operation_count(&control, Operation::Open(vmid)), 1);
+    assert_eq!(operation_count(&control, Operation::ReleaseKeys(vmid)), 1);
+    assert_eq!(operation_count(&control, Operation::CloseSession(vmid)), 1);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn ui_cancellation_closes_once_without_reopening() {
+    let live = inventory(1, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    let session_id = open_to_negotiation(&mut manager).await;
+
+    manager
+        .send(AppCommand::Close { session_id })
+        .await
+        .unwrap();
+    assert_clean_disconnected(&mut manager).await;
+
+    let vmid = VmId::new(100).unwrap();
+    assert_eq!(operation_count(&control, Operation::Open(vmid)), 1);
+    assert_eq!(operation_count(&control, Operation::ReleaseKeys(vmid)), 1);
+    assert_eq!(operation_count(&control, Operation::CloseSession(vmid)), 1);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn key_release_failure_still_closes_once_and_never_reopens() {
+    let live = inventory(1, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    control
+        .0
+        .lock()
+        .unwrap()
+        .release_results
+        .push_back(Err(PublicError::new(PublicErrorKind::Cleanup)));
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    let session_id = open_to_negotiation(&mut manager).await;
+
+    manager
+        .send(AppCommand::Close { session_id })
+        .await
+        .unwrap();
+    assert_one_error_then_disconnected(&mut manager, PublicErrorKind::Cleanup).await;
+
+    let vmid = VmId::new(100).unwrap();
+    assert_eq!(operation_count(&control, Operation::Open(vmid)), 1);
+    assert_eq!(operation_count(&control, Operation::ReleaseKeys(vmid)), 1);
+    assert_eq!(operation_count(&control, Operation::CloseSession(vmid)), 1);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_close_failure_reports_once_and_never_reopens() {
+    let live = inventory(1, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    control
+        .0
+        .lock()
+        .unwrap()
+        .close_results
+        .push_back(Err(PublicError::new(PublicErrorKind::Cleanup)));
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    let session_id = open_to_negotiation(&mut manager).await;
+
+    manager
+        .send(AppCommand::Close { session_id })
+        .await
+        .unwrap();
+    assert_one_error_then_disconnected(&mut manager, PublicErrorKind::Cleanup).await;
+
+    let vmid = VmId::new(100).unwrap();
+    assert_eq!(operation_count(&control, Operation::Open(vmid)), 1);
+    assert_eq!(operation_count(&control, Operation::ReleaseKeys(vmid)), 1);
+    assert_eq!(operation_count(&control, Operation::CloseSession(vmid)), 1);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn failures_close_once_emit_one_typed_error_and_never_auto_reconnect() {
     let live = inventory(1, vec![vm(100, VmStatus::Running)]);
     for kind in [
@@ -641,7 +923,7 @@ async fn failures_close_once_emit_one_typed_error_and_never_auto_reconnect() {
 }
 
 #[tokio::test]
-async fn app_channels_remain_bounded_under_framebuffer_pressure() {
+async fn shutdown_drains_a_full_app_queue_and_completes_owned_cleanup() {
     let live = inventory(1, vec![vm(100, VmStatus::Running)]);
     let control =
         FakeControl::with_cached_and_inventories(None, [live.clone(), live.clone(), live]);
@@ -668,7 +950,32 @@ async fn app_channels_remain_bounded_under_framebuffer_pressure() {
             rgba: vec![0, 0, 0, 255],
         }]));
     }
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert!(manager.queued_event_count() <= APP_QUEUE_CAPACITY);
-    manager.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while manager.queued_event_count() < APP_QUEUE_CAPACITY {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("app queue did not fill");
+    assert_eq!(manager.queued_event_count(), APP_QUEUE_CAPACITY);
+
+    tokio::time::timeout(Duration::from_secs(2), manager.shutdown())
+        .await
+        .expect("shutdown deadlocked behind the full event queue")
+        .unwrap();
+    let operations = control.operations();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| matches!(operation, Operation::CloseSession(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == Operation::CloseMaster)
+            .count(),
+        1
+    );
 }

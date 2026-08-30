@@ -6,9 +6,8 @@ use std::{
     time::Duration,
 };
 
-use crossbeam_channel::TrySendError as CrossbeamTrySendError;
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
@@ -126,13 +125,30 @@ impl SessionManager {
     }
 
     pub async fn shutdown(mut self) -> Result<(), PublicError> {
-        let _ = self.command_tx.send(AppCommand::Shutdown).await;
+        let shutdown = self.command_tx.send(AppCommand::Shutdown);
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                result = &mut shutdown => {
+                    let _ = result;
+                    break;
+                }
+                _ = self.event_rx.recv() => {}
+            }
+        }
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
-        worker
-            .await
-            .map_err(|_| PublicError::new(PublicErrorKind::Cleanup))?
+        let mut worker = worker;
+        loop {
+            tokio::select! {
+                result = &mut worker => {
+                    return result
+                        .map_err(|_| PublicError::new(PublicErrorKind::Cleanup))?;
+                }
+                _ = self.event_rx.recv() => {}
+            }
+        }
     }
 }
 
@@ -538,6 +554,7 @@ pub struct ProductionSession {
     task: Option<JoinHandle<()>>,
     terminal: Arc<Mutex<Option<Result<(), PublicError>>>>,
     terminal_reported: bool,
+    cancel: Option<oneshot::Sender<()>>,
 }
 
 impl ProductionSession {
@@ -545,19 +562,29 @@ impl ProductionSession {
         let (connection, channels) = bounded_vnc_channels();
         let terminal = Arc::new(Mutex::new(None));
         let task_terminal = terminal.clone();
+        let terminal_sender = channels.event_tx.clone();
+        let (cancel, cancelled) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let result = VncClient::run(proxy, options.vnc, channels.event_tx, channels.command_rx)
-                .await
-                .map_err(public_rfb_error);
+            let result = VncClient::run_cancellable(
+                proxy,
+                options.vnc,
+                channels.event_tx,
+                channels.command_rx,
+                cancelled,
+            )
+            .await
+            .map_err(public_rfb_error);
             *task_terminal
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+            drop(terminal_sender);
         });
         Self {
             connection,
             task: Some(task),
             terminal,
             terminal_reported: false,
+            cancel: Some(cancel),
         }
     }
 
@@ -603,9 +630,16 @@ impl ManagedSession for ProductionSession {
                     return Ok(self.take_terminal_event());
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    return Ok(self
-                        .take_terminal_event()
-                        .or(Some(SessionTransportEvent::Disconnected)));
+                    if let Some(event) = self.take_terminal_event() {
+                        return Ok(Some(event));
+                    }
+                    if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
+                        self.terminal_reported = true;
+                        return Ok(Some(SessionTransportEvent::Error(PublicError::new(
+                            PublicErrorKind::Cleanup,
+                        ))));
+                    }
+                    return Ok(None);
                 }
             }
         }
@@ -625,30 +659,25 @@ impl ManagedSession for ProductionSession {
     }
 
     fn close(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
-        let command_tx = self.connection.command_tx.clone();
-        let task = self.task.take();
-        let terminal = self.terminal.clone();
         Box::pin(async move {
-            let mut command = crate::connection::VncCommand::Disconnect;
-            loop {
-                match command_tx.try_send(command) {
-                    Ok(()) | Err(CrossbeamTrySendError::Disconnected(_)) => break,
-                    Err(CrossbeamTrySendError::Full(returned)) => {
-                        command = returned;
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                }
+            if let Some(cancel) = self.cancel.take() {
+                let _ = cancel.send(());
             }
-            if let Some(task) = task {
+            if let Some(task) = self.task.take() {
                 task.await
                     .map_err(|_| PublicError::new(PublicErrorKind::Cleanup))?;
             }
-            let terminal_result = terminal
+            let terminal_result = self
+                .terminal
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .unwrap_or(Ok(()));
             match terminal_result {
                 Err(error) if error.kind() == PublicErrorKind::Cleanup => Err(error),
+                Err(error) if !self.terminal_reported => {
+                    self.terminal_reported = true;
+                    Err(error)
+                }
                 Ok(()) | Err(_) => Ok(()),
             }
         })
@@ -721,6 +750,7 @@ fn public_ssh_failure(kind: SshFailureKind) -> PublicError {
 }
 
 fn public_rfb_error(error: RfbError) -> PublicError {
+    let has_cleanup_failure = error.has_cleanup_failure();
     let kind = match (error.kind(), error.phase()) {
         (_, RfbPhase::Cleanup) => PublicErrorKind::Cleanup,
         (RfbErrorKind::SecurityAllowlist | RfbErrorKind::SecurityFailure, _) => {
@@ -731,18 +761,56 @@ fn public_rfb_error(error: RfbError) -> PublicError {
         (RfbErrorKind::Queue, RfbPhase::EventQueue) => PublicErrorKind::Queue,
         _ => PublicErrorKind::RfbProtocol,
     };
-    PublicError::new(kind)
+    let error = PublicError::new(kind);
+    if has_cleanup_failure {
+        error.with_cleanup_failure()
+    } else {
+        error
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        fs, io,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
-    use super::{ManagedSession, ProductionSession};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::{tempdir, TempDir};
+    use tokio::time::{sleep, timeout};
+
+    use super::{ManagedSession, OpenOptions, ProductionSession};
     use crate::{
         connection::{bounded_vnc_channels, FbRect, VncEvent, VNC_QUEUE_CAPACITY},
+        model::{NodeName, PveProfile, SshTarget, VmId},
+        runtime::RuntimeDir,
         session::{PublicError, PublicErrorKind, SessionTransportEvent},
+        ssh::{SshCommandFactory, SshMaster, TrustedSshProxy},
+        vnc::{RfbError, RfbErrorKind, RfbPhase},
     };
+
+    fn production_session(
+        terminal: Option<Result<(), PublicError>>,
+        terminal_reported: bool,
+    ) -> (ProductionSession, crate::connection::VncSessionChannels) {
+        let (connection, channels) = bounded_vnc_channels();
+        (
+            ProductionSession {
+                connection,
+                task: None,
+                terminal: Arc::new(Mutex::new(terminal)),
+                terminal_reported,
+                cancel: None,
+            },
+            channels,
+        )
+    }
 
     #[test]
     fn terminal_error_survives_a_full_vnc_event_queue() {
@@ -766,6 +834,7 @@ mod tests {
                 PublicErrorKind::RfbProtocol,
             ))))),
             terminal_reported: false,
+            cancel: None,
         };
 
         for _ in 0..VNC_QUEUE_CAPACITY {
@@ -782,18 +851,146 @@ mod tests {
         assert!(session.try_recv().unwrap().is_none());
     }
 
+    #[test]
+    fn disconnected_vnc_channel_waits_for_terminal_publication_before_reporting() {
+        let (mut session, channels) = production_session(None, false);
+        drop(channels);
+
+        assert!(session.try_recv().unwrap().is_none());
+        *session.terminal.lock().unwrap() =
+            Some(Err(PublicError::new(PublicErrorKind::RfbSecurity)));
+        assert!(matches!(
+            session.try_recv().unwrap(),
+            Some(SessionTransportEvent::Error(error))
+                if error.kind() == PublicErrorKind::RfbSecurity
+        ));
+        assert!(session.try_recv().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn close_surfaces_an_unreported_terminal_error_exactly_once() {
+        let (mut session, channels) =
+            production_session(Some(Err(PublicError::new(PublicErrorKind::Decoder))), false);
+        drop(channels);
+
+        let error = session.close().await.unwrap_err();
+        assert_eq!(error.kind(), PublicErrorKind::Decoder);
+        assert!(session.close().await.is_ok());
+    }
+
+    #[test]
+    fn public_terminal_error_preserves_primary_kind_and_cleanup_failure() {
+        let error = RfbError::new(
+            RfbPhase::Authentication,
+            RfbErrorKind::SecurityFailure,
+            "synthetic authentication",
+        )
+        .with_cleanup_failure(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "synthetic cleanup failure",
+        ));
+
+        let public = super::public_rfb_error(error);
+        assert_eq!(public.kind(), PublicErrorKind::RfbSecurity);
+        assert!(public.has_cleanup_failure());
+    }
+
     #[tokio::test]
     async fn explicit_cleanup_does_not_treat_an_earlier_protocol_error_as_cleanup_failure() {
-        let (connection, _channels) = bounded_vnc_channels();
-        let mut session = ProductionSession {
-            connection,
-            task: None,
-            terminal: Arc::new(Mutex::new(Some(Err(PublicError::new(
-                PublicErrorKind::RfbProtocol,
-            ))))),
-            terminal_reported: false,
-        };
+        let (mut session, _channels) = production_session(
+            Some(Err(PublicError::new(PublicErrorKind::RfbProtocol))),
+            true,
+        );
 
         session.close().await.unwrap();
+    }
+
+    fn fixture_profile() -> PveProfile {
+        PveProfile {
+            name: "Synthetic Proxmox".to_owned(),
+            ssh_target: SshTarget::parse("root@pve.example.invalid").unwrap(),
+            node: NodeName::parse("pve2").unwrap(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_ssh() -> (TempDir, PathBuf) {
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("fake_ssh.sh");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_ssh.sh"),
+            &executable,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        (directory, executable)
+    }
+
+    async fn wait_for(path: &Path) {
+        timeout(Duration::from_secs(30), async {
+            while !path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("synthetic helper did not become ready");
+    }
+
+    fn helper_pid(path: &Path) -> u32 {
+        fs::read_to_string(path).unwrap().trim().parse().unwrap()
+    }
+
+    fn exact_pid_is_alive(pid: u32) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    async fn assert_exact_pid_is_gone(pid: u32) {
+        timeout(Duration::from_secs(30), async {
+            while exact_pid_is_alive(pid) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned synthetic proxy child was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_cancels_pre_session_negotiation_and_reaps_the_owned_proxy() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("proxy_wait_for_eof"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&runtime.control_socket().with_extension("state")).await;
+        let mut verified = master.verify().await.unwrap();
+        let proxy = TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap())
+            .await
+            .unwrap();
+        let mut session = ProductionSession::spawn(proxy, OpenOptions::default());
+        let proxy_pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&proxy_pid_path).await;
+        let proxy_pid = helper_pid(&proxy_pid_path);
+
+        timeout(Duration::from_secs(2), session.close())
+            .await
+            .expect("pre-session cancellation did not complete")
+            .unwrap();
+        assert_exact_pid_is_gone(proxy_pid).await;
+        master.close().await.unwrap();
     }
 }

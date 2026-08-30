@@ -111,6 +111,10 @@ if [ "$proxy" = true ]; then
         awk 'BEGIN { for (i = 0; i < 100; i++) printf "%01024d", 0 }' >&2
     fi
     dd bs=1 count=1 of=/dev/null 2>/dev/null || true
+    if [ -f "${socket}.proxy_wait_for_eof" ]; then
+        /bin/cat >/dev/null
+        exit 0
+    fi
     if [ -f "${socket}.proxy_auth_failure" ]; then
         printf '%s\n' 'synthetic@pve.example.invalid: Permission denied (publickey).' >&2
         exit 255

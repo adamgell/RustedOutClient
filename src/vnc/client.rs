@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::oneshot;
 use tracing::debug;
 
 use crate::{
@@ -346,10 +347,45 @@ impl VncClient {
         event_tx: Sender<VncEvent>,
         command_rx: Receiver<VncCommand>,
     ) -> Result<(), RfbError> {
+        Self::run_inner(proxy, options, event_tx, command_rx, std::future::pending()).await
+    }
+
+    pub(crate) async fn run_cancellable(
+        proxy: TrustedSshProxy,
+        options: VncOptions,
+        event_tx: Sender<VncEvent>,
+        command_rx: Receiver<VncCommand>,
+        cancelled: oneshot::Receiver<()>,
+    ) -> Result<(), RfbError> {
+        Self::run_inner(proxy, options, event_tx, command_rx, async move {
+            let _ = cancelled.await;
+        })
+        .await
+    }
+
+    async fn run_inner<C>(
+        proxy: TrustedSshProxy,
+        options: VncOptions,
+        event_tx: Sender<VncEvent>,
+        command_rx: Receiver<VncCommand>,
+        cancelled: C,
+    ) -> Result<(), RfbError>
+    where
+        C: std::future::Future<Output = ()>,
+    {
         let limits = options.limits;
         let (stream, ticket) = proxy.into_parts();
         let mut reader = RfbReader::new(stream, limits);
-        let result = run_connected(&mut reader, ticket, options, event_tx, command_rx).await;
+        tokio::pin!(cancelled);
+        let result = {
+            let connected = run_connected(&mut reader, ticket, options, event_tx, command_rx);
+            tokio::pin!(connected);
+            tokio::select! {
+                biased;
+                result = &mut connected => result,
+                () = &mut cancelled => Ok(()),
+            }
+        };
         finish_session(reader, result).await
     }
 }
@@ -421,7 +457,10 @@ where
     let mut stream = reader.into_inner();
     match stream.shutdown().await {
         Ok(()) => result,
-        Err(source) => Err(RfbError::io(RfbPhase::Cleanup, source)),
+        Err(source) => match result {
+            Ok(()) => Err(RfbError::io(RfbPhase::Cleanup, source)),
+            Err(primary) => Err(primary.with_cleanup_failure(source)),
+        },
     }
 }
 
@@ -910,10 +949,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
     use crossbeam_channel::bounded;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::{
         configure_server, decoder_pixel_format, finish_session, framebuffer_rects, run_session,
@@ -1000,6 +1043,44 @@ mod tests {
 
         let mut byte = [0_u8; 1];
         assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+    }
+
+    struct ShutdownFailure;
+
+    impl AsyncWrite for ShutdownFailure {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "synthetic shutdown failure",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_preserves_the_primary_protocol_classification() {
+        let reader = RfbReader::new(ShutdownFailure, ProtocolLimits::default());
+        let primary = RfbError::new(
+            RfbPhase::Authentication,
+            RfbErrorKind::SecurityFailure,
+            "synthetic authentication",
+        );
+
+        let returned = finish_session(reader, Err(primary)).await.unwrap_err();
+        assert_eq!(returned.phase(), RfbPhase::Authentication);
+        assert_eq!(returned.kind(), RfbErrorKind::SecurityFailure);
+        assert!(returned.has_cleanup_failure());
     }
 
     #[tokio::test]

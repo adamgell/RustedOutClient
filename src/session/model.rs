@@ -105,6 +105,7 @@ pub struct PublicError {
     kind: PublicErrorKind,
     session_id: Option<SessionId>,
     vmid: Option<VmId>,
+    cleanup_failed: bool,
 }
 
 impl PublicError {
@@ -113,6 +114,7 @@ impl PublicError {
             kind,
             session_id: None,
             vmid: None,
+            cleanup_failed: false,
         }
     }
 
@@ -128,9 +130,18 @@ impl PublicError {
         self.vmid
     }
 
+    pub fn has_cleanup_failure(self) -> bool {
+        self.cleanup_failed
+    }
+
     pub(crate) fn for_session(mut self, session_id: SessionId, vmid: VmId) -> Self {
         self.session_id = Some(session_id);
         self.vmid = Some(vmid);
+        self
+    }
+
+    pub(crate) fn with_cleanup_failure(mut self) -> Self {
+        self.cleanup_failed = true;
         self
     }
 }
