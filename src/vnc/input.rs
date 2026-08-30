@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
+use crossbeam_channel::TrySendError;
 use thiserror::Error;
 
-use crate::connection::{ClipboardSlot, VncConnection};
+use crate::connection::{ClipboardSlot, VncConnection, VNC_QUEUE_CAPACITY};
 
 pub const CLIPBOARD_TEXT_LIMIT: usize = 1_048_576;
 
@@ -24,8 +25,12 @@ pub enum InputError {
     InvalidClipboardText,
     #[error("clipboard limit exceeds the protocol ceiling")]
     InvalidClipboardLimit,
+    #[error("pressed key tracking limit reached")]
+    PressedKeyLimit,
     #[error("bounded VNC command queue is unavailable")]
     QueueUnavailable,
+    #[error("VNC command receiver is disconnected")]
+    TransportDisconnected,
 }
 
 /// Bounded UTF-8 text received from the remote RFB peer.
@@ -77,17 +82,22 @@ pub trait InputSink {
 
 impl InputSink for VncConnection {
     fn key(&mut self, down: bool, keysym: u32) -> Result<(), InputError> {
-        self.send_key(down, keysym)
-            .map_err(|_| InputError::QueueUnavailable)
+        self.send_key(down, keysym).map_err(input_queue_error)
     }
 
     fn pointer(&mut self, buttons: u8, x: u16, y: u16) -> Result<(), InputError> {
-        self.send_pointer(buttons, x, y)
-            .map_err(|_| InputError::QueueUnavailable)
+        self.send_pointer(buttons, x, y).map_err(input_queue_error)
     }
 
     fn send_clipboard(&mut self, text: String) -> Result<(), InputError> {
-        VncConnection::send_clipboard(self, text).map_err(|_| InputError::QueueUnavailable)
+        VncConnection::send_clipboard(self, text).map_err(input_queue_error)
+    }
+}
+
+fn input_queue_error<T>(error: TrySendError<T>) -> InputError {
+    match error {
+        TrySendError::Full(_) => InputError::QueueUnavailable,
+        TrySendError::Disconnected(_) => InputError::TransportDisconnected,
     }
 }
 
@@ -139,6 +149,9 @@ where
     pub fn key(&mut self, down: bool, keysym: u32) -> Result<(), InputError> {
         self.require_interactive()?;
         if down {
+            if !self.pressed.contains(&keysym) && self.pressed.len() == VNC_QUEUE_CAPACITY {
+                return Err(InputError::PressedKeyLimit);
+            }
             self.pressed.insert(keysym);
             self.sink.key(true, keysym)
         } else {

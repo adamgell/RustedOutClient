@@ -16,6 +16,7 @@ use rustedoutclient::{
     ssh::{InventorySnapshot, VmInventoryItem, VmStatus},
     vnc::{ClipboardText, InputController, InputError, InputSink, ProtocolLimits, VncOptions},
 };
+use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -39,8 +40,13 @@ struct FakeState {
     start_results: VecDeque<Result<(), PublicError>>,
     inventories: VecDeque<Result<InventorySnapshot, PublicError>>,
     open_results: VecDeque<Result<(), PublicError>>,
+    key_results: VecDeque<Result<(), InputError>>,
     release_results: VecDeque<Result<(), PublicError>>,
     close_results: VecDeque<Result<(), PublicError>>,
+    release_delay: Option<Duration>,
+    release_started_at: Option<Instant>,
+    release_finished_at: Option<Instant>,
+    close_deadline: Option<Instant>,
     session_events: VecDeque<SessionTransportEvent>,
     operations: Vec<Operation>,
     tickets_generated: usize,
@@ -74,6 +80,15 @@ impl FakeControl {
     fn tickets_generated(&self) -> usize {
         self.0.lock().unwrap().tickets_generated
     }
+
+    fn close_timing(&self) -> (Instant, Instant, Instant) {
+        let state = self.0.lock().unwrap();
+        (
+            state.release_started_at.unwrap(),
+            state.release_finished_at.unwrap(),
+            state.close_deadline.unwrap(),
+        )
+    }
 }
 
 struct FakeBackend {
@@ -93,13 +108,11 @@ struct FakeInputSink {
 
 impl InputSink for FakeInputSink {
     fn key(&mut self, down: bool, keysym: u32) -> Result<(), InputError> {
-        self.control
-            .0
-            .lock()
-            .unwrap()
+        let mut state = self.control.0.lock().unwrap();
+        state
             .operations
             .push(Operation::Key(self.vmid, down, keysym));
-        Ok(())
+        state.key_results.pop_front().unwrap_or(Ok(()))
     }
 
     fn pointer(&mut self, buttons: u8, x: u16, y: u16) -> Result<(), InputError> {
@@ -150,16 +163,22 @@ impl ManagedSession for FakeSession {
     fn release_all_keys(&mut self) -> Result<(), PublicError> {
         let mut state = self.control.0.lock().unwrap();
         state.operations.push(Operation::ReleaseKeys(self.vmid));
+        state.release_started_at = Some(Instant::now());
+        let release_delay = state.release_delay;
         let configured = state.release_results.pop_front().unwrap_or(Ok(()));
         drop(state);
+        if let Some(delay) = release_delay {
+            std::thread::sleep(delay);
+        }
         let release = self
             .input
             .release_all_keys()
-            .map_err(|_| PublicError::new(PublicErrorKind::Queue));
+            .map_err(public_input_cleanup_error);
+        self.control.0.lock().unwrap().release_finished_at = Some(Instant::now());
         configured.and(release)
     }
 
-    fn close(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
+    fn close(&mut self, deadline: Instant) -> BackendFuture<'_, Result<(), PublicError>> {
         let vmid = self.vmid;
         let control = self.control.clone();
         Box::pin(async move {
@@ -169,9 +188,18 @@ impl ManagedSession for FakeSession {
                 .map_err(|_| PublicError::new(PublicErrorKind::Queue));
             let mut state = control.0.lock().unwrap();
             state.operations.push(Operation::CloseSession(vmid));
+            state.close_deadline = Some(deadline);
             let close = state.close_results.pop_front().unwrap_or(Ok(()));
             input_cleanup.and(close)
         })
+    }
+}
+
+fn public_input_cleanup_error(error: InputError) -> PublicError {
+    match error {
+        InputError::QueueUnavailable => PublicError::new(PublicErrorKind::Queue),
+        InputError::TransportDisconnected => PublicError::new(PublicErrorKind::Cleanup),
+        _ => PublicError::new(PublicErrorKind::Cleanup),
     }
 }
 
@@ -459,6 +487,32 @@ async fn assert_one_error_then_disconnected(
         }
     }
     assert_eq!(terminal_events, ["error", "disconnected"]);
+}
+
+async fn recv_one_error_then_disconnected(manager: &mut SessionManager) -> PublicError {
+    let mut error = None;
+    let mut disconnected = false;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while error.is_none() || !disconnected {
+            match manager.recv().await.unwrap() {
+                AppEvent::Error(observed) => {
+                    assert!(
+                        error.replace(observed).is_none(),
+                        "duplicate terminal error"
+                    );
+                }
+                AppEvent::SessionChanged(snapshot)
+                    if snapshot.phase == SessionPhase::Disconnected =>
+                {
+                    disconnected = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for terminal session events");
+    error.unwrap()
 }
 
 async fn assert_clean_disconnected(manager: &mut SessionManager) {
@@ -1104,6 +1158,121 @@ async fn ui_cancellation_closes_once_without_reopening() {
     assert_eq!(operation_count(&control, Operation::Open(vmid)), 1);
     assert_eq!(operation_count(&control, Operation::ReleaseKeys(vmid)), 1);
     assert_eq!(operation_count(&control, Operation::CloseSession(vmid)), 1);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manager_close_deadline_starts_before_release_and_is_not_renewed_for_transport() {
+    let live = inventory(1, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    control.0.lock().unwrap().release_delay = Some(Duration::from_millis(100));
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    let session_id = open_to_negotiation(&mut manager).await;
+
+    manager
+        .send(AppCommand::Close { session_id })
+        .await
+        .unwrap();
+    assert_clean_disconnected(&mut manager).await;
+
+    let (release_started, release_finished, close_deadline) = control.close_timing();
+    assert!(release_started < release_finished);
+    assert!(release_started < close_deadline);
+    assert!(
+        close_deadline.duration_since(release_started) <= Duration::from_secs(3),
+        "the absolute deadline must exist before manager-level release"
+    );
+    assert!(
+        close_deadline.saturating_duration_since(release_finished) < Duration::from_secs(3),
+        "transport close must receive the already-consumed deadline"
+    );
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn disconnected_key_release_preserves_terminal_rfb_primary_with_cleanup_evidence() {
+    let live = inventory(1, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    {
+        let mut state = control.0.lock().unwrap();
+        state
+            .key_results
+            .extend([Ok(()), Err(InputError::TransportDisconnected)]);
+        state
+            .close_results
+            .push_back(Err(PublicError::new(PublicErrorKind::RfbSecurity)));
+    }
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    let session_id = open_to_negotiation(&mut manager).await;
+    press_ready_key(&mut manager, &control, session_id, 0x51).await;
+
+    manager
+        .send(AppCommand::Close { session_id })
+        .await
+        .unwrap();
+    let error = recv_one_error_then_disconnected(&mut manager).await;
+
+    assert_eq!(error.kind(), PublicErrorKind::RfbSecurity);
+    assert!(error.has_cleanup_failure());
+    assert_one_key_release(&control, 0x51);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn disconnected_key_release_without_terminal_primary_reports_cleanup() {
+    let live = inventory(1, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    control
+        .0
+        .lock()
+        .unwrap()
+        .key_results
+        .extend([Ok(()), Err(InputError::TransportDisconnected)]);
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    let session_id = open_to_negotiation(&mut manager).await;
+    press_ready_key(&mut manager, &control, session_id, 0x52).await;
+
+    manager
+        .send(AppCommand::Close { session_id })
+        .await
+        .unwrap();
+    let error = recv_one_error_then_disconnected(&mut manager).await;
+
+    assert_eq!(error.kind(), PublicErrorKind::Cleanup);
+    assert_one_key_release(&control, 0x52);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn full_queue_key_release_remains_queue_primary() {
+    let live = inventory(1, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    {
+        let mut state = control.0.lock().unwrap();
+        state
+            .key_results
+            .extend([Ok(()), Err(InputError::QueueUnavailable)]);
+        state
+            .close_results
+            .push_back(Err(PublicError::new(PublicErrorKind::RfbSecurity)));
+    }
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    let session_id = open_to_negotiation(&mut manager).await;
+    press_ready_key(&mut manager, &control, session_id, 0x53).await;
+
+    manager
+        .send(AppCommand::Close { session_id })
+        .await
+        .unwrap();
+    let error = recv_one_error_then_disconnected(&mut manager).await;
+
+    assert_eq!(error.kind(), PublicErrorKind::Queue);
+    assert!(error.has_cleanup_failure());
+    assert_one_key_release(&control, 0x53);
     manager.shutdown().await.unwrap();
 }
 

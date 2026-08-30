@@ -44,7 +44,7 @@ pub trait ManagedSession: Send + 'static {
     fn mark_ready(&mut self);
     fn send_input(&mut self, action: InputAction) -> Result<Option<ClipboardText>, InputError>;
     fn release_all_keys(&mut self) -> Result<(), PublicError>;
-    fn close(&mut self) -> BackendFuture<'_, Result<(), PublicError>>;
+    fn close(&mut self, deadline: Instant) -> BackendFuture<'_, Result<(), PublicError>>;
 }
 
 pub trait SessionBackend: Send + 'static {
@@ -398,30 +398,26 @@ where
         }
 
         let close_result = if let Some(mut session) = self.sessions[index].session.take() {
+            let deadline = Instant::now() + graceful_close_timeout();
             let release_result = session.release_all_keys();
-            let transport_close = session.close().await;
-            match (release_result, transport_close) {
-                (Err(primary), Err(_)) => Err(primary.with_cleanup_failure()),
-                (Err(primary), Ok(())) => Err(primary),
-                (Ok(()), result) => result,
-            }
+            let transport_close = session.close(deadline).await;
+            compose_release_and_transport(release_result, transport_close)
         } else {
             Ok(())
         };
-        let error = match (primary_error, close_result) {
-            (Some(primary), Err(_)) => Some(primary.with_cleanup_failure()),
-            (Some(primary), Ok(())) => Some(primary),
-            (None, Err(error)) => Some(error),
-            (None, Ok(())) => None,
+        let result = match (primary_error, close_result) {
+            (Some(primary), Err(_)) => Err(primary.with_cleanup_failure()),
+            (Some(primary), Ok(())) => Err(primary),
+            (None, result) => result,
         };
-        if let Some(error) = error {
+        if let Err(error) = result {
             if !self.sessions[index].error_emitted {
                 self.sessions[index].error_emitted = true;
                 self.emit_critical(AppEvent::Error(error)).await;
             }
         }
         self.transition(index, SessionPhase::Disconnected).await;
-        close_result
+        result
     }
 
     async fn transition(&mut self, index: usize, phase: SessionPhase) {
@@ -698,21 +694,24 @@ impl ManagedSession for ProductionSession {
     fn release_all_keys(&mut self) -> Result<(), PublicError> {
         self.input
             .release_all_keys()
-            .map_err(|_| PublicError::new(PublicErrorKind::Queue))
+            .map_err(public_input_cleanup_error)
     }
 
-    fn close(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
+    fn close(&mut self, deadline: Instant) -> BackendFuture<'_, Result<(), PublicError>> {
         Box::pin(async move {
-            let deadline = Instant::now() + graceful_close_timeout();
             let session_loop_ready = self.input.is_ready();
-            let mut primary = self
-                .input
-                .clear_session()
-                .err()
-                .map(|_| PublicError::new(PublicErrorKind::Queue));
+            let mut primary = None;
+            let mut cleanup_failed = false;
+            if let Err(error) = self.input.clear_session() {
+                match public_input_cleanup_error(error).kind() {
+                    PublicErrorKind::Queue => {
+                        primary = Some(PublicError::new(PublicErrorKind::Queue));
+                    }
+                    _ => cleanup_failed = true,
+                }
+            }
             let task_running = self.task.as_ref().is_some_and(|task| !task.is_finished());
             let mut use_cancellation = !session_loop_ready || !task_running;
-            let mut cleanup_failed = false;
 
             if session_loop_ready && task_running {
                 match self.input.connection().begin_graceful_close() {
@@ -801,6 +800,31 @@ fn graceful_close_timeout() -> Duration {
     #[cfg(not(test))]
     {
         Duration::from_secs(3)
+    }
+}
+
+fn compose_release_and_transport(
+    release: Result<(), PublicError>,
+    transport: Result<(), PublicError>,
+) -> Result<(), PublicError> {
+    match (release, transport) {
+        (Ok(()), result) => result,
+        (Err(release), Ok(())) => Err(release),
+        (Err(release), Err(transport))
+            if release.kind() == PublicErrorKind::Cleanup
+                && transport.kind() != PublicErrorKind::Cleanup =>
+        {
+            Err(transport.with_cleanup_failure())
+        }
+        (Err(release), Err(_)) => Err(release.with_cleanup_failure()),
+    }
+}
+
+fn public_input_cleanup_error(error: InputError) -> PublicError {
+    match error {
+        InputError::QueueUnavailable => PublicError::new(PublicErrorKind::Queue),
+        InputError::TransportDisconnected => PublicError::new(PublicErrorKind::Cleanup),
+        _ => PublicError::new(PublicErrorKind::Cleanup),
     }
 }
 
@@ -899,7 +923,7 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     #[cfg(unix)]
@@ -907,7 +931,7 @@ mod tests {
 
     use tempfile::{tempdir, TempDir};
     use tokio::sync::oneshot;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::{sleep, timeout, Instant};
 
     use super::{
         BackendFuture, ManagedSession, OpenOptions, ProductionSession, SessionBackend,
@@ -947,6 +971,10 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("controlled task did not reach the expected state");
+    }
+
+    fn close_deadline() -> Instant {
+        Instant::now() + super::graceful_close_timeout()
     }
 
     fn production_session(
@@ -1034,9 +1062,9 @@ mod tests {
             production_session(Some(Err(PublicError::new(PublicErrorKind::Decoder))), false);
         drop(channels);
 
-        let error = session.close().await.unwrap_err();
+        let error = session.close(close_deadline()).await.unwrap_err();
         assert_eq!(error.kind(), PublicErrorKind::Decoder);
-        assert!(session.close().await.is_ok());
+        assert!(session.close(close_deadline()).await.is_ok());
     }
 
     #[tokio::test]
@@ -1074,7 +1102,7 @@ mod tests {
             .clipboard
             .replace(ClipboardText::try_from(b"clear on close".to_vec()).unwrap());
         assert_eq!(channels.clipboard.retained_count(), 1);
-        session.close().await.unwrap();
+        session.close(close_deadline()).await.unwrap();
         assert_eq!(channels.clipboard.retained_count(), 0);
         session.mark_ready();
         assert!(session
@@ -1109,7 +1137,7 @@ mod tests {
                 keysym: 0x41,
             })
         ));
-        session.close().await.unwrap();
+        session.close(close_deadline()).await.unwrap();
         assert!(channels.command_rx.try_recv().is_err());
     }
 
@@ -1143,7 +1171,7 @@ mod tests {
             .unwrap();
 
         let started = Instant::now();
-        let error = session.close().await.unwrap_err();
+        let error = session.close(close_deadline()).await.unwrap_err();
 
         assert_eq!(error.kind(), PublicErrorKind::Cleanup);
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -1184,7 +1212,7 @@ mod tests {
         };
         session.mark_ready();
 
-        let error = session.close().await.unwrap_err();
+        let error = session.close(close_deadline()).await.unwrap_err();
 
         assert_eq!(error.kind(), PublicErrorKind::RfbSecurity);
         assert!(error.has_cleanup_failure());
@@ -1230,7 +1258,7 @@ mod tests {
         session.mark_ready();
 
         let close = tokio::spawn(async move {
-            let result = session.close().await;
+            let result = session.close(close_deadline()).await;
             (result, session)
         });
         wait_for_flag(&barrier_seen).await;
@@ -1280,7 +1308,7 @@ mod tests {
         };
 
         let close = tokio::spawn(async move {
-            let result = session.close().await;
+            let result = session.close(close_deadline()).await;
             (result, session)
         });
         wait_for_flag(&clipboard_inserted).await;
@@ -1303,6 +1331,49 @@ mod tests {
             .send_input(InputAction::ReceiveClipboard)
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consumed_manager_deadline_reaches_exact_task_abort_without_a_fresh_budget() {
+        let (connection, channels) = bounded_vnc_channels();
+        let terminal = Arc::new(Mutex::new(None));
+        let (cancel, cancelled) = oneshot::channel();
+        let task_started = Arc::new(AtomicBool::new(false));
+        let task_started_probe = Arc::clone(&task_started);
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let task_drop_probe = Arc::clone(&task_dropped);
+        let task = tokio::spawn(async move {
+            let _drop_probe = DropProbe(task_drop_probe);
+            let _ignored_cancellation = cancelled;
+            let _owned_channels = channels;
+            task_started_probe.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+        let mut session = ProductionSession {
+            input: InputController::for_connection(connection, false, false, CLIPBOARD_TEXT_LIMIT)
+                .unwrap(),
+            task: Some(task),
+            terminal,
+            terminal_reported: false,
+            cancel: Some(cancel),
+        };
+        session.mark_ready();
+        wait_for_flag(&task_started).await;
+
+        let close = tokio::spawn(async move { session.close(Instant::now()).await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            close.is_finished(),
+            "an already-consumed manager deadline must not be renewed"
+        );
+        assert_eq!(
+            close.await.unwrap().unwrap_err().kind(),
+            PublicErrorKind::Cleanup
+        );
+        assert!(task_dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1343,7 +1414,7 @@ mod tests {
         };
         session.mark_ready();
 
-        let result = session.close().await;
+        let result = session.close(close_deadline()).await;
 
         assert!(clipboard_inserted.load(Ordering::SeqCst));
         result.unwrap();
@@ -1379,7 +1450,7 @@ mod tests {
         };
         session.mark_ready();
 
-        let error = timeout(Duration::from_secs(2), session.close())
+        let error = timeout(Duration::from_secs(2), session.close(close_deadline()))
             .await
             .expect("full-queue close was not bounded")
             .unwrap_err();
@@ -1391,7 +1462,6 @@ mod tests {
     #[tokio::test]
     async fn graceful_close_disconnected_queue_preserves_terminal_transport_primary() {
         let (connection, channels) = bounded_vnc_channels();
-        drop(channels.command_rx);
         let terminal = Arc::new(Mutex::new(Some(Err(PublicError::new(
             PublicErrorKind::RfbSecurity,
         )))));
@@ -1408,8 +1478,22 @@ mod tests {
             cancel: Some(cancel),
         };
         session.mark_ready();
+        session
+            .send_input(InputAction::Key {
+                down: true,
+                keysym: 0x51,
+            })
+            .unwrap();
+        assert!(matches!(
+            channels.command_rx.try_recv(),
+            Ok(VncCommand::KeyEvent {
+                down: true,
+                keysym: 0x51,
+            })
+        ));
+        drop(channels.command_rx);
 
-        let error = timeout(Duration::from_secs(2), session.close())
+        let error = timeout(Duration::from_secs(2), session.close(close_deadline()))
             .await
             .expect("disconnected-queue close was not bounded")
             .unwrap_err();
@@ -1421,7 +1505,6 @@ mod tests {
     #[tokio::test]
     async fn graceful_close_disconnected_queue_without_terminal_reports_cleanup() {
         let (connection, channels) = bounded_vnc_channels();
-        drop(channels.command_rx);
         let terminal = Arc::new(Mutex::new(None));
         let (cancel, cancelled) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -1436,8 +1519,22 @@ mod tests {
             cancel: Some(cancel),
         };
         session.mark_ready();
+        session
+            .send_input(InputAction::Key {
+                down: true,
+                keysym: 0x52,
+            })
+            .unwrap();
+        assert!(matches!(
+            channels.command_rx.try_recv(),
+            Ok(VncCommand::KeyEvent {
+                down: true,
+                keysym: 0x52,
+            })
+        ));
+        drop(channels.command_rx);
 
-        let error = timeout(Duration::from_secs(2), session.close())
+        let error = timeout(Duration::from_secs(2), session.close(close_deadline()))
             .await
             .expect("disconnected-queue close was not bounded")
             .unwrap_err();
@@ -1469,7 +1566,7 @@ mod tests {
             true,
         );
 
-        session.close().await.unwrap();
+        session.close(close_deadline()).await.unwrap();
     }
 
     fn fixture_profile() -> PveProfile {
@@ -2031,7 +2128,7 @@ mod tests {
         )
         .await;
 
-        let error = timeout(Duration::from_secs(2), session.close())
+        let error = timeout(Duration::from_secs(2), session.close(close_deadline()))
             .await
             .expect("post-ack shutdown stall exceeded the total close policy")
             .unwrap_err();
@@ -2129,7 +2226,7 @@ mod tests {
         wait_for(&proxy_pid_path).await;
         let proxy_pid = helper_pid(&proxy_pid_path);
 
-        timeout(Duration::from_secs(2), session.close())
+        timeout(Duration::from_secs(2), session.close(close_deadline()))
             .await
             .expect("pre-session cancellation did not complete")
             .unwrap();

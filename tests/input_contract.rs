@@ -4,6 +4,7 @@ use std::{
 };
 
 use rustedoutclient::{
+    connection::{bounded_vnc_channels, VNC_QUEUE_CAPACITY},
     session::InputAction,
     vnc::{ClipboardText, InputController, InputError, InputSink},
 };
@@ -207,6 +208,83 @@ fn key_up_updates_after_attempt_and_release_all_is_reverse_deterministic() {
                 keysym: 1,
             },
         ]
+    );
+}
+
+#[test]
+fn tracked_keys_are_capped_at_the_exact_queue_capacity_and_release_stays_bounded() {
+    let sink = RecordingSink::default();
+    let mut controller = ready_controller(sink.clone(), false, false);
+
+    for keysym in 0..VNC_QUEUE_CAPACITY as u32 {
+        controller.key(true, keysym).unwrap();
+    }
+    assert_eq!(sink.attempts().len(), VNC_QUEUE_CAPACITY);
+
+    controller.key(true, 0).unwrap();
+    assert_eq!(sink.attempts().len(), VNC_QUEUE_CAPACITY + 1);
+    assert_eq!(
+        controller.key(true, VNC_QUEUE_CAPACITY as u32).unwrap_err(),
+        InputError::PressedKeyLimit
+    );
+    assert_eq!(
+        sink.attempts().len(),
+        VNC_QUEUE_CAPACITY + 1,
+        "the 257th distinct key must not reach the sink"
+    );
+
+    controller.key(false, 0).unwrap();
+    controller.key(true, VNC_QUEUE_CAPACITY as u32).unwrap();
+    let release_start = sink.attempts().len();
+    controller.release_all_keys().unwrap();
+    let attempts = sink.attempts();
+    let releases = &attempts[release_start..];
+    assert_eq!(releases.len(), VNC_QUEUE_CAPACITY);
+    for (offset, attempt) in releases.iter().enumerate() {
+        assert_eq!(
+            attempt,
+            &Attempt::Key {
+                down: false,
+                keysym: (VNC_QUEUE_CAPACITY - offset) as u32,
+            }
+        );
+    }
+
+    controller.release_all_keys().unwrap();
+    assert_eq!(sink.attempts().len(), release_start + VNC_QUEUE_CAPACITY);
+}
+
+#[test]
+fn production_sink_distinguishes_full_queue_from_disconnected_transport() {
+    let (mut full, full_channels) = bounded_vnc_channels();
+    for keysym in 0..VNC_QUEUE_CAPACITY as u32 {
+        InputSink::key(&mut full, true, keysym).unwrap();
+    }
+    assert_eq!(
+        InputSink::pointer(&mut full, 0, 0, 0).unwrap_err(),
+        InputError::QueueUnavailable
+    );
+    drop(full_channels);
+
+    let (mut disconnected_key, key_channels) = bounded_vnc_channels();
+    drop(key_channels.command_rx);
+    assert_eq!(
+        InputSink::key(&mut disconnected_key, true, 1).unwrap_err(),
+        InputError::TransportDisconnected
+    );
+
+    let (mut disconnected_pointer, pointer_channels) = bounded_vnc_channels();
+    drop(pointer_channels.command_rx);
+    assert_eq!(
+        InputSink::pointer(&mut disconnected_pointer, 1, 2, 3).unwrap_err(),
+        InputError::TransportDisconnected
+    );
+
+    let (mut disconnected_clipboard, clipboard_channels) = bounded_vnc_channels();
+    drop(clipboard_channels.command_rx);
+    assert_eq!(
+        InputSink::send_clipboard(&mut disconnected_clipboard, "text".to_owned()).unwrap_err(),
+        InputError::TransportDisconnected
     );
 }
 
