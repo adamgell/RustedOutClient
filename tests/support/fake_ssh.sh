@@ -116,6 +116,30 @@ if [ "$proxy" = true ]; then
         /bin/cat >/dev/null
         exit 0
     fi
+    if [ -f "${socket}.proxy_rfb_input_capture" ]; then
+        printf 'RFB 003.008\n'
+        dd bs=1 count=12 of=/dev/null 2>/dev/null || exit 74
+        printf '\001\002'
+        dd bs=1 count=1 of=/dev/null 2>/dev/null || exit 74
+        printf '0123456789abcdef'
+        dd bs=1 count=16 of=/dev/null 2>/dev/null || exit 74
+        printf '\000\000\000\000'
+        dd bs=1 count=1 of=/dev/null 2>/dev/null || exit 74
+        printf '\000\001\000\001'
+        printf '\040\030\000\001\000\377\000\377\000\377\020\010\000\000\000\000'
+        printf '\000\000\000\000'
+        dd bs=1 count=58 of=/dev/null 2>/dev/null || exit 74
+        printf '\000\000\000\001'
+        printf '\000\000\000\000\000\001\000\001\000\000\000\000'
+        printf '\000\000\000\000'
+        dd bs=1 count=10 of=/dev/null 2>/dev/null || exit 74
+        dd bs=1 count=8 of="${socket}.proxy.input-wire" 2>/dev/null || exit 74
+        : > "${socket}.proxy.key-down-read"
+        dd bs=1 count=8 >> "${socket}.proxy.input-wire" 2>/dev/null || exit 74
+        : > "${socket}.proxy.key-up-read"
+        /bin/cat >/dev/null
+        exit 0
+    fi
     if [ ! -f "${socket}.proxy_no_stdout" ]; then
         printf 'RFB 003.008\n'
     fi

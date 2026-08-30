@@ -1,23 +1,71 @@
-error[E0277]: `rustedoutclient::vnc::ClipboardText` doesn't implement `Debug`
-  --> tests/ui/clipboard_debug.rs:11:22
+error[E0277]: `ClipboardText` doesn't implement `Debug`
+  --> tests/ui/clipboard_debug.rs:12:22
    |
-11 |     requires_debug::<ClipboardText>();
-   |                      ^^^^^^^^^^^^^ the trait `Debug` is not implemented for `rustedoutclient::vnc::ClipboardText`
+12 |     requires_debug::<ClipboardText>();
+   |                      ^^^^^^^^^^^^^ the trait `Debug` is not implemented for `ClipboardText`
    |
 note: required by a bound in `requires_debug`
-  --> tests/ui/clipboard_debug.rs:8:22
+  --> tests/ui/clipboard_debug.rs:9:22
    |
- 8 | fn requires_debug<T: Debug>() {}
+ 9 | fn requires_debug<T: Debug>() {}
+   |                      ^^^^^ required by this bound in `requires_debug`
+
+error[E0277]: `VncCommand` doesn't implement `Debug`
+  --> tests/ui/clipboard_debug.rs:13:22
+   |
+13 |     requires_debug::<VncCommand>();
+   |                      ^^^^^^^^^^ the trait `Debug` is not implemented for `VncCommand`
+   |
+note: required by a bound in `requires_debug`
+  --> tests/ui/clipboard_debug.rs:9:22
+   |
+ 9 | fn requires_debug<T: Debug>() {}
+   |                      ^^^^^ required by this bound in `requires_debug`
+
+error[E0277]: `VncEvent` doesn't implement `Debug`
+  --> tests/ui/clipboard_debug.rs:14:22
+   |
+14 |     requires_debug::<VncEvent>();
+   |                      ^^^^^^^^ the trait `Debug` is not implemented for `VncEvent`
+   |
+note: required by a bound in `requires_debug`
+  --> tests/ui/clipboard_debug.rs:9:22
+   |
+ 9 | fn requires_debug<T: Debug>() {}
    |                      ^^^^^ required by this bound in `requires_debug`
 
 error[E0277]: `InputAction` doesn't implement `Debug`
-  --> tests/ui/clipboard_debug.rs:12:22
+  --> tests/ui/clipboard_debug.rs:15:22
    |
-12 |     requires_debug::<InputAction>();
+15 |     requires_debug::<InputAction>();
    |                      ^^^^^^^^^^^ the trait `Debug` is not implemented for `InputAction`
    |
 note: required by a bound in `requires_debug`
-  --> tests/ui/clipboard_debug.rs:8:22
+  --> tests/ui/clipboard_debug.rs:9:22
    |
- 8 | fn requires_debug<T: Debug>() {}
+ 9 | fn requires_debug<T: Debug>() {}
+   |                      ^^^^^ required by this bound in `requires_debug`
+
+error[E0277]: `AppCommand` doesn't implement `Debug`
+  --> tests/ui/clipboard_debug.rs:16:22
+   |
+16 |     requires_debug::<AppCommand>();
+   |                      ^^^^^^^^^^ the trait `Debug` is not implemented for `AppCommand`
+   |
+note: required by a bound in `requires_debug`
+  --> tests/ui/clipboard_debug.rs:9:22
+   |
+ 9 | fn requires_debug<T: Debug>() {}
+   |                      ^^^^^ required by this bound in `requires_debug`
+
+error[E0277]: `AppEvent` doesn't implement `Debug`
+  --> tests/ui/clipboard_debug.rs:17:22
+   |
+17 |     requires_debug::<AppEvent>();
+   |                      ^^^^^^^^ the trait `Debug` is not implemented for `AppEvent`
+   |
+note: required by a bound in `requires_debug`
+  --> tests/ui/clipboard_debug.rs:9:22
+   |
+ 9 | fn requires_debug<T: Debug>() {}
    |                      ^^^^^ required by this bound in `requires_debug`

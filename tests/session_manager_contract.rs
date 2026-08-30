@@ -14,7 +14,7 @@ use rustedoutclient::{
         SessionTransportEvent, APP_QUEUE_CAPACITY,
     },
     ssh::{InventorySnapshot, VmInventoryItem, VmStatus},
-    vnc::{ClipboardText, InputController, InputError, InputSink},
+    vnc::{ClipboardText, InputController, InputError, InputSink, ProtocolLimits, VncOptions},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,10 +257,17 @@ impl SessionBackend for FakeBackend {
                 vmid,
                 control: control.clone(),
             };
+            let input = InputController::with_clipboard_limit(
+                sink,
+                options.view_only,
+                options.clipboard_enabled,
+                options.vnc.limits.max_clipboard_bytes as usize,
+            )
+            .map_err(|_| PublicError::new(PublicErrorKind::RfbLimit))?;
             Ok(FakeSession {
                 vmid,
                 control: control.clone(),
-                input: InputController::new(sink, options.view_only, options.clipboard_enabled),
+                input,
             })
         })
     }
@@ -648,6 +655,97 @@ async fn manager_keeps_semantic_rejections_non_terminal_and_marks_controller_rea
 
     manager.shutdown().await.unwrap();
     assert_one_key_release(&control, 0x43);
+}
+
+#[tokio::test]
+async fn tightened_clipboard_limit_rejects_before_queue_without_terminating_session() {
+    let live = inventory(2, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    let options = OpenOptions {
+        vnc: VncOptions {
+            limits: ProtocolLimits {
+                max_clipboard_bytes: 4,
+                ..ProtocolLimits::default()
+            },
+            ..VncOptions::default()
+        },
+        clipboard_enabled: true,
+        ..OpenOptions::default()
+    };
+    manager
+        .send(AppCommand::Open {
+            vmid: VmId::new(100).unwrap(),
+            options,
+        })
+        .await
+        .unwrap();
+    let session_id = match recv_matching(&mut manager, |event| {
+        matches!(event, AppEvent::SessionChanged(snapshot) if snapshot.phase == SessionPhase::NegotiatingRfb)
+    })
+    .await
+    {
+        AppEvent::SessionChanged(snapshot) => snapshot.session_id,
+        _ => unreachable!(),
+    };
+    control.push_session_event(SessionTransportEvent::Framebuffer(vec![FbRect {
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+        rgba: vec![0, 0, 0, 255],
+    }]));
+    recv_matching(&mut manager, |event| {
+        matches!(event, AppEvent::SessionChanged(snapshot) if snapshot.phase == SessionPhase::Ready)
+    })
+    .await;
+
+    manager
+        .send(AppCommand::SendInput {
+            session_id,
+            action: InputAction::SendClipboard("1234".to_owned()),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while operation_count(&control, Operation::Clipboard(VmId::new(100).unwrap(), 4)) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    manager
+        .send(AppCommand::SendInput {
+            session_id,
+            action: InputAction::SendClipboard("12345".to_owned()),
+        })
+        .await
+        .unwrap();
+    let rejection = recv_matching(&mut manager, |event| {
+        matches!(
+            event,
+            AppEvent::InputRejected {
+                reason: InputError::ClipboardTooLarge,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(matches!(
+        rejection,
+        AppEvent::InputRejected {
+            session_id: rejected_session,
+            reason: InputError::ClipboardTooLarge,
+        } if rejected_session == session_id
+    ));
+    assert_eq!(
+        operation_count(&control, Operation::Clipboard(VmId::new(100).unwrap(), 5)),
+        0
+    );
+
+    send_key_and_wait(&manager, &control, session_id, 0x41).await;
+    manager.shutdown().await.unwrap();
 }
 
 #[tokio::test]

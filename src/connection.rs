@@ -1,4 +1,7 @@
+use std::sync::{Arc, Mutex};
+
 use crossbeam_channel::{Receiver, Sender, TrySendError};
+use tokio::sync::oneshot;
 
 use crate::vnc::{ClipboardText, RfbError};
 
@@ -18,7 +21,6 @@ pub enum VncEvent {
     DesktopSize(u32, u32),
     FramebufferRects(Vec<FbRect>),
     DesktopName(String),
-    ClipboardText(ClipboardText),
     Error(RfbError),
     Disconnected,
 }
@@ -28,33 +30,84 @@ pub enum VncCommand {
     KeyEvent { down: bool, keysym: u32 },
     PointerEvent { buttons: u8, x: u16, y: u16 },
     SetClipboard(String),
+    GracefulDisconnect(CloseBarrier),
     Disconnect,
+}
+
+/// Opaque acknowledgement carried only by the session's ordered command queue.
+pub struct CloseBarrier {
+    acknowledged: oneshot::Sender<()>,
+}
+
+impl CloseBarrier {
+    pub(crate) fn acknowledge(self) {
+        let _ = self.acknowledged.send(());
+    }
+}
+
+/// The session's sole retained remote clipboard value.
+#[derive(Clone, Default)]
+pub(crate) struct ClipboardSlot(Arc<Mutex<Option<ClipboardText>>>);
+
+impl ClipboardSlot {
+    pub(crate) fn replace(&self, text: ClipboardText) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(text);
+    }
+
+    pub(crate) fn take(&self) -> Option<ClipboardText> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    pub(crate) fn clear(&self) {
+        drop(self.take());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_count(&self) -> usize {
+        usize::from(
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some(),
+        )
+    }
 }
 
 /// UI-owned ends of one bounded VNC session's queues.
 pub struct VncConnection {
     pub event_rx: Receiver<VncEvent>,
     pub command_tx: Sender<VncCommand>,
+    pub(crate) clipboard: ClipboardSlot,
 }
 
 /// Runtime-owned ends passed to [`crate::vnc::VncClient::run`].
 pub struct VncSessionChannels {
     pub event_tx: Sender<VncEvent>,
     pub command_rx: Receiver<VncCommand>,
+    pub(crate) clipboard: ClipboardSlot,
 }
 
 /// Creates the only supported command/event queue shape.
 pub fn bounded_vnc_channels() -> (VncConnection, VncSessionChannels) {
     let (event_tx, event_rx) = crossbeam_channel::bounded(VNC_QUEUE_CAPACITY);
     let (command_tx, command_rx) = crossbeam_channel::bounded(VNC_QUEUE_CAPACITY);
+    let clipboard = ClipboardSlot::default();
     (
         VncConnection {
             event_rx,
             command_tx,
+            clipboard: clipboard.clone(),
         },
         VncSessionChannels {
             event_tx,
             command_rx,
+            clipboard,
         },
     )
 }
@@ -81,5 +134,16 @@ impl VncConnection {
 
     pub fn disconnect(&self) -> Result<(), TrySendError<VncCommand>> {
         self.command_tx.try_send(VncCommand::Disconnect)
+    }
+
+    pub(crate) fn begin_graceful_close(
+        &self,
+    ) -> Result<oneshot::Receiver<()>, TrySendError<VncCommand>> {
+        let (acknowledged, receiver) = oneshot::channel();
+        self.command_tx
+            .try_send(VncCommand::GracefulDisconnect(CloseBarrier {
+                acknowledged,
+            }))?;
+        Ok(receiver)
     }
 }

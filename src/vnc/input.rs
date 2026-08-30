@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
-use crate::connection::VncConnection;
+use crate::connection::{ClipboardSlot, VncConnection};
 
 pub const CLIPBOARD_TEXT_LIMIT: usize = 1_048_576;
 
@@ -22,6 +22,8 @@ pub enum InputError {
     ClipboardTooLarge,
     #[error("remote clipboard text is not valid UTF-8")]
     InvalidClipboardText,
+    #[error("clipboard limit exceeds the protocol ceiling")]
+    InvalidClipboardLimit,
     #[error("bounded VNC command queue is unavailable")]
     QueueUnavailable,
 }
@@ -97,7 +99,8 @@ pub struct InputController<S> {
     ready: bool,
     view_only: bool,
     clipboard_enabled: bool,
-    pending_clipboard: Option<ClipboardText>,
+    max_clipboard_bytes: usize,
+    clipboard: ClipboardSlot,
 }
 
 impl<S> InputController<S>
@@ -105,14 +108,28 @@ where
     S: InputSink,
 {
     pub fn new(sink: S, view_only: bool, clipboard_enabled: bool) -> Self {
-        Self {
+        Self::with_clipboard_limit(sink, view_only, clipboard_enabled, CLIPBOARD_TEXT_LIMIT)
+            .expect("the global clipboard limit is valid")
+    }
+
+    pub fn with_clipboard_limit(
+        sink: S,
+        view_only: bool,
+        clipboard_enabled: bool,
+        max_clipboard_bytes: usize,
+    ) -> Result<Self, InputError> {
+        if max_clipboard_bytes > CLIPBOARD_TEXT_LIMIT {
+            return Err(InputError::InvalidClipboardLimit);
+        }
+        Ok(Self {
             sink,
             pressed: BTreeSet::new(),
             ready: false,
             view_only,
             clipboard_enabled,
-            pending_clipboard: None,
-        }
+            max_clipboard_bytes,
+            clipboard: ClipboardSlot::default(),
+        })
     }
 
     pub fn mark_ready(&mut self) {
@@ -182,7 +199,7 @@ where
 
     pub fn send_clipboard(&mut self, text: String) -> Result<(), InputError> {
         self.require_clipboard()?;
-        if text.len() > CLIPBOARD_TEXT_LIMIT {
+        if text.len() > self.max_clipboard_bytes {
             return Err(InputError::ClipboardTooLarge);
         }
         self.sink.send_clipboard(text)
@@ -190,18 +207,18 @@ where
 
     pub fn receive_clipboard(&mut self) -> Result<Option<ClipboardText>, InputError> {
         self.require_clipboard()?;
-        Ok(self.pending_clipboard.take())
+        Ok(self.clipboard.take())
     }
 
     pub fn buffer_remote_clipboard(&mut self, text: ClipboardText) {
         if self.clipboard_enabled {
-            self.pending_clipboard = Some(text);
+            self.clipboard.replace(text);
         }
     }
 
     pub fn clear_session(&mut self) -> Result<(), InputError> {
         let result = self.release_all_keys();
-        self.pending_clipboard = None;
+        self.clipboard.clear();
         self.ready = false;
         result
     }
@@ -226,7 +243,32 @@ where
 }
 
 impl InputController<VncConnection> {
+    pub(crate) fn for_connection(
+        connection: VncConnection,
+        view_only: bool,
+        clipboard_enabled: bool,
+        max_clipboard_bytes: usize,
+    ) -> Result<Self, InputError> {
+        if max_clipboard_bytes > CLIPBOARD_TEXT_LIMIT {
+            return Err(InputError::InvalidClipboardLimit);
+        }
+        let clipboard = connection.clipboard.clone();
+        Ok(Self {
+            sink: connection,
+            pressed: BTreeSet::new(),
+            ready: false,
+            view_only,
+            clipboard_enabled,
+            max_clipboard_bytes,
+            clipboard,
+        })
+    }
+
     pub(crate) fn connection(&self) -> &VncConnection {
         &self.sink
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready
     }
 }

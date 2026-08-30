@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
@@ -23,15 +23,15 @@ enum Attempt {
 #[derive(Default)]
 struct SinkState {
     attempts: Vec<Attempt>,
-    fail_at: BTreeSet<usize>,
+    failures: BTreeMap<usize, InputError>,
 }
 
 #[derive(Clone, Default)]
 struct RecordingSink(Arc<Mutex<SinkState>>);
 
 impl RecordingSink {
-    fn fail_at(self, attempts: impl IntoIterator<Item = usize>) -> Self {
-        self.0.lock().unwrap().fail_at.extend(attempts);
+    fn fail_with(self, failures: impl IntoIterator<Item = (usize, InputError)>) -> Self {
+        self.0.lock().unwrap().failures.extend(failures);
         self
     }
 
@@ -43,11 +43,11 @@ impl RecordingSink {
         let mut state = self.0.lock().unwrap();
         state.attempts.push(attempt);
         let attempt_number = state.attempts.len();
-        if state.fail_at.contains(&attempt_number) {
-            Err(InputError::QueueUnavailable)
-        } else {
-            Ok(())
-        }
+        state
+            .failures
+            .get(&attempt_number)
+            .copied()
+            .map_or(Ok(()), Err)
     }
 }
 
@@ -115,12 +115,15 @@ fn ctrl_alt_delete_emits_exact_semantic_rfb_order() {
 
 #[test]
 fn ctrl_alt_delete_returns_first_failure_after_cleanup_attempts_and_clears_tracking() {
-    let sink = RecordingSink::default().fail_at([3, 4]);
+    let sink = RecordingSink::default().fail_with([
+        (3, InputError::ClipboardDisabled),
+        (4, InputError::QueueUnavailable),
+    ]);
     let mut controller = ready_controller(sink.clone(), false, false);
 
     assert_eq!(
         controller.ctrl_alt_delete().unwrap_err(),
-        InputError::QueueUnavailable
+        InputError::ClipboardDisabled
     );
     assert_eq!(
         sink.attempts(),
@@ -209,7 +212,10 @@ fn key_up_updates_after_attempt_and_release_all_is_reverse_deterministic() {
 
 #[test]
 fn release_all_attempts_every_key_and_clears_tracking_after_failures() {
-    let sink = RecordingSink::default().fail_at([5, 6]);
+    let sink = RecordingSink::default().fail_with([
+        (5, InputError::QueueUnavailable),
+        (6, InputError::ClipboardDisabled),
+    ]);
     let mut controller = ready_controller(sink.clone(), false, false);
     controller.key(true, 1).unwrap();
     controller.key(true, 2).unwrap();
@@ -243,7 +249,7 @@ fn release_all_attempts_every_key_and_clears_tracking_after_failures() {
 
 #[test]
 fn focus_loss_and_view_only_activation_release_keys_and_view_only_sticks_on_error() {
-    let sink = RecordingSink::default().fail_at([4]);
+    let sink = RecordingSink::default().fail_with([(4, InputError::QueueUnavailable)]);
     let mut controller = ready_controller(sink.clone(), false, false);
 
     controller.key(true, 1).unwrap();
@@ -360,6 +366,46 @@ fn clipboard_is_default_off_and_exactly_one_mib_is_the_hard_ceiling() {
 }
 
 #[test]
+fn tightened_clipboard_limit_rejects_before_queue_and_keeps_controller_usable() {
+    let sink = RecordingSink::default();
+    let mut controller =
+        InputController::with_clipboard_limit(sink.clone(), false, true, 4).unwrap();
+    controller.mark_ready();
+
+    controller.send_clipboard("1234".to_owned()).unwrap();
+    assert_eq!(sink.attempts(), [Attempt::Clipboard(4)]);
+
+    assert_eq!(
+        controller.send_clipboard("12345".to_owned()).unwrap_err(),
+        InputError::ClipboardTooLarge
+    );
+    assert_eq!(sink.attempts(), [Attempt::Clipboard(4)]);
+
+    controller.key(true, 0x41).unwrap();
+    assert_eq!(
+        sink.attempts(),
+        [
+            Attempt::Clipboard(4),
+            Attempt::Key {
+                down: true,
+                keysym: 0x41,
+            },
+        ]
+    );
+}
+
+#[test]
+fn controller_never_accepts_a_relaxed_clipboard_limit() {
+    let result = InputController::with_clipboard_limit(
+        RecordingSink::default(),
+        false,
+        true,
+        CLIPBOARD_LIMIT + 1,
+    );
+    assert!(matches!(result, Err(InputError::InvalidClipboardLimit)));
+}
+
+#[test]
 fn remote_clipboard_is_strict_bounded_replacing_one_shot_ephemeral_text() {
     assert_eq!(
         ClipboardText::try_from(vec![0x66, 0x80])
@@ -395,7 +441,20 @@ fn public_input_actions_are_semantic_and_clipboard_payloads_are_not_debuggable()
     cases.compile_fail("tests/ui/raw_input_forward.rs");
     cases.compile_fail("tests/ui/clipboard_debug.rs");
 
-    let _semantic_actions = [
+    fn assert_reviewed_semantic_action(action: InputAction) {
+        match action {
+            InputAction::Key { .. }
+            | InputAction::Pointer { .. }
+            | InputAction::CtrlAltDelete
+            | InputAction::ReleaseAllKeys
+            | InputAction::FocusLost
+            | InputAction::SetViewOnly(_)
+            | InputAction::SendClipboard(_)
+            | InputAction::ReceiveClipboard => {}
+        }
+    }
+
+    for action in [
         InputAction::Key {
             down: true,
             keysym: 1,
@@ -411,5 +470,7 @@ fn public_input_actions_are_semantic_and_clipboard_payloads_are_not_debuggable()
         InputAction::SetViewOnly(true),
         InputAction::SendClipboard(String::new()),
         InputAction::ReceiveClipboard,
-    ];
+    ] {
+        assert_reviewed_semantic_action(action);
+    }
 }

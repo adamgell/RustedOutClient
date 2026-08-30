@@ -6,7 +6,9 @@ use tokio::sync::oneshot;
 use tracing::debug;
 
 use crate::{
-    connection::{FbRect, VncCommand, VncEvent, VNC_QUEUE_CAPACITY},
+    connection::{
+        ClipboardSlot, FbRect, VncCommand, VncEvent, VncSessionChannels, VNC_QUEUE_CAPACITY,
+    },
     ssh::{ProxyTicket, TrustedSshProxy},
 };
 
@@ -347,19 +349,36 @@ impl VncClient {
         event_tx: Sender<VncEvent>,
         command_rx: Receiver<VncCommand>,
     ) -> Result<(), RfbError> {
-        Self::run_inner(proxy, options, event_tx, command_rx, std::future::pending()).await
+        Self::run_inner(
+            proxy,
+            options,
+            event_tx,
+            command_rx,
+            ClipboardSlot::default(),
+            false,
+            std::future::pending(),
+        )
+        .await
     }
 
     pub(crate) async fn run_cancellable(
         proxy: TrustedSshProxy,
         options: VncOptions,
-        event_tx: Sender<VncEvent>,
-        command_rx: Receiver<VncCommand>,
+        channels: VncSessionChannels,
+        clipboard_enabled: bool,
         cancelled: oneshot::Receiver<()>,
     ) -> Result<(), RfbError> {
-        Self::run_inner(proxy, options, event_tx, command_rx, async move {
-            let _ = cancelled.await;
-        })
+        Self::run_inner(
+            proxy,
+            options,
+            channels.event_tx,
+            channels.command_rx,
+            channels.clipboard,
+            clipboard_enabled,
+            async move {
+                let _ = cancelled.await;
+            },
+        )
         .await
     }
 
@@ -368,6 +387,8 @@ impl VncClient {
         options: VncOptions,
         event_tx: Sender<VncEvent>,
         command_rx: Receiver<VncCommand>,
+        clipboard: ClipboardSlot,
+        clipboard_enabled: bool,
         cancelled: C,
     ) -> Result<(), RfbError>
     where
@@ -378,7 +399,15 @@ impl VncClient {
         let mut reader = RfbReader::new(stream, limits);
         tokio::pin!(cancelled);
         let result = {
-            let connected = run_connected(&mut reader, ticket, options, event_tx, command_rx);
+            let connected = run_connected(
+                &mut reader,
+                ticket,
+                options,
+                event_tx,
+                command_rx,
+                clipboard,
+                clipboard_enabled,
+            );
             tokio::pin!(connected);
             tokio::select! {
                 biased;
@@ -396,6 +425,8 @@ async fn run_connected<S>(
     options: VncOptions,
     event_tx: Sender<VncEvent>,
     command_rx: Receiver<VncCommand>,
+    clipboard: ClipboardSlot,
+    clipboard_enabled: bool,
 ) -> Result<(), RfbError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -444,7 +475,16 @@ where
 
     send_fb_update_request(reader, false, 0, 0, width, height).await?;
 
-    run_session(reader, &mut framebuffer, &mut events, &command_rx, limits).await
+    run_session(
+        reader,
+        &mut framebuffer,
+        &mut events,
+        &command_rx,
+        limits,
+        &clipboard,
+        clipboard_enabled,
+    )
+    .await
 }
 
 async fn finish_session<S>(
@@ -470,6 +510,8 @@ async fn run_session<S>(
     events: &mut EventQueue,
     command_rx: &Receiver<VncCommand>,
     limits: ProtocolLimits,
+    clipboard: &ClipboardSlot,
+    clipboard_enabled: bool,
 ) -> Result<(), RfbError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -495,6 +537,14 @@ where
                 }
                 Ok(VncCommand::SetClipboard(text)) => {
                     send_client_cut_text(reader, &text, limits).await?;
+                }
+                Ok(VncCommand::GracefulDisconnect(barrier)) => {
+                    reader
+                        .flush()
+                        .await
+                        .map_err(|source| RfbError::io(RfbPhase::Cleanup, source))?;
+                    barrier.acknowledge();
+                    return Ok(());
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -690,7 +740,9 @@ where
                         "server clipboard UTF-8",
                     )
                 })?;
-                events.send_lossless(VncEvent::ClipboardText(text))?;
+                if clipboard_enabled {
+                    clipboard.replace(text);
+                }
             }
             _ => {
                 return Err(RfbError::new(
@@ -969,7 +1021,7 @@ mod tests {
         tight, EventQueue, TightState,
     };
     use crate::{
-        connection::{FbRect, VncCommand, VncEvent},
+        connection::{bounded_vnc_channels, ClipboardSlot, FbRect, VncCommand, VncEvent},
         vnc::{
             messages::{encoding as enc, server_msg},
             CheckedRect, Framebuffer, ProtocolLimits, RfbError, RfbErrorKind, RfbPhase, RfbReader,
@@ -1104,6 +1156,7 @@ mod tests {
         let (event_tx, event_rx) = bounded(8);
         let mut events = EventQueue::new(event_tx, limits);
         let (_command_tx, command_rx) = bounded::<VncCommand>(1);
+        let clipboard = ClipboardSlot::default();
 
         let error = run_session(
             &mut reader,
@@ -1111,12 +1164,152 @@ mod tests {
             &mut events,
             &command_rx,
             limits,
+            &clipboard,
+            true,
         )
         .await
         .unwrap_err();
         assert_eq!(error.phase(), RfbPhase::Session);
         assert_eq!(error.kind(), RfbErrorKind::Protocol);
         assert!(event_rx.try_recv().is_err());
+        assert_eq!(clipboard.retained_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn clipboard_pressure_replaces_one_private_slot_without_event_payloads() {
+        const MESSAGE_COUNT: usize = 257;
+        const MESSAGE_BYTES: usize = 8;
+
+        let (client, mut peer) = duplex(128);
+        let producer = tokio::spawn(async move {
+            for index in 0..MESSAGE_COUNT {
+                let text = format!("{index:0MESSAGE_BYTES$}");
+                assert_eq!(text.len(), MESSAGE_BYTES);
+                peer.write_all(&[server_msg::SERVER_CUT_TEXT, 0, 0, 0])
+                    .await
+                    .unwrap();
+                peer.write_all(&(MESSAGE_BYTES as u32).to_be_bytes())
+                    .await
+                    .unwrap();
+                peer.write_all(text.as_bytes()).await.unwrap();
+            }
+            peer.shutdown().await.unwrap();
+        });
+        let limits = ProtocolLimits {
+            max_clipboard_bytes: MESSAGE_BYTES as u32,
+            ..ProtocolLimits::default()
+        };
+        let mut reader = RfbReader::new(client, limits);
+        let mut framebuffer = Framebuffer::new(1, 1, limits).unwrap();
+        let (connection, channels) = bounded_vnc_channels();
+        let mut events = EventQueue::new(channels.event_tx, limits);
+
+        let error = run_session(
+            &mut reader,
+            &mut framebuffer,
+            &mut events,
+            &channels.command_rx,
+            limits,
+            &channels.clipboard,
+            true,
+        )
+        .await
+        .unwrap_err();
+        producer.await.unwrap();
+
+        assert_eq!(error.kind(), RfbErrorKind::Io);
+        assert_eq!(error.io_kind(), Some(io::ErrorKind::UnexpectedEof));
+        assert!(connection.event_rx.try_recv().is_err());
+        assert_eq!(channels.clipboard.retained_count(), 1);
+        let latest = channels.clipboard.take().unwrap();
+        assert_eq!(latest.as_str(), "00000256");
+        assert_eq!(channels.clipboard.retained_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_clipboard_pressure_validates_and_retains_nothing() {
+        const MESSAGE_COUNT: usize = 257;
+        const MESSAGE_BYTES: usize = 8;
+
+        let (client, mut peer) = duplex(128);
+        let producer = tokio::spawn(async move {
+            for index in 0..MESSAGE_COUNT {
+                let text = format!("{index:0MESSAGE_BYTES$}");
+                peer.write_all(&[server_msg::SERVER_CUT_TEXT, 0, 0, 0])
+                    .await
+                    .unwrap();
+                peer.write_all(&(MESSAGE_BYTES as u32).to_be_bytes())
+                    .await
+                    .unwrap();
+                peer.write_all(text.as_bytes()).await.unwrap();
+            }
+            peer.shutdown().await.unwrap();
+        });
+        let limits = ProtocolLimits {
+            max_clipboard_bytes: MESSAGE_BYTES as u32,
+            ..ProtocolLimits::default()
+        };
+        let mut reader = RfbReader::new(client, limits);
+        let mut framebuffer = Framebuffer::new(1, 1, limits).unwrap();
+        let (connection, channels) = bounded_vnc_channels();
+        let mut events = EventQueue::new(channels.event_tx, limits);
+
+        let error = run_session(
+            &mut reader,
+            &mut framebuffer,
+            &mut events,
+            &channels.command_rx,
+            limits,
+            &channels.clipboard,
+            false,
+        )
+        .await
+        .unwrap_err();
+        producer.await.unwrap();
+
+        assert_eq!(error.kind(), RfbErrorKind::Io);
+        assert_eq!(error.io_kind(), Some(io::ErrorKind::UnexpectedEof));
+        assert!(connection.event_rx.try_recv().is_err());
+        assert_eq!(channels.clipboard.retained_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn graceful_close_acknowledges_only_after_ordered_key_bytes_are_written() {
+        let (client, mut peer) = duplex(64);
+        let limits = ProtocolLimits::default();
+        let mut reader = RfbReader::new(client, limits);
+        let mut framebuffer = Framebuffer::new(1, 1, limits).unwrap();
+        let (connection, channels) = bounded_vnc_channels();
+        let mut events = EventQueue::new(channels.event_tx, limits);
+
+        connection.send_key(true, 0xffe3).unwrap();
+        connection.send_key(false, 0xffe3).unwrap();
+        let acknowledged = connection.begin_graceful_close().unwrap();
+
+        let session = run_session(
+            &mut reader,
+            &mut framebuffer,
+            &mut events,
+            &channels.command_rx,
+            limits,
+            &channels.clipboard,
+            false,
+        );
+        let (result, wire) = tokio::join!(session, async {
+            let mut wire = [0_u8; 16];
+            peer.read_exact(&mut wire).await.unwrap();
+            wire
+        });
+
+        result.unwrap();
+        acknowledged.await.unwrap();
+        assert_eq!(
+            wire,
+            [
+                4, 1, 0, 0, 0, 0, 0xff, 0xe3, // Control_L down
+                4, 0, 0, 0, 0, 0, 0xff, 0xe3, // Control_L up
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1174,6 +1367,7 @@ mod tests {
         let (event_tx, event_rx) = bounded(8);
         let mut events = EventQueue::new(event_tx, limits);
         let (_command_tx, command_rx) = bounded::<VncCommand>(1);
+        let clipboard = ClipboardSlot::default();
 
         let error = run_session(
             &mut reader,
@@ -1181,6 +1375,8 @@ mod tests {
             &mut events,
             &command_rx,
             limits,
+            &clipboard,
+            false,
         )
         .await
         .unwrap_err();
