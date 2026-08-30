@@ -73,12 +73,16 @@ fn is_ssh_authentication_line(line: &str) -> bool {
         return false;
     };
 
-    !target.is_empty()
-        && target.bytes().all(|byte| byte.is_ascii_graphic())
-        && !methods.is_empty()
+    let Some((user, host)) = target.split_once('@') else {
+        return false;
+    };
+
+    is_graphic_component(user)
+        && is_graphic_component(host)
+        && !host.contains('@')
         && methods
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b',' | b'-' | b'_'))
+            .split(',')
+            .all(|method| !method.is_empty() && method.bytes().all(is_auth_method_byte))
 }
 
 fn is_ssh_timeout_line(line: &str) -> bool {
@@ -88,11 +92,26 @@ fn is_ssh_timeout_line(line: &str) -> bool {
     else {
         return false;
     };
-    let Some((endpoint, message)) = details.rsplit_once(": ") else {
+    let Some((host, port_and_message)) = details.rsplit_once(" port ") else {
+        return false;
+    };
+    let Some((port, message)) = port_and_message.split_once(": ") else {
         return false;
     };
 
-    !endpoint.is_empty()
-        && endpoint.contains(" port ")
+    let valid_port = !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|port| port != 0);
+
+    is_graphic_component(host)
+        && valid_port
         && matches!(message, "Operation timed out" | "Connection timed out")
+}
+
+fn is_graphic_component(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn is_auth_method_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-'
 }

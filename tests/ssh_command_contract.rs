@@ -132,8 +132,18 @@ fn bounded_stderr_classification_distinguishes_safe_public_failure_kinds() {
             "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nOffending ED25519 key in /Users/test/.ssh/known_hosts:4",
             SshFailureKind::HostKeyChanged,
         ),
-        ("root@pve.example.invalid: Permission denied (publickey).", SshFailureKind::Authentication),
-        ("ssh: connect to host pve.example.invalid port 22: Operation timed out", SshFailureKind::Timeout),
+        (
+            "root@pve.example.invalid: Permission denied (publickey,keyboard-interactive).",
+            SshFailureKind::Authentication,
+        ),
+        (
+            "ssh: connect to host pve.example.invalid port 22: Operation timed out",
+            SshFailureKind::Timeout,
+        ),
+        (
+            "ssh: connect to host pve.example.invalid port 65535: Connection timed out",
+            SshFailureKind::Timeout,
+        ),
         ("ssh: connect to host pve.example.invalid port 22: No route to host", SshFailureKind::Ssh),
         (
             "pvesh get: Permission denied while reading /nodes/pve2/qemu",
@@ -141,6 +151,19 @@ fn bounded_stderr_classification_distinguishes_safe_public_failure_kinds() {
         ),
         (
             "qm vncproxy: Operation timed out while waiting for the guest",
+            SshFailureKind::Ssh,
+        ),
+        ("qm: Permission denied (publickey).", SshFailureKind::Ssh),
+        (
+            "ssh: connect to host pve.example.invalid port invalid: Operation timed out",
+            SshFailureKind::Ssh,
+        ),
+        (
+            "ssh: connect to host pve.example.invalid port 0: Operation timed out",
+            SshFailureKind::Ssh,
+        ),
+        (
+            "ssh: connect to host pve.example.invalid port 65536: Operation timed out",
             SshFailureKind::Ssh,
         ),
     ];
