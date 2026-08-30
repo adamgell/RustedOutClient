@@ -2,7 +2,7 @@ use std::{ffi::OsString, path::PathBuf};
 
 use rustedoutclient::{
     model::{NodeName, PveProfile, SshTarget, VmId},
-    ssh::{classify_stderr, CommandSpec, SshCommandFactory, SshFailureKind},
+    ssh::{classify_stderr, CommandSpec, ProxyTicket, SshCommandFactory, SshFailureKind},
 };
 
 const SOCKET: &str = "/tmp/roc-test/c";
@@ -46,7 +46,7 @@ fn common_args() -> Vec<&'static str> {
 fn assert_common_contract(spec: &CommandSpec) {
     assert_eq!(spec.program, PathBuf::from("/usr/bin/ssh"));
     assert!(spec.capture_stderr);
-    assert!(spec.env.is_empty());
+    assert_eq!(spec.environment_variable_count(), 0);
 
     for option in [
         "BatchMode=yes",
@@ -90,20 +90,34 @@ fn every_operation_has_exact_strict_shell_free_argv() {
         TARGET,
         "pvesh get /nodes/pve2/qemu --output-format json",
     ]);
-    let mut proxy = common_args();
-    proxy.extend(["-S", SOCKET, TARGET, "exec /usr/sbin/qm vncproxy 107"]);
-
     for (spec, expected) in [
         (factory.master(&profile), master),
         (factory.check(&profile), check),
         (factory.exit(&profile), exit),
         (factory.inventory(&profile), inventory),
-        (factory.proxy(&profile, VmId::new(107).unwrap()), proxy),
     ] {
         let spec = spec.unwrap();
         assert_common_contract(&spec);
         assert_eq!(spec.args, os_args(&expected));
     }
+
+    let ticket = ProxyTicket::generate();
+    let proxy = factory
+        .proxy(&profile, VmId::new(107).unwrap(), &ticket)
+        .unwrap();
+    let mut expected_proxy = common_args();
+    expected_proxy.extend([
+        "-o",
+        "SendEnv=LC_PVE_TICKET",
+        "-S",
+        SOCKET,
+        TARGET,
+        "qm vncproxy 107",
+    ]);
+    assert_eq!(proxy.program, PathBuf::from("/usr/bin/ssh"));
+    assert!(proxy.capture_stderr);
+    assert_eq!(proxy.environment_variable_count(), 1);
+    assert_eq!(proxy.args, os_args(&expected_proxy));
 }
 
 #[test]
@@ -117,8 +131,19 @@ fn inventory_and_proxy_keep_the_allowlisted_remote_commands_as_single_arguments(
         "pvesh get /nodes/pve2/qemu --output-format json"
     );
 
-    let proxy = factory.proxy(&profile, VmId::new(107).unwrap()).unwrap();
-    assert_eq!(proxy.args.last().unwrap(), "exec /usr/sbin/qm vncproxy 107");
+    let ticket = ProxyTicket::generate();
+    let proxy = factory
+        .proxy(&profile, VmId::new(107).unwrap(), &ticket)
+        .unwrap();
+    assert_eq!(proxy.args.last().unwrap(), "qm vncproxy 107");
+    assert_eq!(
+        proxy
+            .args
+            .iter()
+            .filter(|arg| *arg == "SendEnv=LC_PVE_TICKET")
+            .count(),
+        1
+    );
 }
 
 #[test]

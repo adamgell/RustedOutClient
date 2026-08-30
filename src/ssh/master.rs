@@ -1,4 +1,9 @@
-use std::{io, process::Stdio, time::Duration};
+use std::{
+    io,
+    process::Stdio,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -13,13 +18,17 @@ use tokio::{
 
 use crate::model::PveProfile;
 
-use super::{classify_stderr, CommandSpec, SshCommandFactory, SshFailure};
+use super::{
+    classify_stderr, CommandSpec, InventoryClient, InventoryError, SshCommandFactory, SshFailure,
+    VerifiedInventory,
+};
 
 const MAX_CAPTURED_STDERR_BYTES: usize = 65_536;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+static NEXT_MASTER_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct ControlPolicy {
@@ -101,6 +110,15 @@ pub struct SshMaster {
     profile: PveProfile,
     child: Option<Child>,
     stderr_task: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    owner_id: u64,
+}
+
+/// Proof that this exact owned master completed a successful control check.
+///
+/// Its field is private, so downstream callers can obtain it only by awaiting
+/// [`SshMaster::verify`].
+pub struct VerifiedSshMaster<'a> {
+    master: &'a mut SshMaster,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -179,7 +197,13 @@ impl SshMaster {
             profile,
             child: Some(child),
             stderr_task,
+            owner_id: NEXT_MASTER_OWNER_ID.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    pub async fn verify(&mut self) -> Result<VerifiedSshMaster<'_>, SshMasterError> {
+        self.check().await?;
+        Ok(VerifiedSshMaster { master: self })
     }
 
     pub async fn check(&mut self) -> Result<(), SshMasterError> {
@@ -289,6 +313,35 @@ impl SshMaster {
         } else {
             true
         }
+    }
+}
+
+impl VerifiedSshMaster<'_> {
+    pub async fn fetch_inventory(&mut self) -> Result<VerifiedInventory, InventoryError> {
+        let snapshot = InventoryClient::fetch(&self.master.factory, &self.master.profile).await?;
+        Ok(VerifiedInventory::from_live_fetch(
+            self.master.owner_id,
+            snapshot,
+        ))
+    }
+
+    pub(super) async fn recheck(&mut self) -> Result<(), SshMasterError> {
+        self.master.check().await
+    }
+
+    pub(super) fn proxy_spec(
+        &self,
+        vmid: crate::model::VmId,
+        ticket: &super::ProxyTicket,
+    ) -> CommandSpec {
+        self.master
+            .factory
+            .proxy(&self.master.profile, vmid, ticket)
+            .unwrap()
+    }
+
+    pub(super) fn owner_id(&self) -> u64 {
+        self.master.owner_id
     }
 }
 

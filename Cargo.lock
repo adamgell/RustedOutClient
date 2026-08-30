@@ -3271,6 +3271,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "image",
+ "rand 0.8.7",
  "rustix 1.1.4",
  "secrecy",
  "serde",

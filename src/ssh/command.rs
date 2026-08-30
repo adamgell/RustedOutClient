@@ -9,6 +9,8 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::model::{PveProfile, VmId};
 
+use super::ProxyTicket;
+
 const SYSTEM_SSH: &str = "/usr/bin/ssh";
 const COMMON_OPTIONS: &[&str] = &[
     "BatchMode=yes",
@@ -27,11 +29,15 @@ const COMMON_OPTIONS: &[&str] = &[
 pub struct CommandSpec {
     pub program: PathBuf,
     pub args: Vec<OsString>,
-    pub env: Vec<(OsString, SecretString)>,
+    env: Vec<(OsString, SecretString)>,
     pub capture_stderr: bool,
 }
 
 impl CommandSpec {
+    pub fn environment_variable_count(&self) -> usize {
+        self.env.len()
+    }
+
     /// Builds an OpenSSH process directly from separate program, argument, and
     /// environment values. It never invokes a command interpreter.
     ///
@@ -96,12 +102,25 @@ impl SshCommandFactory {
         Ok(spec)
     }
 
-    pub fn proxy(&self, profile: &PveProfile, vmid: VmId) -> Result<CommandSpec, Infallible> {
-        let mut spec = self.child_spec(profile);
-        spec.args.push(OsString::from(format!(
-            "exec /usr/sbin/qm vncproxy {}",
-            vmid.get()
-        )));
+    pub fn proxy(
+        &self,
+        profile: &PveProfile,
+        vmid: VmId,
+        ticket: &ProxyTicket,
+    ) -> Result<CommandSpec, Infallible> {
+        let mut spec = self.base_spec();
+        spec.args.extend([
+            OsString::from("-o"),
+            OsString::from("SendEnv=LC_PVE_TICKET"),
+        ]);
+        self.with_control_socket(&mut spec);
+        self.with_target(&mut spec, profile);
+        spec.args
+            .push(OsString::from(format!("qm vncproxy {}", vmid.get())));
+        spec.env.push((
+            OsString::from("LC_PVE_TICKET"),
+            SecretString::from(ticket.expose_for_auth()),
+        ));
         Ok(spec)
     }
 

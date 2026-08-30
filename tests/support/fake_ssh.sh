@@ -3,6 +3,7 @@
 socket=
 operation=
 master=false
+proxy=false
 previous=
 
 for argument in "$@"; do
@@ -14,6 +15,9 @@ for argument in "$@"; do
     if [ "$argument" = "-M" ]; then
         master=true
     fi
+    case "$argument" in
+        "qm vncproxy "*) proxy=true ;;
+    esac
     previous=$argument
 done
 
@@ -67,6 +71,29 @@ if [ "$operation" = "exit" ]; then
     if [ -f "$pid_file" ]; then
         pid=$(sed -n '1p' "$pid_file")
         kill -TERM "$pid" 2>/dev/null || true
+    fi
+    exit 0
+fi
+
+if [ "$proxy" = true ]; then
+    case "${LC_PVE_TICKET-}" in
+        ????????) ;;
+        *) exit 71 ;;
+    esac
+    case "$LC_PVE_TICKET" in
+        *[!A-Za-z0-9]*) exit 72 ;;
+    esac
+    printf '%s\n' "$$" > "${socket}.proxy.pid"
+    : > "${socket}.proxy.env-valid"
+    printf 'RFB 003.008\n'
+    if [ -f "${socket}.proxy_large_stderr" ]; then
+        awk 'BEGIN { for (i = 0; i < 100; i++) printf "%01024d", 0 }' >&2
+    fi
+    dd bs=1 count=1 of=/dev/null 2>/dev/null || true
+    if [ -f "${socket}.hang_proxy" ]; then
+        while :; do
+            sleep 0.05
+        done
     fi
     exit 0
 fi
