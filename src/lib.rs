@@ -7,3 +7,4 @@ pub mod connection;
 pub mod framebuffer;
 pub mod model;
 pub mod protocol;
+pub mod ssh;
