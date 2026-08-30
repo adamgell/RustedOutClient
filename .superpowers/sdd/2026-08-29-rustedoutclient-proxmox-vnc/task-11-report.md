@@ -520,3 +520,112 @@ This report is the only file in the permitted evidence-only follow-up commit. Ca
 - No live Proxmox/VM operation, guest change, real clipboard access, secret value, dependency change, stash mutation, rollback-artifact edit, subagent, push, amend, or GUI run occurred.
 
 Remaining concern/acceptance boundary: platform-native visual inspection, real Windows input/secure-attention behavior, two concurrent live sessions, real guest ExtendedDesktopSize behavior, real clipboard transfer, and repeated live close/reconnect cleanup remain controller-run native acceptance. They were intentionally not attempted under the fix-round safety boundaries. No known automated-test, static-analysis, source-boundary, or repository-integrity concern remains.
+
+# Task 11 fix round 3 report
+
+Date: 2026-08-30
+Fix brief: `task-11-fix-round-3.md`
+Required fix base: `58a2d579cd26ea9afcc765d96f9628e2853e1fe1`
+Implementation commit message: `fix: retain queued pointer release cleanup`
+Final implementation commit SHA: `327bad1ccc1802163eeb8eb2c25743497a28cd60`
+Focused coverage commit SHA: `ea22a5432f7a8eba3765ac9650d8d9d6b40a272c`
+
+This section supersedes earlier Task 11 evidence wherever round-3 behavior or test counts differ. Every round-1 and round-2 implementation and regression remains present.
+
+## Round-3 starting and root-cause evidence
+
+- Before editing, `git rev-parse HEAD` returned exactly `58a2d579cd26ea9afcc765d96f9628e2853e1fe1` and the linked worktree was clean on `feature/proxmox-console-foundation`.
+- `task-11-fix-round-3.md` was read completely before editing.
+- The event path was traced from `collect_pointer_events` through `dispatch_rendered_actions`, `dispatch_action`, and `InputOwnership` acknowledgement.
+- Root cause: pointer collection cleared the local button mask before the app-command send result was known, while the app acknowledged only `ReleaseOwnedInput`. A zero-button ordinary pointer send returning Full or Disconnected therefore left no remote-release obligation, allowed later controls through, and allowed native close to enqueue Shutdown early.
+- No subagent, stash command, live endpoint, VM/guest action, real clipboard access, dependency change, rollback-artifact change, push, amend, or GUI process was used.
+- Parked Task 8 stash 0 remained exactly `0d95b4f403abb215f8d6d9f8e21d64201d60e76a` with subject `task8-parser-qa-pending-program-access`.
+
+## Round-3 test-first RED evidence
+
+The three app-level scripted-queue regressions were added before the production release-obligation state or ordinary pointer acknowledgement hook.
+
+1. Full zero-button release and selection change
+   - Exact test: `full_zero_button_release_retries_one_old_owner_cleanup_before_later_control`.
+   - Result: exit 101.
+   - Actual assertion: accepted commands were `[Pointer(old, 1, 10, 20), Other]`; expected only the accepted nonzero pointer. The Full zero-button release incorrectly allowed the later control through and retained no cleanup.
+
+2. Sent versus Disconnected ordinary release acknowledgement
+   - Exact test: `ordinary_zero_button_acknowledgement_clears_only_sent_and_disconnects_without_spin`.
+   - Result: exit 101.
+   - Actual assertion: `owner_cleanup_pending()` was false after the zero-button send returned Disconnected; one bounded non-spinning teardown record was required.
+
+3. Native close ordering after a Full mouse-up
+   - Exact test: `native_close_after_full_mouse_up_orders_retained_release_before_shutdown`.
+   - Result: exit 101.
+   - Actual assertion: `shutdown_attempts` was 1 instead of 0 because the failed ordinary release was forgotten and Shutdown was enqueued before semantic cleanup.
+
+Each exact regression passed after the single production fix. The Sent case additionally proves that a later key/focus cleanup carries `pointer_position: None`, so an accepted ordinary zero-button release leaves no duplicate pointer recovery.
+
+## Round-3 implementation
+
+- Added one `pointer_release_required: bool` to the existing bounded `InputOwnership` record. The existing `Option<(u16, u16)>` remains the sole coordinate slot; no queue, history, task, timer, transport, or second cleanup path was added.
+- Immediately before an ordinary pointer action is dispatched, the matching owner records its bounded guest coordinates. Any nonzero button mask conservatively marks remote pointer release required regardless of whether that specific send is accepted.
+- After dispatch, a matching zero-button action clears the obligation only on `DispatchOutcome::Sent`. Once local buttons are also zero, its retained pointer coordinates are cleared, preventing duplicate pointer recovery.
+- Busy and other usable-but-not-accepted zero-button outcomes schedule the existing targeted `ReleaseOwnedInput` state. `dispatch_rendered_actions` then stops, so no later input or control can overtake cleanup.
+- Disconnected pointer dispatch moves the existing cleanup state to Disconnected. It retains the owner and coordinates without another send attempt or fresh input; authoritative manager/event-channel completion clears it.
+- Existing pending cleanup now includes the stored pointer position whenever either local buttons remain held or the remote-release obligation is outstanding.
+- Pointer-gone/outside release clears the local mask but preserves coordinates while a remote release remains required. The next existing semantic cleanup can therefore emit only a zero-button recovery at the last valid guest position.
+- Selection changes cannot retarget acknowledgement or cleanup because both compare and retain the original `SessionId`.
+- Native close observes the resulting pending cleanup and preserves the existing FIFO order `ReleaseOwnedInput(Some(last_position))` then `Shutdown`.
+- Regular Ready/view-only/error gating, compile-fail removal of split cleanup actions, unified controller attempt-both behavior, and the manager whole-close deadline are unchanged.
+
+## Focused GREEN evidence
+
+| Command/focus | Result |
+|---|---|
+| Exact Full mouse-up/old-owner retry regression | 1 passed |
+| Exact Sent/Disconnected acknowledgement regression | 1 passed |
+| Exact native-close ordering regression | 1 passed |
+| `cargo test --lib app::view::input_tests` | 12 passed, including all five pointer masks plus explicit outside-release and PointerGone behavior |
+| `cargo test --lib app::close_coordinator_tests` | 10 passed |
+| Exact `release_owned_input_attempts_pointer_and_all_keys_returns_first_error_and_clears_tracking` | 1 passed; key cleanup still runs after pointer-write failure |
+
+## Required final gate sequence
+
+The full required sequence was run on the final implementation tree after formatting:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | exit 0 |
+| `cargo test --test app_state_contract` | exit 0; 12 passed |
+| `cargo test --test input_contract` | exit 0; 14 passed plus three nested trybuild fixtures |
+| `cargo test --test session_manager_contract` | exit 0; 23 passed |
+| `cargo test --all-targets` | exit 0; 122 library + 164 integration = 286 passed, 0 failed; five nested trybuild fixtures also passed |
+| `cargo clippy --all-targets -- -D warnings` | exit 0; no warnings |
+| `cargo build --release` | exit 0 |
+| `git diff --check` | exit 0 |
+
+## Round-3 changed files
+
+Implementation commit `327bad1ccc1802163eeb8eb2c25743497a28cd60` contains exactly two files:
+
+- `src/app/mod.rs` — ordinary pointer dispatch acknowledgement, cleanup-first loop suppression, scripted Full/Disconnected/selection/native-close regressions.
+- `src/app/view.rs` — one bounded remote-release obligation, retained coordinates, authoritative Sent/Busy/Disconnected transitions, and cleanup payload projection.
+
+Focused coverage commit `ea22a5432f7a8eba3765ac9650d8d9d6b40a272c` contains only `src/app/view.rs` and adds the explicit accepted-down → PointerGone → Full zero-button → retained semantic cleanup regression. This report is the only file in the final permitted evidence-only follow-up commit. Cargo manifests and lockfiles are unchanged. No protected rollback artifact appears in any round-3 commit.
+
+## Round-3 self-review against the remaining finding
+
+1. A nonzero pointer action always creates a conservative remote-release obligation for the matching owner.
+2. The last `u16` guest coordinates survive local mask zero and pointer departure while that obligation exists.
+3. Only an accepted matching zero-button ordinary action clears the obligation; Busy folds it into existing pending semantic cleanup.
+4. Disconnected retains one bounded, non-spinning owner record until manager completion.
+5. Cleanup and acknowledgement stay targeted to the old owner across a session selection change.
+6. Native close cannot enqueue Shutdown ahead of the retained semantic release.
+7. Existing tests keep all five local button masks, visible/outside release, and pointer-gone behavior intact.
+8. The existing `InputController::release_owned_input` regression still proves pointer failure returns first while every held key release is attempted and tracked state is cleared.
+
+## Privacy, security, and boundary review
+
+- The app surface remains semantic and contains no raw `VncCommand`; recovery still emits only zero-button pointer input.
+- No queue capacity, two-session limit, framebuffer/protocol ceiling, SSH command/known-host rule, trusted-proxy/VNC-auth boundary, clipboard design, close deadline, owned-process cleanup, private persistence, or content-free error behavior changed.
+- Task 12 remains the existing disabled/typed-not-available action only. Task 8 and all protected rollback artifacts remain untouched.
+- Tests use only synthetic `.invalid` configuration and `NoClipboard`; no host clipboard is opened and no secret or live infrastructure value is present.
+
+Remaining concern/acceptance boundary: real macOS title-bar behavior, live Windows pointer/key behavior under actual queue pressure, two concurrent live sessions, and repeated live close/reconnect cleanup remain controller-run native acceptance. They were intentionally not attempted under the fix-round safety boundaries. No known automated-test, static-analysis, source-boundary, or repository-integrity concern remains.
