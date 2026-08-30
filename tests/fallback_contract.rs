@@ -154,7 +154,7 @@ fn semantic_command_contains_only_target_and_display_preferences() {
 }
 
 #[test]
-fn production_manager_validates_then_rechecks_inventory_before_fresh_proxy_open() {
+fn production_manager_rechecks_inventory_before_one_pinned_viewer_open() {
     let manager = source("src/session/manager.rs");
     let production = manager
         .split("impl SessionBackend for ProductionBackend")
@@ -167,11 +167,11 @@ fn production_manager_validates_then_rechecks_inventory_before_fresh_proxy_open(
         .split("fn close_master")
         .next()
         .unwrap();
-    let validate = fallback.find("validate_viewer_path").unwrap();
+    assert!(!fallback.contains("validate_viewer_path"));
     let verify = fallback.find("master.verify()").unwrap();
     let connect = fallback.find("TrustedSshProxy::connect").unwrap();
     let open = fallback.find("TigerVncFallback::open").unwrap();
-    assert!(validate < verify && verify < connect && connect < open);
+    assert!(verify < connect && connect < open);
 
     let native_error_mapping = manager
         .split("fn public_rfb_error")

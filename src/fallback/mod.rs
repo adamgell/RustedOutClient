@@ -3,6 +3,7 @@ mod relay;
 mod viewer;
 
 use std::{
+    ffi::OsString,
     fmt,
     path::Path,
     process::Stdio,
@@ -105,10 +106,6 @@ impl TigerVncFallback {
             OpenPolicy::production(),
         )
         .await
-    }
-
-    pub(crate) fn validate_viewer_path(viewer_path: &Path) -> Result<(), FallbackError> {
-        validate_viewer_path(viewer_path)
     }
 }
 
@@ -241,9 +238,68 @@ impl Drop for FallbackSession {
     }
 }
 
+struct ViewerEnvironment {
+    home: Option<OsString>,
+    tmpdir: Option<OsString>,
+    lang: Option<OsString>,
+    lc_all: Option<OsString>,
+    lc_ctype: Option<OsString>,
+    #[cfg(test)]
+    inherited_seed: Vec<(OsString, OsString)>,
+}
+
+impl ViewerEnvironment {
+    fn from_parent() -> Self {
+        Self {
+            home: std::env::var_os("HOME"),
+            tmpdir: std::env::var_os("TMPDIR"),
+            lang: std::env::var_os("LANG"),
+            lc_all: std::env::var_os("LC_ALL"),
+            lc_ctype: std::env::var_os("LC_CTYPE"),
+            #[cfg(test)]
+            inherited_seed: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(allowed: [Option<&str>; 5], inherited_seed: &[(&str, &str)]) -> Self {
+        Self {
+            home: allowed[0].map(Into::into),
+            tmpdir: allowed[1].map(Into::into),
+            lang: allowed[2].map(Into::into),
+            lc_all: allowed[3].map(Into::into),
+            lc_ctype: allowed[4].map(Into::into),
+            inherited_seed: inherited_seed
+                .iter()
+                .map(|(name, value)| ((*name).into(), (*value).into()))
+                .collect(),
+        }
+    }
+
+    fn apply(self, command: &mut tokio::process::Command) {
+        #[cfg(test)]
+        for (name, value) in self.inherited_seed {
+            command.env(name, value);
+        }
+        command.env_clear().env("PATH", "/usr/bin:/bin");
+        for (name, value) in [
+            ("HOME", self.home),
+            ("TMPDIR", self.tmpdir),
+            ("LANG", self.lang),
+            ("LC_ALL", self.lc_all),
+            ("LC_CTYPE", self.lc_ctype),
+        ] {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+    }
+}
+
 struct OpenPolicy {
     relay: RelayPolicy,
     viewer_snapshot: ViewerSnapshotPolicy,
+    viewer_environment: ViewerEnvironment,
     #[cfg(test)]
     password_file: PasswordFilePolicy,
     close_timeout: Duration,
@@ -260,6 +316,7 @@ impl OpenPolicy {
         Self {
             relay: RelayPolicy::production(FALLBACK_CLOSE_TIMEOUT),
             viewer_snapshot: ViewerSnapshotPolicy::production(),
+            viewer_environment: ViewerEnvironment::from_parent(),
             #[cfg(test)]
             password_file: PasswordFilePolicy::production(),
             close_timeout: FALLBACK_CLOSE_TIMEOUT,
@@ -368,6 +425,7 @@ where
         password_file.path(),
         &endpoint,
         preferences,
+        policy.viewer_environment,
     );
     let viewer = match viewer {
         Ok(viewer) => viewer,
@@ -426,6 +484,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn validate_viewer_path(viewer_path: &Path) -> Result<(), FallbackError> {
     viewer::validate_viewer_path(viewer_path).map_err(|error| fallback_snapshot_error(&error))
 }
@@ -442,21 +501,16 @@ fn spawn_viewer(
     password_path: &Path,
     endpoint: &str,
     preferences: FallbackPreferences,
+    environment: ViewerEnvironment,
 ) -> Result<OwnedViewer, ViewerSnapshot> {
     let mut command = tokio::process::Command::new(snapshot.path());
     command
         .args(viewer_arguments(password_path, endpoint, preferences))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    for variable in ["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"] {
-        if let Some(value) = std::env::var_os(variable) {
-            command.env(variable, value);
-        }
-    }
+    environment.apply(&mut command);
     match command.spawn() {
         Ok(child) => Ok(OwnedViewer { child, snapshot }),
         Err(_) => Err(snapshot),
@@ -702,31 +756,6 @@ exit 0
         }
     }
 
-    struct ParentEnvironment(Vec<(String, Option<std::ffi::OsString>)>);
-
-    impl ParentEnvironment {
-        fn install(values: &[(&str, &str)]) -> Self {
-            let mut previous = Vec::with_capacity(values.len());
-            for (key, value) in values {
-                previous.push(((*key).to_owned(), std::env::var_os(key)));
-                std::env::set_var(key, value);
-            }
-            Self(previous)
-        }
-    }
-
-    impl Drop for ParentEnvironment {
-        fn drop(&mut self) {
-            for (key, previous) in self.0.drain(..).rev() {
-                if let Some(previous) = previous {
-                    std::env::set_var(key, previous);
-                } else {
-                    std::env::remove_var(key);
-                }
-            }
-        }
-    }
-
     struct TestChannels {
         bound: oneshot::Receiver<std::net::SocketAddr>,
         accepted: oneshot::Receiver<()>,
@@ -748,6 +777,7 @@ exit 0
                     accepted: Some(accepted_tx),
                 },
                 viewer_snapshot: super::viewer::ViewerSnapshotPolicy::production(),
+                viewer_environment: super::ViewerEnvironment::from_parent(),
                 password_file: super::password_file::PasswordFilePolicy::production(),
                 close_timeout,
                 bound: Some(bound_tx),
@@ -784,6 +814,16 @@ exit 0
         })
         .await
         .expect("synthetic viewer artifact was not created");
+    }
+
+    async fn wait_for_nonempty(path: &Path) {
+        timeout(Duration::from_secs(5), async {
+            while !fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("synthetic viewer artifact remained empty");
     }
 
     async fn completed(session: &mut FallbackSession) -> Result<(), super::FallbackError> {
@@ -979,7 +1019,7 @@ exit 0
         .unwrap();
         let _address = channels.bound.await.unwrap();
         let pid = channels.pid.await.unwrap();
-        wait_for(&marker).await;
+        wait_for_nonempty(&marker).await;
 
         assert_eq!(fs::read_to_string(&marker).unwrap(), "opened-descriptor\n");
         assert_eq!(fs::read_link(&configured).unwrap(), replacement);
@@ -1011,22 +1051,27 @@ while :; do sleep 1; done
             &viewer,
             &template.replace("@CAPTURE@", &shell_quote(&capture)),
         );
-        let _environment = ParentEnvironment::install(&[
-            ("PATH", "/synthetic/parent-path"),
-            ("HOME", "/synthetic/home"),
-            ("TMPDIR", "/synthetic/tmp"),
-            ("LANG", "C"),
-            ("LC_ALL", "C"),
-            ("LC_CTYPE", "C"),
-            ("ROC_SYNTHETIC_SECRET", "blocked-arbitrary"),
-            ("DYLD_INSERT_LIBRARIES", "blocked-loader"),
-            ("LD_PRELOAD", "blocked-loader"),
-            ("SSH_AUTH_SOCK", "blocked-ssh"),
-            ("SSH_AGENT_PID", "blocked-ssh"),
-            ("LC_PVE_TICKET", "blocked-ticket"),
-        ]);
         let (proxy, _peer) = duplex(64);
-        let (policy, channels) = test_policy(Duration::from_secs(5), Duration::from_secs(1));
+        let (mut policy, channels) = test_policy(Duration::from_secs(5), Duration::from_secs(1));
+        policy.viewer_environment = super::ViewerEnvironment::for_test(
+            [
+                Some("/synthetic/home"),
+                Some("/synthetic/tmp"),
+                Some("C"),
+                Some("C"),
+                Some("C"),
+            ],
+            &[
+                ("PATH", "/synthetic/parent-path"),
+                ("HOME", "/blocked-home"),
+                ("ROC_SYNTHETIC_SECRET", "blocked-arbitrary"),
+                ("DYLD_INSERT_LIBRARIES", "blocked-loader"),
+                ("LD_PRELOAD", "blocked-loader"),
+                ("SSH_AUTH_SOCK", "blocked-ssh"),
+                ("SSH_AGENT_PID", "blocked-ssh"),
+                ("LC_PVE_TICKET", "blocked-ticket"),
+            ],
+        );
         let mut session = open_test(
             &runtime,
             &viewer,
@@ -1038,7 +1083,7 @@ while :; do sleep 1; done
         .unwrap();
         let _address = channels.bound.await.unwrap();
         let pid = channels.pid.await.unwrap();
-        wait_for(&capture).await;
+        wait_for_nonempty(&capture).await;
         assert_eq!(
             fs::read_to_string(&capture)
                 .unwrap()
@@ -1236,7 +1281,7 @@ while :; do sleep 1; done
         viewer.read_exact(&mut from_proxy).await.unwrap();
         assert_eq!(&from_proxy, b"proxy-bytes");
 
-        wait_for(&fixture.artifact(".argv")).await;
+        wait_for_nonempty(&fixture.artifact(".argv")).await;
         let arguments = fs::read_to_string(fixture.artifact(".argv"))
             .unwrap()
             .lines()
@@ -1287,7 +1332,7 @@ while :; do sleep 1; done
             .await
             .unwrap();
         let proxy_pid_path = runtime.control_socket().with_extension("proxy.pid");
-        wait_for(&proxy_pid_path).await;
+        wait_for_nonempty(&proxy_pid_path).await;
         let proxy_pid = helper_pid(&proxy_pid_path);
 
         let mut session = super::TigerVncFallback::open(
@@ -1298,8 +1343,8 @@ while :; do sleep 1; done
         )
         .await
         .unwrap();
-        wait_for(&viewer.artifact(".argv")).await;
-        wait_for(&viewer.artifact(".pid")).await;
+        wait_for_nonempty(&viewer.artifact(".argv")).await;
+        wait_for_nonempty(&viewer.artifact(".pid")).await;
         let viewer_pid = helper_pid(&viewer.artifact(".pid"));
         let arguments = fs::read_to_string(viewer.artifact(".argv")).unwrap();
         let endpoint = arguments.lines().last().unwrap();

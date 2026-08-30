@@ -1125,7 +1125,6 @@ impl SessionBackend for ProductionBackend {
                 .fallback_viewer
                 .as_deref()
                 .ok_or_else(|| PublicError::new(PublicErrorKind::ViewerFallback))?;
-            TigerVncFallback::validate_viewer_path(viewer_path).map_err(public_fallback_error)?;
             let master = self
                 .master
                 .as_mut()

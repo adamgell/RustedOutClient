@@ -238,6 +238,7 @@ impl Drop for ViewerSnapshot {
     }
 }
 
+#[cfg(test)]
 pub(super) fn validate_viewer_path(configured_path: &Path) -> Result<(), ViewerSnapshotError> {
     open_validated_source(configured_path).map(drop)
 }
