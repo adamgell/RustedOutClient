@@ -64,6 +64,26 @@ impl ViewResources {
         self.input.acknowledge_cleanup(outcome);
     }
 
+    pub(crate) fn begin_pointer_dispatch(
+        &mut self,
+        session_id: SessionId,
+        buttons: u8,
+        position: (u16, u16),
+    ) {
+        self.input
+            .begin_pointer_dispatch(session_id, buttons, position);
+    }
+
+    pub(crate) fn acknowledge_pointer_dispatch(
+        &mut self,
+        session_id: SessionId,
+        buttons: u8,
+        outcome: DispatchOutcome,
+    ) {
+        self.input
+            .acknowledge_pointer_dispatch(session_id, buttons, outcome);
+    }
+
     pub(crate) fn manager_completed(&mut self) {
         self.input.manager_completed();
     }
@@ -89,6 +109,7 @@ struct InputOwnership {
     modifier_bits: u8,
     pointer_buttons: u8,
     pointer_position: Option<(u16, u16)>,
+    pointer_release_required: bool,
     cleanup: CleanupDispatchState,
 }
 
@@ -155,10 +176,51 @@ impl InputOwnership {
             .filter(|_| self.cleanup == CleanupDispatchState::Pending)?;
         Some(UiAction::ReleaseOwnedInput {
             session_id,
-            pointer_position: (self.pointer_buttons != 0)
+            pointer_position: (self.pointer_buttons != 0 || self.pointer_release_required)
                 .then_some(self.pointer_position)
                 .flatten(),
         })
+    }
+
+    fn begin_pointer_dispatch(&mut self, session_id: SessionId, buttons: u8, position: (u16, u16)) {
+        if self.session_id != Some(session_id) {
+            return;
+        }
+        self.pointer_position = Some(position);
+        if buttons != 0 {
+            self.pointer_release_required = true;
+        }
+    }
+
+    fn acknowledge_pointer_dispatch(
+        &mut self,
+        session_id: SessionId,
+        buttons: u8,
+        outcome: DispatchOutcome,
+    ) {
+        if self.session_id != Some(session_id) || !self.pointer_release_required {
+            return;
+        }
+        if buttons != 0 {
+            if outcome == DispatchOutcome::Disconnected {
+                self.schedule_cleanup();
+                self.acknowledge_cleanup(outcome);
+            }
+            return;
+        }
+        match outcome {
+            DispatchOutcome::Sent => {
+                self.pointer_release_required = false;
+                if self.pointer_buttons == 0 {
+                    self.pointer_position = None;
+                }
+            }
+            DispatchOutcome::Disconnected => {
+                self.schedule_cleanup();
+                self.acknowledge_cleanup(outcome);
+            }
+            _ => self.schedule_cleanup(),
+        }
     }
 
     fn acknowledge_cleanup(&mut self, outcome: DispatchOutcome) {
@@ -194,7 +256,9 @@ impl InputOwnership {
             }
         }
         self.pointer_buttons = 0;
-        self.pointer_position = None;
+        if !self.pointer_release_required {
+            self.pointer_position = None;
+        }
     }
 
     #[cfg(test)]
@@ -207,6 +271,7 @@ impl InputOwnership {
         self.modifier_bits = modifier_bits;
         self.pointer_buttons = pointer_buttons;
         self.pointer_position = pointer_position;
+        self.pointer_release_required = pointer_buttons != 0;
     }
 
     #[cfg(test)]
@@ -216,6 +281,7 @@ impl InputOwnership {
             && self.modifier_bits == 0
             && self.pointer_buttons == 0
             && self.pointer_position.is_none()
+            && !self.pointer_release_required
             && self.cleanup == CleanupDispatchState::None
     }
 

@@ -179,7 +179,25 @@ where
     let initial_fullscreen = state.fullscreen();
     for action in actions {
         let owner_cleanup = matches!(action, UiAction::ReleaseOwnedInput { .. });
+        let pointer = match action {
+            UiAction::Pointer {
+                session_id,
+                buttons,
+                x,
+                y,
+            } => Some((session_id, buttons, (x, y))),
+            _ => None,
+        };
+        if let Some((session_id, buttons, position)) = pointer {
+            view.begin_pointer_dispatch(session_id, buttons, position);
+        }
         let outcome = dispatch_action(state, sink, clipboard, action);
+        if let Some((session_id, buttons, _)) = pointer {
+            view.acknowledge_pointer_dispatch(session_id, buttons, outcome);
+            if view.owner_cleanup_pending() {
+                break;
+            }
+        }
         if owner_cleanup {
             view.acknowledge_owner_cleanup(outcome);
             if outcome != DispatchOutcome::Sent {
@@ -295,10 +313,15 @@ mod close_coordinator_tests {
         dispatch_rendered_actions, AppCommand, AppCommandSink, AppState, ClipboardAdapter,
         ClipboardAdapterError, CloseCoordinator, CommandQueueError, NativeCloseAction, UiAction,
     };
-    use crate::session::{InputAction, SessionId};
+    use crate::{
+        config::AppConfig,
+        model::{NodeName, PveProfile, SshTarget, VmId},
+        session::{AppEvent, InputAction, ResizeStatus, SessionId, SessionPhase, SessionSnapshot},
+    };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum RecordedCommand {
+        Pointer(SessionId, u8, u16, u16),
         ReleaseOwnedInput(SessionId, Option<(u16, u16)>),
         Shutdown,
         Other,
@@ -329,6 +352,10 @@ mod close_coordinator_tests {
             let recorded = match command {
                 AppCommand::SendInput {
                     session_id,
+                    action: InputAction::Pointer { buttons, x, y },
+                } => RecordedCommand::Pointer(session_id, buttons, x, y),
+                AppCommand::SendInput {
+                    session_id,
                     action: InputAction::ReleaseOwnedInput { pointer_position },
                 } => RecordedCommand::ReleaseOwnedInput(session_id, pointer_position),
                 AppCommand::Shutdown => {
@@ -346,6 +373,31 @@ mod close_coordinator_tests {
         }
     }
 
+    fn ready_state(first: SessionId, second: SessionId) -> AppState {
+        let mut state = AppState::from_config(&AppConfig::new(PveProfile {
+            name: "Synthetic lab".to_owned(),
+            ssh_target: SshTarget::parse("root@pve.example.invalid").unwrap(),
+            node: NodeName::parse("pve2").unwrap(),
+        }));
+        for (session_id, vmid) in [(first, 107), (second, 108)] {
+            state
+                .apply(AppEvent::SessionChanged(SessionSnapshot {
+                    session_id,
+                    profile_name: "Synthetic lab".to_owned(),
+                    vmid: VmId::new(vmid).unwrap(),
+                    phase: SessionPhase::Ready,
+                    view_only: false,
+                    clipboard_enabled: false,
+                    dynamic_resolution_enabled: true,
+                    guest_size: None,
+                    resize_status: ResizeStatus::Waiting,
+                }))
+                .unwrap();
+        }
+        state.select_session(Some(first));
+        state
+    }
+
     #[derive(Default)]
     struct NoClipboard;
 
@@ -357,6 +409,206 @@ mod close_coordinator_tests {
         fn write_text(&mut self, _text: String) -> Result<(), ClipboardAdapterError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn full_zero_button_release_retries_one_old_owner_cleanup_before_later_control() {
+        let outgoing = SessionId::new();
+        let incoming = SessionId::new();
+        let sink = ScriptedSink::new([Ok(()), Err(CommandQueueError::Full), Ok(()), Ok(())]);
+        let mut state = ready_state(outgoing, incoming);
+        let mut clipboard = NoClipboard;
+        let mut view = ViewResources::default();
+        view.set_test_owner(outgoing, 0, 0, None);
+
+        dispatch_rendered_actions(
+            &mut state,
+            &sink,
+            &mut clipboard,
+            &mut view,
+            [
+                UiAction::Pointer {
+                    session_id: outgoing,
+                    buttons: 1,
+                    x: 10,
+                    y: 20,
+                },
+                UiAction::Pointer {
+                    session_id: outgoing,
+                    buttons: 0,
+                    x: 12,
+                    y: 22,
+                },
+                UiAction::RefreshInventory,
+            ],
+        );
+
+        assert_eq!(
+            sink.accepted(),
+            [RecordedCommand::Pointer(outgoing, 1, 10, 20)],
+            "a Full zero-button release must block later controls"
+        );
+        assert!(view.owner_cleanup_pending());
+        assert_eq!(
+            view.owner_cleanup_action(),
+            Some(UiAction::ReleaseOwnedInput {
+                session_id: outgoing,
+                pointer_position: Some((12, 22)),
+            })
+        );
+
+        state.select_session(Some(incoming));
+        let cleanup = view.owner_cleanup_action().unwrap();
+        dispatch_rendered_actions(
+            &mut state,
+            &sink,
+            &mut clipboard,
+            &mut view,
+            [cleanup, UiAction::RefreshInventory],
+        );
+        assert!(!view.owner_cleanup_pending());
+        assert_eq!(
+            sink.accepted(),
+            [
+                RecordedCommand::Pointer(outgoing, 1, 10, 20),
+                RecordedCommand::ReleaseOwnedInput(outgoing, Some((12, 22))),
+                RecordedCommand::Other,
+            ],
+            "selection changes must not retarget the retained release"
+        );
+    }
+
+    #[test]
+    fn ordinary_zero_button_acknowledgement_clears_only_sent_and_disconnects_without_spin() {
+        let outgoing = SessionId::new();
+        let incoming = SessionId::new();
+
+        let sent_sink = ScriptedSink::new([Ok(()), Ok(())]);
+        let mut sent_state = ready_state(outgoing, incoming);
+        let mut clipboard = NoClipboard;
+        let mut sent_view = ViewResources::default();
+        sent_view.set_test_owner(outgoing, 0, 0, None);
+        dispatch_rendered_actions(
+            &mut sent_state,
+            &sent_sink,
+            &mut clipboard,
+            &mut sent_view,
+            [
+                UiAction::Pointer {
+                    session_id: outgoing,
+                    buttons: 1,
+                    x: 30,
+                    y: 40,
+                },
+                UiAction::Pointer {
+                    session_id: outgoing,
+                    buttons: 0,
+                    x: 31,
+                    y: 41,
+                },
+            ],
+        );
+        assert!(!sent_view.owner_cleanup_pending());
+        assert_eq!(sent_view.owner_cleanup_action(), None);
+        sent_view.request_owner_cleanup();
+        assert_eq!(
+            sent_view.owner_cleanup_action(),
+            Some(UiAction::ReleaseOwnedInput {
+                session_id: outgoing,
+                pointer_position: None,
+            }),
+            "an accepted zero-button release leaves no duplicate pointer recovery"
+        );
+
+        let disconnected_sink =
+            ScriptedSink::new([Ok(()), Err(CommandQueueError::Disconnected), Ok(())]);
+        let mut disconnected_state = ready_state(outgoing, incoming);
+        let mut disconnected_view = ViewResources::default();
+        disconnected_view.set_test_owner(outgoing, 0, 0, None);
+        dispatch_rendered_actions(
+            &mut disconnected_state,
+            &disconnected_sink,
+            &mut clipboard,
+            &mut disconnected_view,
+            [
+                UiAction::Pointer {
+                    session_id: outgoing,
+                    buttons: 1,
+                    x: 50,
+                    y: 60,
+                },
+                UiAction::Pointer {
+                    session_id: outgoing,
+                    buttons: 0,
+                    x: 51,
+                    y: 61,
+                },
+                UiAction::RefreshInventory,
+            ],
+        );
+        assert!(disconnected_view.owner_cleanup_pending());
+        assert_eq!(
+            disconnected_view.owner_cleanup_action(),
+            None,
+            "a disconnected cleanup record must not spin another send"
+        );
+        assert_eq!(
+            disconnected_sink.accepted(),
+            [RecordedCommand::Pointer(outgoing, 1, 50, 60)],
+            "later controls remain blocked after sender disconnection"
+        );
+        disconnected_view.manager_completed();
+        assert!(!disconnected_view.owner_cleanup_pending());
+    }
+
+    #[test]
+    fn native_close_after_full_mouse_up_orders_retained_release_before_shutdown() {
+        let outgoing = SessionId::new();
+        let incoming = SessionId::new();
+        let sink = ScriptedSink::new([Ok(()), Err(CommandQueueError::Full), Ok(()), Ok(())]);
+        let mut state = ready_state(outgoing, incoming);
+        let mut clipboard = NoClipboard;
+        let mut view = ViewResources::default();
+        let mut coordinator = CloseCoordinator::default();
+        view.set_test_owner(outgoing, 0b0010, 0, None);
+
+        dispatch_rendered_actions(
+            &mut state,
+            &sink,
+            &mut clipboard,
+            &mut view,
+            [
+                UiAction::Pointer {
+                    session_id: outgoing,
+                    buttons: 1,
+                    x: 70,
+                    y: 80,
+                },
+                UiAction::Pointer {
+                    session_id: outgoing,
+                    buttons: 0,
+                    x: 71,
+                    y: 81,
+                },
+            ],
+        );
+        assert_eq!(
+            coordinator.update(true, view.owner_cleanup_pending(), Some(&sink)),
+            vec![NativeCloseAction::CancelClose]
+        );
+        assert_eq!(sink.shutdown_attempts.get(), 0);
+
+        let cleanup = view.owner_cleanup_action().unwrap();
+        dispatch_rendered_actions(&mut state, &sink, &mut clipboard, &mut view, [cleanup]);
+        assert_eq!(coordinator.update(false, false, Some(&sink)), Vec::new());
+        assert_eq!(
+            sink.accepted(),
+            [
+                RecordedCommand::Pointer(outgoing, 1, 70, 80),
+                RecordedCommand::ReleaseOwnedInput(outgoing, Some((71, 81))),
+                RecordedCommand::Shutdown,
+            ]
+        );
     }
 
     #[test]
