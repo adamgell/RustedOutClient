@@ -266,6 +266,11 @@ impl ProxyCleanupFailure {
         self.evidence.merge(later.evidence);
         self
     }
+
+    fn merge_trace(mut self, trace: CleanupEvidence) -> Self {
+        self.evidence.merge(trace);
+        self
+    }
 }
 
 impl std::fmt::Display for ProxyCleanupFailure {
@@ -1432,6 +1437,8 @@ async fn own_child(
         Cleanup,
     }
     let lifecycle = async {
+        let mut natural_trace = CleanupEvidence::default();
+        natural_trace.mark_seen(ProxyIoStage::NaturalWait);
         let trigger = if faults.natural_wait_fails() {
             Trigger::Natural(Err(io::Error::from_raw_os_error(5)))
         } else {
@@ -1447,6 +1454,7 @@ async fn own_child(
                     forced: false,
                     reaped: true,
                     cleanup: None,
+                    trace: natural_trace,
                 },
                 Err(error) => {
                     let initial = ProxyCleanupFailure::new(
@@ -1456,8 +1464,13 @@ async fn own_child(
                             &error,
                         )),
                     );
+                    natural_trace.record_io(ProxyIoFailure::from_error(
+                        ProxyIoStage::NaturalWait,
+                        &error,
+                    ));
                     let mut outcome =
                         terminate_owned_child(child.child_mut(), faults, &policy).await;
+                    outcome.trace.merge(natural_trace);
                     outcome.cleanup = Some(match outcome.cleanup {
                         Some(later) => initial.merge_cleanup(later),
                         None => initial,
@@ -1465,7 +1478,11 @@ async fn own_child(
                     outcome
                 }
             },
-            Trigger::Cleanup => terminate_owned_child(child.child_mut(), faults, &policy).await,
+            Trigger::Cleanup => {
+                let mut outcome = terminate_owned_child(child.child_mut(), faults, &policy).await;
+                outcome.trace.merge(natural_trace);
+                outcome
+            }
         }
     };
     let (outcome, stderr) =
@@ -1482,6 +1499,7 @@ struct StopOutcome {
     forced: bool,
     reaped: bool,
     cleanup: Option<ProxyCleanupFailure>,
+    trace: CleanupEvidence,
 }
 
 #[derive(Default)]
@@ -1522,12 +1540,13 @@ impl CleanupAccumulator {
         self.reap_state = Some(state);
     }
 
-    fn finish(self) -> Option<ProxyCleanupFailure> {
-        self.primary.map(|stage| ProxyCleanupFailure {
+    fn finish(self) -> (CleanupEvidence, Option<ProxyCleanupFailure>) {
+        let failure = self.primary.map(|stage| ProxyCleanupFailure {
             stage,
             evidence: self.evidence,
             reap_state: self.reap_state.unwrap_or(ProxyReapState::Confirmed),
-        })
+        });
+        (self.evidence, failure)
     }
 }
 
@@ -1536,16 +1555,20 @@ async fn terminate_owned_child(
     faults: StreamFaults,
     policy: &StreamPolicy,
 ) -> StopOutcome {
+    let mut cleanup = CleanupAccumulator::default();
+    cleanup.mark_seen(ProxyIoStage::GracefulWait);
     match timeout(policy.graceful_close_timeout, child.wait()).await {
-        Ok(Ok(status)) => StopOutcome {
-            status: Some(status),
-            forced: false,
-            reaped: true,
-            cleanup: None,
-        },
+        Ok(Ok(status)) => {
+            let (trace, cleanup) = cleanup.finish();
+            StopOutcome {
+                status: Some(status),
+                forced: false,
+                reaped: true,
+                cleanup,
+                trace,
+            }
+        }
         first_wait => {
-            let mut cleanup = CleanupAccumulator::default();
-            cleanup.mark_seen(ProxyIoStage::GracefulWait);
             if let Ok(Err(error)) = first_wait {
                 cleanup.record_failure(
                     ProxyCleanupStage::GracefulWait,
@@ -1599,11 +1622,13 @@ async fn terminate_owned_child(
             if !reaped {
                 cleanup.set_reap_state(ProxyReapState::Unconfirmed);
             }
+            let (trace, cleanup) = cleanup.finish();
             StopOutcome {
                 status,
                 forced: true,
                 reaped,
-                cleanup: cleanup.finish(),
+                cleanup,
+                trace,
             }
         }
     }
@@ -1613,7 +1638,7 @@ async fn run_lifecycle_with_stderr<F>(
     lifecycle: F,
     stderr: Option<ChildStderr>,
     pipe_drain_timeout: Duration,
-) -> (StopOutcome, Result<Vec<u8>, ProxyCleanupFailure>)
+) -> (StopOutcome, StderrOutcome)
 where
     F: Future<Output = StopOutcome>,
 {
@@ -1625,16 +1650,32 @@ where
         outcome = &mut lifecycle => {
             let stderr = match timeout(pipe_drain_timeout, &mut capture).await {
                 Ok(result) => map_stderr_capture(result),
-                Err(_) => Err(ProxyCleanupFailure::new(
-                    ProxyCleanupStage::StderrDrain,
-                    None,
-                )),
+                Err(_) => StderrOutcome::timeout(),
             };
             (outcome, stderr)
         }
         result = &mut capture => {
             let outcome = lifecycle.await;
             (outcome, map_stderr_capture(result))
+        }
+    }
+}
+
+struct StderrOutcome {
+    result: Result<Vec<u8>, ProxyCleanupFailure>,
+    trace: CleanupEvidence,
+}
+
+impl StderrOutcome {
+    fn timeout() -> Self {
+        let mut trace = CleanupEvidence::default();
+        trace.mark_seen(ProxyIoStage::StderrDrain);
+        Self {
+            result: Err(ProxyCleanupFailure::new(
+                ProxyCleanupStage::StderrDrain,
+                None,
+            )),
+            trace,
         }
     }
 }
@@ -1657,30 +1698,34 @@ async fn capture_proxy_stderr(stderr: Option<ChildStderr>) -> io::Result<Vec<u8>
     capture_bounded(stderr, MAX_CAPTURED_STDERR_BYTES).await
 }
 
-fn map_stderr_capture(result: io::Result<Vec<u8>>) -> Result<Vec<u8>, ProxyCleanupFailure> {
-    match result {
+fn map_stderr_capture(result: io::Result<Vec<u8>>) -> StderrOutcome {
+    let mut trace = CleanupEvidence::default();
+    trace.mark_seen(ProxyIoStage::StderrDrain);
+    let result = match result {
         Ok(bytes) => Ok(bytes),
-        Err(error) => Err(ProxyCleanupFailure::new(
-            ProxyCleanupStage::StderrDrain,
-            Some(ProxyIoFailure::from_error(
-                ProxyIoStage::StderrDrain,
-                &error,
-            )),
-        )),
-    }
+        Err(error) => {
+            let failure = ProxyIoFailure::from_error(ProxyIoStage::StderrDrain, &error);
+            trace.record_io(failure);
+            Err(ProxyCleanupFailure::new(
+                ProxyCleanupStage::StderrDrain,
+                Some(failure),
+            ))
+        }
+    };
+    StderrOutcome { result, trace }
 }
 
-fn compose_terminal(
-    outcome: StopOutcome,
-    stderr: Result<Vec<u8>, ProxyCleanupFailure>,
-) -> TerminalResult {
-    let cleanup = match (outcome.cleanup, stderr.as_ref().err().copied()) {
+fn compose_terminal(outcome: StopOutcome, stderr: StderrOutcome) -> TerminalResult {
+    let mut trace = outcome.trace;
+    trace.merge(stderr.trace);
+    let cleanup = match (outcome.cleanup, stderr.result.as_ref().err().copied()) {
         (Some(normal), Some(stderr)) => Some(normal.merge_cleanup(stderr)),
         (Some(normal), None) => Some(normal),
         (None, Some(stderr)) => Some(stderr),
         (None, None) => None,
-    };
-    let process_result = match (outcome.status, outcome.forced, stderr.as_ref()) {
+    }
+    .map(|cleanup| cleanup.merge_trace(trace));
+    let process_result = match (outcome.status, outcome.forced, stderr.result.as_ref()) {
         (Some(_), true, _) => Ok(()),
         (Some(status), false, Ok(stderr)) => classify_status(status, stderr),
         (Some(status), false, Err(_)) => classify_status(status, &[]),
@@ -2310,6 +2355,260 @@ mod tests {
         assert!(cleanup.io_failure_for(ProxyIoStage::NaturalWait).is_some());
         assert!(cleanup.io_failure_for(ProxyIoStage::Kill).is_some());
         assert_eq!(cleanup.reap_state(), ProxyReapState::Confirmed);
+        assert_no_proxy_lifecycle_activity().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_timeout_successful_kill_and_reap_survive_later_stderr_timeout() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("hang_proxy"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime.control_socket().with_extension("proxy_stderr_open"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let ticket = ProxyTicket::generate();
+        let spec = factory
+            .proxy(&fixture_profile(), VmId::new(107).unwrap(), &ticket)
+            .unwrap();
+        let mut policy = TestStreamPolicy::short_after_ready(
+            runtime.control_socket().with_extension("proxy.pid"),
+        );
+        policy.pipe_drain_timeout = Duration::from_millis(100);
+        let mut stream =
+            ProxyStream::spawn_with_test_seams(spec, TestStreamFaults::default(), policy)
+                .await
+                .unwrap();
+        let pid_path = runtime.control_socket().with_extension("proxy.pid");
+        let holder_path = runtime
+            .control_socket()
+            .with_extension("proxy.stderr-holder.pid");
+        wait_for(&pid_path).await;
+        wait_for(&holder_path).await;
+        let pid = helper_pid(&pid_path);
+        let holder_pid = helper_pid(&holder_path);
+
+        let error = stream.close().await.unwrap_err();
+        let cleanup = error.cleanup_failure().unwrap();
+        assert_eq!(cleanup.stage(), ProxyCleanupStage::StderrDrain);
+        for stage in [
+            ProxyIoStage::GracefulWait,
+            ProxyIoStage::Kill,
+            ProxyIoStage::FinalReap,
+            ProxyIoStage::StderrDrain,
+        ] {
+            assert!(
+                cleanup.stage_seen(stage),
+                "missing mixed cleanup stage {stage:?}"
+            );
+            assert!(cleanup.io_failure_for(stage).is_none());
+        }
+        assert_eq!(cleanup.reap_state(), ProxyReapState::Confirmed);
+        assert_eq!(stream.close().await.unwrap_err(), error);
+        assert_exact_pid_is_gone(pid).await;
+        assert_exact_pid_is_gone(holder_pid).await;
+        assert_no_proxy_lifecycle_activity().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_cleanup_failure_keeps_successful_stderr_completion_trace() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("hang_proxy"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let mut stream = spawn_test_stream(
+            &runtime,
+            executable,
+            TestStreamFaults::cleanup(TestCleanupFault::Kill),
+        )
+        .await
+        .unwrap();
+        let pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&pid_path).await;
+        let pid = helper_pid(&pid_path);
+
+        let error = stream.close().await.unwrap_err();
+        let cleanup = error.cleanup_failure().unwrap();
+        assert_eq!(cleanup.stage(), ProxyCleanupStage::Kill);
+        for stage in [
+            ProxyIoStage::GracefulWait,
+            ProxyIoStage::Kill,
+            ProxyIoStage::FinalReap,
+            ProxyIoStage::StderrDrain,
+        ] {
+            assert!(
+                cleanup.stage_seen(stage),
+                "missing mixed cleanup stage {stage:?}"
+            );
+        }
+        assert!(cleanup.io_failure_for(ProxyIoStage::Kill).is_some());
+        assert!(cleanup.io_failure_for(ProxyIoStage::StderrDrain).is_none());
+        assert_eq!(cleanup.reap_state(), ProxyReapState::Confirmed);
+        assert_eq!(stream.close().await.unwrap_err(), error);
+        assert_exact_pid_is_gone(pid).await;
+        assert_no_proxy_lifecycle_activity().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn natural_wait_success_survives_later_stderr_timeout() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("proxy_stderr_open"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let ticket = ProxyTicket::generate();
+        let spec = factory
+            .proxy(&fixture_profile(), VmId::new(107).unwrap(), &ticket)
+            .unwrap();
+        let mut policy = TestStreamPolicy::short_after_ready(
+            runtime.control_socket().with_extension("proxy.pid"),
+        );
+        policy.pipe_drain_timeout = Duration::from_millis(100);
+        let mut stream =
+            ProxyStream::spawn_with_test_seams(spec, TestStreamFaults::default(), policy)
+                .await
+                .unwrap();
+        let pid_path = runtime.control_socket().with_extension("proxy.pid");
+        let holder_path = runtime
+            .control_socket()
+            .with_extension("proxy.stderr-holder.pid");
+        wait_for(&pid_path).await;
+        wait_for(&holder_path).await;
+        let pid = helper_pid(&pid_path);
+        let holder_pid = helper_pid(&holder_path);
+        stream.write_all(b"x").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !stream.owner.as_ref().unwrap().is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("natural owner completion did not finish");
+
+        let error = stream.close().await.unwrap_err();
+        let cleanup = error.cleanup_failure().unwrap();
+        assert_eq!(cleanup.stage(), ProxyCleanupStage::StderrDrain);
+        assert!(cleanup.stage_seen(ProxyIoStage::NaturalWait));
+        assert!(cleanup.stage_seen(ProxyIoStage::StderrDrain));
+        assert!(cleanup.io_failure_for(ProxyIoStage::NaturalWait).is_none());
+        assert!(cleanup.io_failure_for(ProxyIoStage::StderrDrain).is_none());
+        assert_eq!(stream.close().await.unwrap_err(), error);
+        assert_exact_pid_is_gone(pid).await;
+        assert_exact_pid_is_gone(holder_pid).await;
+        assert_no_proxy_lifecycle_activity().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_failure_keeps_successful_normal_trace_when_stderr_times_out() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("hang_proxy"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime.control_socket().with_extension("proxy_stderr_open"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let ticket = ProxyTicket::generate();
+        let spec = factory
+            .proxy(&fixture_profile(), VmId::new(107).unwrap(), &ticket)
+            .unwrap();
+        let startup_gate = runtime
+            .control_socket()
+            .with_extension("allow_setup_trace_failure");
+        let mut policy = TestStreamPolicy::short_after_ready(
+            runtime.control_socket().with_extension("proxy.pid"),
+        );
+        policy.pipe_drain_timeout = Duration::from_millis(100);
+        policy.startup_gate = Some(startup_gate.clone());
+        let startup = tokio::spawn(ProxyStream::spawn_with_test_seams(
+            spec,
+            TestStreamFaults::setup(TestSetupFault::MissingStdout),
+            policy,
+        ));
+        let pid_path = runtime.control_socket().with_extension("proxy.pid");
+        let holder_path = runtime
+            .control_socket()
+            .with_extension("proxy.stderr-holder.pid");
+        wait_for(&pid_path).await;
+        wait_for(&holder_path).await;
+        let pid = helper_pid(&pid_path);
+        let holder_pid = helper_pid(&holder_path);
+        fs::write(&startup_gate, b"synthetic fixture control\n").unwrap();
+        let error = match startup.await.unwrap() {
+            Err(error) => error,
+            Ok(_) => panic!("missing stdout setup unexpectedly succeeded"),
+        };
+        assert_eq!(
+            error.io_failure().unwrap().stage(),
+            ProxyIoStage::SetupStdout
+        );
+        let cleanup = error.cleanup_failure().unwrap();
+        assert_eq!(cleanup.stage(), ProxyCleanupStage::StderrDrain);
+        for stage in [
+            ProxyIoStage::GracefulWait,
+            ProxyIoStage::Kill,
+            ProxyIoStage::FinalReap,
+            ProxyIoStage::StderrDrain,
+        ] {
+            assert!(
+                cleanup.stage_seen(stage),
+                "missing setup trace stage {stage:?}"
+            );
+        }
+        assert_exact_pid_is_gone(pid).await;
+        assert_exact_pid_is_gone(holder_pid).await;
+        assert_no_proxy_lifecycle_activity().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_forced_cleanup_remains_ok_despite_attempt_trace() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("hang_proxy"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let mut stream = spawn_test_stream(&runtime, executable, TestStreamFaults::default())
+            .await
+            .unwrap();
+        let pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&pid_path).await;
+        let pid = helper_pid(&pid_path);
+
+        stream.close().await.unwrap();
+        stream.close().await.unwrap();
+        assert_exact_pid_is_gone(pid).await;
         assert_no_proxy_lifecycle_activity().await;
     }
 
