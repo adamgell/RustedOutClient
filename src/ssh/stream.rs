@@ -845,6 +845,19 @@ impl ProxyStream {
     }
 
     #[cfg(test)]
+    pub(super) async fn spawn_with_missing_stdout_for_test(
+        spec: CommandSpec,
+        startup_gate: PathBuf,
+    ) -> Result<Self, ProxyStreamError> {
+        Self::spawn_with_test_seams(
+            spec,
+            TestStreamFaults::setup(TestSetupFault::MissingStdout),
+            TestStreamPolicy::short_with_startup_gate(startup_gate),
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn spawn_with_test_seams(
         spec: CommandSpec,
         faults: TestStreamFaults,

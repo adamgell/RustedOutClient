@@ -1,6 +1,9 @@
 use std::fmt;
 
 #[cfg(test)]
+use std::path::PathBuf;
+
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rand::{distributions::Alphanumeric, rngs::OsRng, Rng};
@@ -129,10 +132,33 @@ pub struct TrustedSshProxy {
     ticket: ProxyTicket,
 }
 
+enum ProxySetup {
+    Production,
+    #[cfg(test)]
+    MissingStdout(PathBuf),
+}
+
 impl TrustedSshProxy {
     pub async fn connect(
         master: &mut VerifiedSshMaster<'_>,
         vmid: VmId,
+    ) -> Result<Self, ProxyOpenError> {
+        Self::connect_inner(master, vmid, ProxySetup::Production).await
+    }
+
+    #[cfg(test)]
+    async fn connect_with_missing_stdout_for_test(
+        master: &mut VerifiedSshMaster<'_>,
+        vmid: VmId,
+        startup_gate: PathBuf,
+    ) -> Result<Self, ProxyOpenError> {
+        Self::connect_inner(master, vmid, ProxySetup::MissingStdout(startup_gate)).await
+    }
+
+    async fn connect_inner(
+        master: &mut VerifiedSshMaster<'_>,
+        vmid: VmId,
+        setup: ProxySetup,
     ) -> Result<Self, ProxyOpenError> {
         master.recheck().await?;
         let inventory = master.fetch_inventory().await?;
@@ -145,7 +171,13 @@ impl TrustedSshProxy {
 
         let ticket = ProxyTicket::generate_for_proxy();
         let spec = master.proxy_spec(vmid, &ticket);
-        let stream = ProxyStream::spawn(spec).await?;
+        let stream = match setup {
+            ProxySetup::Production => ProxyStream::spawn(spec).await?,
+            #[cfg(test)]
+            ProxySetup::MissingStdout(startup_gate) => {
+                ProxyStream::spawn_with_missing_stdout_for_test(spec, startup_gate).await?
+            }
+        };
         Ok(Self { stream, ticket })
     }
 
@@ -179,7 +211,7 @@ mod tests {
     use crate::{
         model::{NodeName, PveProfile, SshTarget, VmId},
         runtime::RuntimeDir,
-        ssh::{SshCommandFactory, SshMaster},
+        ssh::{ProxyIoStage, SshCommandFactory, SshMaster},
     };
 
     struct ParentTicketEnvironment(Option<std::ffi::OsString>);
@@ -255,6 +287,53 @@ mod tests {
         })
         .await
         .expect("owned synthetic proxy child was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_spawn_proxy_setup_failure_reaps_the_exact_owned_child() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("hang_proxy"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&runtime.control_socket().with_extension("state")).await;
+        let mut verified = master.verify().await.unwrap();
+        let startup_gate = runtime
+            .control_socket()
+            .with_extension("allow_proxy_setup_failure");
+        let pid_path = runtime.control_socket().with_extension("proxy.pid");
+
+        let connect = TrustedSshProxy::connect_with_missing_stdout_for_test(
+            &mut verified,
+            VmId::new(107).unwrap(),
+            startup_gate.clone(),
+        );
+        let release_fault = async {
+            wait_for(&pid_path).await;
+            let pid = helper_pid(&pid_path);
+            fs::write(&startup_gate, b"synthetic fixture control\n").unwrap();
+            pid
+        };
+        let (result, proxy_pid) = tokio::join!(connect, release_fault);
+        let error = match result {
+            Err(ProxyOpenError::Stream(error)) => error,
+            Err(error) => panic!("unexpected proxy setup error: {error}"),
+            Ok(_) => panic!("post-spawn proxy setup unexpectedly succeeded"),
+        };
+
+        assert_eq!(
+            error.io_failure().unwrap().stage(),
+            ProxyIoStage::SetupStdout
+        );
+        assert_exact_pid_is_gone(proxy_pid).await;
+        master.close().await.unwrap();
     }
 
     fn assert_exact_regular_artifacts_exclude_ticket(

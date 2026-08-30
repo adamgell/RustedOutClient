@@ -775,7 +775,10 @@ mod tests {
         fs, io,
         path::{Path, PathBuf},
         process::{Command, Stdio},
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
         time::Duration,
     };
 
@@ -785,13 +788,22 @@ mod tests {
     use tempfile::{tempdir, TempDir};
     use tokio::time::{sleep, timeout};
 
-    use super::{ManagedSession, OpenOptions, ProductionSession};
+    use super::{
+        BackendFuture, ManagedSession, OpenOptions, ProductionSession, SessionBackend,
+        SessionManager,
+    };
     use crate::{
+        config::AppConfig,
         connection::{bounded_vnc_channels, FbRect, VncEvent, VNC_QUEUE_CAPACITY},
         model::{NodeName, PveProfile, SshTarget, VmId},
         runtime::RuntimeDir,
-        session::{PublicError, PublicErrorKind, SessionTransportEvent},
-        ssh::{SshCommandFactory, SshMaster, TrustedSshProxy},
+        session::{
+            AppCommand, AppEvent, PublicError, PublicErrorKind, SessionPhase, SessionTransportEvent,
+        },
+        ssh::{
+            InventorySnapshot, SshCommandFactory, SshMaster, TrustedSshProxy, VmInventoryItem,
+            VmStatus,
+        },
         vnc::{RfbError, RfbErrorKind, RfbPhase},
     };
 
@@ -958,6 +970,231 @@ mod tests {
         })
         .await
         .expect("owned synthetic proxy child was not reaped");
+    }
+
+    struct ProductionPathBackend {
+        session: Option<ProductionSession>,
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl SessionBackend for ProductionPathBackend {
+        type Session = ProductionSession;
+
+        fn load_cache(
+            &mut self,
+        ) -> BackendFuture<'_, Result<Option<InventorySnapshot>, PublicError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn start_master(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_inventory(&mut self) -> BackendFuture<'_, Result<InventorySnapshot, PublicError>> {
+            Box::pin(async {
+                Ok(InventorySnapshot {
+                    observed_at_unix_ms: 1,
+                    stale: false,
+                    vms: vec![VmInventoryItem {
+                        vmid: VmId::new(107).unwrap(),
+                        name: "SYNTHETIC-107".to_owned(),
+                        node: NodeName::parse("pve2").unwrap(),
+                        status: VmStatus::Running,
+                        template: false,
+                    }],
+                })
+            })
+        }
+
+        fn save_cache(
+            &mut self,
+            _snapshot: &InventorySnapshot,
+        ) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn open_session(
+            &mut self,
+            _vmid: VmId,
+            _options: OpenOptions,
+        ) -> BackendFuture<'_, Result<Self::Session, PublicError>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .session
+                .take()
+                .ok_or_else(|| PublicError::new(PublicErrorKind::Proxy));
+            Box::pin(async move { result })
+        }
+
+        fn close_master(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    async fn production_path_manager(
+        runtime: &RuntimeDir,
+        executable: PathBuf,
+    ) -> (SshMaster, SessionManager, Arc<AtomicUsize>, u32) {
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&runtime.control_socket().with_extension("state")).await;
+        let mut verified = master.verify().await.unwrap();
+        let proxy = TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap())
+            .await
+            .unwrap();
+        let session = ProductionSession::spawn(proxy, OpenOptions::default());
+        let proxy_pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&proxy_pid_path).await;
+        let proxy_pid = helper_pid(&proxy_pid_path);
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut manager = SessionManager::spawn(
+            AppConfig::new(fixture_profile()),
+            ProductionPathBackend {
+                session: Some(session),
+                opens: Arc::clone(&opens),
+            },
+        );
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(manager.recv().await, Some(AppEvent::LiveInventory(_))) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("production-path manager did not publish live inventory");
+        manager
+            .send(AppCommand::Open {
+                vmid: VmId::new(107).unwrap(),
+                options: OpenOptions::default(),
+            })
+            .await
+            .unwrap();
+        (master, manager, opens, proxy_pid)
+    }
+
+    async fn assert_one_production_error_then_disconnected(
+        manager: &mut SessionManager,
+        expected: PublicErrorKind,
+    ) {
+        let mut terminal = Vec::new();
+        let mut ready_count = 0;
+        let mut framebuffer_count = 0;
+        timeout(Duration::from_secs(2), async {
+            while terminal.len() < 2 {
+                match manager.recv().await.unwrap() {
+                    AppEvent::Error(error) => {
+                        assert_eq!(error.kind(), expected);
+                        terminal.push("error");
+                    }
+                    AppEvent::SessionChanged(snapshot)
+                        if snapshot.phase == SessionPhase::Disconnected =>
+                    {
+                        terminal.push("disconnected");
+                    }
+                    AppEvent::SessionChanged(snapshot) if snapshot.phase == SessionPhase::Ready => {
+                        ready_count += 1;
+                    }
+                    AppEvent::Framebuffer { .. } => framebuffer_count += 1,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("production-path terminal sequence did not complete");
+        sleep(Duration::from_millis(20)).await;
+        while let Ok(event) = manager.try_recv() {
+            match event {
+                AppEvent::Error(error) => {
+                    assert_eq!(error.kind(), expected);
+                    terminal.push("error");
+                }
+                AppEvent::SessionChanged(snapshot)
+                    if snapshot.phase == SessionPhase::Disconnected =>
+                {
+                    terminal.push("disconnected");
+                }
+                AppEvent::SessionChanged(snapshot) if snapshot.phase == SessionPhase::Ready => {
+                    ready_count += 1;
+                }
+                AppEvent::Framebuffer { .. } => framebuffer_count += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(terminal, ["error", "disconnected"]);
+        assert_eq!(ready_count, 0);
+        assert_eq!(framebuffer_count, 0);
+    }
+
+    async fn wait_for_fixture_marker(path: &Path) {
+        timeout(Duration::from_secs(2), async {
+            while !path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("synthetic RFB fixture did not reach the required protocol stage");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_rfb_negotiation_failure_reaches_manager_and_reaps_exact_proxy() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("proxy_rfb_security_failure"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let (mut master, mut manager, opens, proxy_pid) =
+            production_path_manager(&runtime, executable).await;
+
+        wait_for_fixture_marker(
+            &runtime
+                .control_socket()
+                .with_extension("proxy.negotiation-failure-sent"),
+        )
+        .await;
+        assert_one_production_error_then_disconnected(&mut manager, PublicErrorKind::RfbSecurity)
+            .await;
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_exact_pid_is_gone(proxy_pid).await;
+        manager.shutdown().await.unwrap();
+        master.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn malformed_real_first_frame_never_reaches_ready_and_reaps_exact_proxy() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("proxy_malformed_first_frame"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let (mut master, mut manager, opens, proxy_pid) =
+            production_path_manager(&runtime, executable).await;
+
+        wait_for_fixture_marker(
+            &runtime
+                .control_socket()
+                .with_extension("proxy.first-frame-sent"),
+        )
+        .await;
+        assert_one_production_error_then_disconnected(&mut manager, PublicErrorKind::RfbProtocol)
+            .await;
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_exact_pid_is_gone(proxy_pid).await;
+        manager.shutdown().await.unwrap();
+        master.close().await.unwrap();
     }
 
     #[cfg(unix)]
