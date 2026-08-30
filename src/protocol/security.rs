@@ -1,5 +1,5 @@
 use crate::connection::{VncCommand, VncEvent};
-use crate::protocol::{ra2, AsyncRw};
+use crate::protocol::AsyncRw;
 use anyhow::{bail, Result};
 use cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use crossbeam_channel::{Receiver, Sender};
@@ -10,15 +10,10 @@ use tracing::info;
 
 pub const SECURITY_NONE: u8 = 1;
 pub const SECURITY_VNC_AUTH: u8 = 2;
-pub const SECURITY_RA2: u8 = 5;
-pub const SECURITY_RA2NE: u8 = 6;
-pub const SECURITY_RA2_256: u8 = 129;
-pub const SECURITY_RA2NE_256: u8 = 130;
 
 /// Negotiate and complete the security handshake, taking ownership of the
 /// TCP stream. Returns the stream the RFB session should continue on — the
-/// raw TCP stream (buffered) for None/VncAuth/RA2ne, or an AES-EAX encrypted
-/// channel for RA2/RA2_256 (where the whole session is encrypted).
+/// raw TCP stream, buffered for subsequent protocol reads.
 ///
 /// If the server requires auth and no password was supplied, we send
 /// `VncEvent::NeedPassword` and block-wait on `cmd_rx` for a
@@ -46,26 +41,17 @@ pub async fn negotiate(
         stream.read_exact(&mut types).await?;
         info!("Server security types: {types:?}");
 
-        // Preference: None (when we have no password) > VncAuth > None >
-        // RA2 family (RSA-AES; needed for RealVNC servers).
-        let chosen = if types.contains(&SECURITY_NONE) && password.map_or(true, |p| p.is_empty()) {
+        // Prefer None when credentials are absent, then VNC authentication.
+        let chosen = if types.contains(&SECURITY_NONE) && password.is_none_or(|p| p.is_empty()) {
             SECURITY_NONE
         } else if types.contains(&SECURITY_VNC_AUTH) {
             SECURITY_VNC_AUTH
         } else if types.contains(&SECURITY_NONE) {
             SECURITY_NONE
-        } else if types.contains(&SECURITY_RA2) {
-            SECURITY_RA2
-        } else if types.contains(&SECURITY_RA2_256) {
-            SECURITY_RA2_256
-        } else if types.contains(&SECURITY_RA2NE) {
-            SECURITY_RA2NE
-        } else if types.contains(&SECURITY_RA2NE_256) {
-            SECURITY_RA2NE_256
         } else {
             bail!(
                 "No supported security type offered by server (got {:?}). \
-                 This viewer supports None(1), VNC Auth(2), and RA2/RSA-AES(5/6/129/130); \
+                 This viewer supports None(1) and VNC Auth(2); \
                  the server likely requires VeNCrypt/ARD, which are not yet implemented.",
                 types
             );
@@ -86,42 +72,6 @@ pub async fn negotiate(
             _ => bail!("Unknown security type: {sec_type}"),
         }
     };
-
-    // --- RA2 family: RSA-AES handshake, possibly wrapping the whole session ---
-    if matches!(
-        chosen,
-        SECURITY_RA2 | SECURITY_RA2_256 | SECURITY_RA2NE | SECURITY_RA2NE_256
-    ) {
-        let sha256 = matches!(chosen, SECURITY_RA2_256 | SECURITY_RA2NE_256);
-        let encrypt_all = matches!(chosen, SECURITY_RA2 | SECURITY_RA2_256);
-        info!(
-            "Using RA2 (RSA-AES{}, {})",
-            if sha256 { "-256" } else { "-128" },
-            if encrypt_all { "full encryption" } else { "handshake only" },
-        );
-
-        let pw = resolve_password(password, event_tx, cmd_rx)?;
-        let (send, recv) = ra2::handshake(&mut stream, "", &pw, sha256).await?;
-
-        if encrypt_all {
-            // Everything from SecurityResult onward is inside the AES channel.
-            // Bridge it to the client through an in-memory duplex + pump tasks.
-            let (local, remote) = tokio::io::duplex(1 << 16);
-            let (tcp_r, tcp_w) = tokio::io::split(stream);
-            let (rem_r, rem_w) = tokio::io::split(remote);
-            tokio::spawn(ra2::pump_decrypt(tcp_r, rem_w, recv));
-            tokio::spawn(ra2::pump_encrypt(rem_r, tcp_w, send));
-
-            let mut wrapped: Box<dyn AsyncRw> = Box::new(BufReader::new(local));
-            read_security_result(&mut wrapped, rfb_minor >= 8).await?;
-            return Ok(wrapped);
-        } else {
-            // "ne" variants: SecurityResult and the session stay in plaintext.
-            let mut plain: Box<dyn AsyncRw> = Box::new(BufReader::new(stream));
-            read_security_result(&mut plain, rfb_minor >= 8).await?;
-            return Ok(plain);
-        }
-    }
 
     // --- Classic types over the plain stream ---
     if chosen == SECURITY_VNC_AUTH {

@@ -1,0 +1,5 @@
+RustedOutClient is a fork of IronVNC.
+
+Fork base: hkder/ironvnc commit 999e00e3a3672efdbf8e8f307e7bd60875dee67e.
+Upstream attribution and the original dual-license terms are preserved in
+LICENSE-MIT and LICENSE-APACHE.

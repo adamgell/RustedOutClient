@@ -6,8 +6,8 @@ use crate::protocol::{
     security,
 };
 use anyhow::{bail, Result};
-use flate2::Decompress;
 use crossbeam_channel::{Receiver, Sender};
+use flate2::Decompress;
 use tight::TightState;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -24,8 +24,8 @@ impl VncClient {
         let addr = format!("{}:{}", params.host, params.port);
         info!("Connecting to {addr}");
         // Keep the raw TcpStream (no BufReader) through the security handshake:
-        // RA2 needs to take ownership of it, and a BufReader could over-read
-        // handshake bytes into a buffer that would then be lost.
+        // a buffered reader could over-read handshake bytes into a buffer that
+        // would then be lost.
         let mut stream = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             TcpStream::connect(&addr),
@@ -167,15 +167,13 @@ impl VncClient {
             // input reaches the server, the screen changes, and updates resume.
             // read_u8 goes through a BufReader, so a timed-out read consumes no
             // bytes and is safe to retry.
-            let msg_type = match tokio::time::timeout(
-                std::time::Duration::from_millis(5),
-                stream.read_u8(),
-            )
-            .await
-            {
-                Ok(r) => r?,
-                Err(_) => continue,
-            };
+            let msg_type =
+                match tokio::time::timeout(std::time::Duration::from_millis(5), stream.read_u8())
+                    .await
+                {
+                    Ok(r) => r?,
+                    Err(_) => continue,
+                };
             match msg_type {
                 server_msg::FB_UPDATE => {
                     stream.read_u8().await?;
@@ -203,22 +201,34 @@ impl VncClient {
                             }
                             enc::ZRLE => {
                                 zrle::decode(
-                                    &mut stream, &mut fb, &pf, rx, ry, rw, rh,
+                                    &mut stream,
+                                    &mut fb,
+                                    &pf,
+                                    rx,
+                                    ry,
+                                    rw,
+                                    rh,
                                     &mut zrle_decomp,
-                                ).await?;
+                                )
+                                .await?;
                                 dirty.push((rx, ry, rw, rh));
                             }
                             enc::HEXTILE => {
-                                hextile::decode(
-                                    &mut stream, &mut fb, &pf, rx, ry, rw, rh,
-                                ).await?;
+                                hextile::decode(&mut stream, &mut fb, &pf, rx, ry, rw, rh).await?;
                                 dirty.push((rx, ry, rw, rh));
                             }
                             enc::TIGHT => {
                                 tight::decode(
-                                    &mut stream, &mut fb, &pf, rx, ry, rw, rh,
+                                    &mut stream,
+                                    &mut fb,
+                                    &pf,
+                                    rx,
+                                    ry,
+                                    rw,
+                                    rh,
                                     &mut tight_state,
-                                ).await?;
+                                )
+                                .await?;
                                 dirty.push((rx, ry, rw, rh));
                             }
                             enc::DESKTOP_SIZE => {
@@ -230,7 +240,7 @@ impl VncClient {
                                 // RichCursor pseudo-encoding: read and discard cursor image + bitmask.
                                 let bpp = (pf.bits_per_pixel / 8) as usize;
                                 let img_bytes = rw as usize * rh as usize * bpp;
-                                let mask_bytes = ((rw as usize + 7) / 8) * rh as usize;
+                                let mask_bytes = (rw as usize).div_ceil(8) * rh as usize;
                                 let mut skip = vec![0u8; img_bytes + mask_bytes];
                                 stream.read_exact(&mut skip).await?;
                             }
@@ -246,15 +256,27 @@ impl VncClient {
                             .map(|(rx, ry, rw, rh)| {
                                 let (w, h, rgba) =
                                     fb.sub_rgba(rx as u32, ry as u32, rw as u32, rh as u32);
-                                FbRect { x: rx as u32, y: ry as u32, w, h, rgba }
+                                FbRect {
+                                    x: rx as u32,
+                                    y: ry as u32,
+                                    w,
+                                    h,
+                                    rgba,
+                                }
                             })
                             .collect();
                         let _ = event_tx.send(VncEvent::FramebufferRects(rects));
                     }
 
                     send_fb_update_request(
-                        &mut stream, true, 0, 0, fb.width as u16, fb.height as u16,
-                    ).await?;
+                        &mut stream,
+                        true,
+                        0,
+                        0,
+                        fb.width as u16,
+                        fb.height as u16,
+                    )
+                    .await?;
                 }
 
                 server_msg::SET_COLOUR_MAP_ENTRIES => {
@@ -307,7 +329,10 @@ fn parse_rfb_version(ver: &str) -> (u32, u32) {
 async fn send_fb_update_request<S>(
     stream: &mut S,
     incremental: bool,
-    x: u16, y: u16, w: u16, h: u16,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
 ) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,

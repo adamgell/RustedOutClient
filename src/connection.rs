@@ -35,8 +35,15 @@ pub enum VncEvent {
 
 /// Commands sent from the UI thread to the VNC background thread.
 pub enum VncCommand {
-    KeyEvent { down: bool, keysym: u32 },
-    PointerEvent { buttons: u8, x: u16, y: u16 },
+    KeyEvent {
+        down: bool,
+        keysym: u32,
+    },
+    PointerEvent {
+        buttons: u8,
+        x: u16,
+        y: u16,
+    },
     /// Send clipboard text to the server.
     SetClipboard(String),
     /// Response to NeedPassword: provide the password to the waiting auth step.

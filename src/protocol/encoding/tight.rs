@@ -29,6 +29,12 @@ impl TightState {
     }
 }
 
+impl Default for TightState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // Subtype constants (lower nibble of control byte).
 const FILL: u8 = 0x08;
 const JPEG: u8 = 0x09;
@@ -41,6 +47,7 @@ const FILTER_GRADIENT: u8 = 0x02;
 // Data shorter than this is sent raw (no zlib compression).
 const MIN_TO_COMPRESS: usize = 12;
 
+#[allow(clippy::too_many_arguments)] // RFB rectangle dimensions are an atomic decoder boundary.
 pub async fn decode<S>(
     stream: &mut S,
     fb: &mut Framebuffer,
@@ -73,12 +80,16 @@ where
             // BasicCompression: bits 1-0 = stream index, bit 2 = filter present.
             let stream_idx = (s & 0x03) as usize;
             let has_filter = (s & 0x04) != 0;
-            basic(stream, fb, pf, x, y, w, h, tight_bpp, stream_idx, has_filter, state).await
+            basic(
+                stream, fb, pf, x, y, w, h, tight_bpp, stream_idx, has_filter, state,
+            )
+            .await
         }
         _ => bail!("Unknown Tight subtype 0x{subtype:02X}"),
     }
 }
 
+#[allow(clippy::too_many_arguments)] // RFB rectangle dimensions are an atomic decoder boundary.
 async fn fill<S>(
     stream: &mut S,
     fb: &mut Framebuffer,
@@ -106,14 +117,7 @@ where
     Ok(())
 }
 
-async fn jpeg<S>(
-    stream: &mut S,
-    fb: &mut Framebuffer,
-    x: u16,
-    y: u16,
-    w: u16,
-    h: u16,
-) -> Result<()>
+async fn jpeg<S>(stream: &mut S, fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) -> Result<()>
 where
     S: AsyncRead + Unpin,
 {
@@ -134,6 +138,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // RFB rectangle dimensions are an atomic decoder boundary.
 async fn basic<S>(
     stream: &mut S,
     fb: &mut Framebuffer,
@@ -161,7 +166,8 @@ where
     match filter {
         FILTER_COPY => {
             let raw_len = n_pixels * tight_bpp;
-            let raw = read_maybe_compressed(stream, raw_len, &mut state.streams[stream_idx]).await?;
+            let raw =
+                read_maybe_compressed(stream, raw_len, &mut state.streams[stream_idx]).await?;
             let rgba = pixels_to_rgba(&raw, tight_bpp, pf, n_pixels);
             fb.blit_rgba(x as u32, y as u32, w as u32, h as u32, &rgba);
         }
@@ -184,7 +190,7 @@ where
                 .collect();
 
             let (index_len, bits_per_px) = if n_colors == 2 {
-                let row_bytes = (w as usize + 7) / 8;
+                let row_bytes = (w as usize).div_ceil(8);
                 (row_bytes * h as usize, 1usize)
             } else {
                 (n_pixels, 8usize)
@@ -195,7 +201,7 @@ where
 
             let mut rgba = vec![255u8; n_pixels * 4];
             if bits_per_px == 1 {
-                let row_bytes = (w as usize + 7) / 8;
+                let row_bytes = (w as usize).div_ceil(8);
                 for row in 0..h as usize {
                     for col in 0..w as usize {
                         let byte_off = row * row_bytes + col / 8;

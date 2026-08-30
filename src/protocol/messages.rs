@@ -17,12 +17,9 @@ pub struct PixelFormat {
 impl PixelFormat {
     #[inline]
     pub fn to_rgb(&self, pixel: u32) -> (u8, u8, u8) {
-        let r = ((pixel >> self.red_shift) & self.red_max as u32) * 255
-            / self.red_max as u32;
-        let g = ((pixel >> self.green_shift) & self.green_max as u32) * 255
-            / self.green_max as u32;
-        let b = ((pixel >> self.blue_shift) & self.blue_max as u32) * 255
-            / self.blue_max as u32;
+        let r = ((pixel >> self.red_shift) & self.red_max as u32) * 255 / self.red_max as u32;
+        let g = ((pixel >> self.green_shift) & self.green_max as u32) * 255 / self.green_max as u32;
+        let b = ((pixel >> self.blue_shift) & self.blue_max as u32) * 255 / self.blue_max as u32;
         (r as u8, g as u8, b as u8)
     }
 }

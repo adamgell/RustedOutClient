@@ -6,6 +6,7 @@ use anyhow::{bail, Result};
 use flate2::{Decompress, FlushDecompress};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+#[allow(clippy::too_many_arguments)] // RFB rectangle dimensions are an atomic decoder boundary.
 pub async fn decode<S>(
     stream: &mut S,
     fb: &mut Framebuffer,
@@ -116,7 +117,7 @@ fn decode_tiles(
                     } else {
                         4
                     };
-                    let row_bytes = (tile_w as usize * bits_per_idx + 7) / 8;
+                    let row_bytes = (tile_w as usize * bits_per_idx).div_ceil(8);
                     let need2 = row_bytes * tile_h as usize;
                     if pos + need2 > raw.len() {
                         bail!("ZRLE packed palette data truncated");
@@ -132,7 +133,7 @@ fn decode_tiles(
                                 (row_data[byte_idx] >> (7 - bit_pos % 8)) & 1
                             } else if bits_per_idx == 2 {
                                 (row_data[byte_idx] >> (6 - (bit_pos % 4) * 2)) & 3
-                            } else if bit_pos % 2 == 0 {
+                            } else if bit_pos.is_multiple_of(2) {
                                 (row_data[byte_idx] >> 4) & 0xf
                             } else {
                                 row_data[byte_idx] & 0xf
