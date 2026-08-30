@@ -218,9 +218,13 @@ where
 
     pub fn clear_session(&mut self) -> Result<(), InputError> {
         let result = self.release_all_keys();
-        self.clipboard.clear();
+        self.clear_clipboard();
         self.ready = false;
         result
+    }
+
+    pub(crate) fn clear_clipboard(&mut self) {
+        self.clipboard.clear();
     }
 
     fn require_interactive(&self) -> Result<(), InputError> {

@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use crossbeam_channel::TrySendError;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -702,6 +703,7 @@ impl ManagedSession for ProductionSession {
 
     fn close(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
         Box::pin(async move {
+            let deadline = Instant::now() + graceful_close_timeout();
             let session_loop_ready = self.input.is_ready();
             let mut primary = self
                 .input
@@ -716,15 +718,19 @@ impl ManagedSession for ProductionSession {
                 match self.input.connection().begin_graceful_close() {
                     Ok(acknowledged) => {
                         if !matches!(
-                            tokio::time::timeout(graceful_close_timeout(), acknowledged).await,
+                            tokio::time::timeout_at(deadline, acknowledged).await,
                             Ok(Ok(()))
                         ) {
                             cleanup_failed = true;
                             use_cancellation = true;
                         }
                     }
-                    Err(_) => {
+                    Err(TrySendError::Full(_)) => {
                         primary.get_or_insert(PublicError::new(PublicErrorKind::Queue));
+                        use_cancellation = true;
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        cleanup_failed = true;
                         use_cancellation = true;
                     }
                 }
@@ -735,12 +741,28 @@ impl ManagedSession for ProductionSession {
                     let _ = cancel.send(());
                 }
             }
-            if let Some(task) = self.task.take() {
-                if task.await.is_err() {
-                    cleanup_failed = true;
+            if let Some(mut task) = self.task.take() {
+                match tokio::time::timeout_at(deadline, &mut task).await {
+                    Ok(result) => {
+                        if result.is_err() {
+                            cleanup_failed = true;
+                        }
+                    }
+                    Err(_) => {
+                        cleanup_failed = true;
+                        if let Some(cancel) = self.cancel.take() {
+                            let _ = cancel.send(());
+                        }
+                        tokio::task::yield_now().await;
+                        task.abort();
+                        if task.await.is_err_and(|error| !error.is_cancelled()) {
+                            cleanup_failed = true;
+                        }
+                    }
                 }
             }
             drop(self.cancel.take());
+            self.input.clear_clipboard();
             let terminal_result = self
                 .terminal
                 .lock()
@@ -908,6 +930,24 @@ mod tests {
             ClipboardText, InputController, RfbError, RfbErrorKind, RfbPhase, CLIPBOARD_TEXT_LIMIT,
         },
     };
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn wait_for_flag(flag: &AtomicBool) {
+        for _ in 0..1_000 {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("controlled task did not reach the expected state");
+    }
 
     fn production_session(
         terminal: Option<Result<(), PublicError>>,
@@ -1150,6 +1190,261 @@ mod tests {
         assert!(error.has_cleanup_failure());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn total_close_deadline_aborts_post_ack_shutdown_stall_and_preserves_primary() {
+        let (connection, channels) = bounded_vnc_channels();
+        let terminal = Arc::new(Mutex::new(Some(Err(PublicError::new(
+            PublicErrorKind::RfbSecurity,
+        )))));
+        let (cancel, cancelled) = oneshot::channel();
+        let barrier_seen = Arc::new(AtomicBool::new(false));
+        let task_barrier_seen = Arc::clone(&barrier_seen);
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let task_drop_probe = Arc::clone(&task_dropped);
+        let task = tokio::spawn(async move {
+            let _drop_probe = DropProbe(task_drop_probe);
+            let _ignored_cancellation = cancelled;
+            loop {
+                match channels.command_rx.try_recv() {
+                    Ok(VncCommand::GracefulDisconnect(barrier)) => {
+                        task_barrier_seen.store(true, Ordering::SeqCst);
+                        sleep(Duration::from_millis(60)).await;
+                        barrier.acknowledge();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(_) | Err(crossbeam_channel::TryRecvError::Empty) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+                }
+            }
+        });
+        let mut session = ProductionSession {
+            input: InputController::for_connection(connection, false, false, CLIPBOARD_TEXT_LIMIT)
+                .unwrap(),
+            task: Some(task),
+            terminal,
+            terminal_reported: false,
+            cancel: Some(cancel),
+        };
+        session.mark_ready();
+
+        let close = tokio::spawn(async move {
+            let result = session.close().await;
+            (result, session)
+        });
+        wait_for_flag(&barrier_seen).await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(41)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            close.is_finished(),
+            "complete close exceeded one total deadline"
+        );
+        let (result, _session) = close.await.unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), PublicErrorKind::RfbSecurity);
+        assert!(error.has_cleanup_failure());
+        assert!(task_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_close_deadline_aborts_cancellation_ignored_task_and_finally_clears_clipboard() {
+        let (connection, channels) = bounded_vnc_channels();
+        let retained = channels.clipboard.clone();
+        let task_retained = retained.clone();
+        let terminal = Arc::new(Mutex::new(None));
+        let (cancel, cancelled) = oneshot::channel();
+        let clipboard_inserted = Arc::new(AtomicBool::new(false));
+        let task_clipboard_inserted = Arc::clone(&clipboard_inserted);
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let task_drop_probe = Arc::clone(&task_dropped);
+        let task = tokio::spawn(async move {
+            let _drop_probe = DropProbe(task_drop_probe);
+            let _ = cancelled.await;
+            task_retained.replace(ClipboardText::try_from(b"late".to_vec()).unwrap());
+            task_clipboard_inserted.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+        let mut session = ProductionSession {
+            input: InputController::for_connection(connection, false, true, CLIPBOARD_TEXT_LIMIT)
+                .unwrap(),
+            task: Some(task),
+            terminal,
+            terminal_reported: false,
+            cancel: Some(cancel),
+        };
+
+        let close = tokio::spawn(async move {
+            let result = session.close().await;
+            (result, session)
+        });
+        wait_for_flag(&clipboard_inserted).await;
+        assert_eq!(retained.retained_count(), 1);
+        tokio::time::advance(Duration::from_millis(101)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            close.is_finished(),
+            "cancellation-ignored close exceeded its deadline"
+        );
+        let (result, mut session) = close.await.unwrap();
+        assert_eq!(result.unwrap_err().kind(), PublicErrorKind::Cleanup);
+        assert!(task_dropped.load(Ordering::SeqCst));
+        assert_eq!(retained.retained_count(), 0);
+        session.mark_ready();
+        assert!(session
+            .send_input(InputAction::ReceiveClipboard)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_ack_close_finally_clears_clipboard_repopulated_after_initial_clear() {
+        let (connection, channels) = bounded_vnc_channels();
+        let retained = channels.clipboard.clone();
+        let task_retained = retained.clone();
+        let terminal = Arc::new(Mutex::new(None));
+        let task_terminal = Arc::clone(&terminal);
+        let (cancel, cancelled) = oneshot::channel();
+        let clipboard_inserted = Arc::new(AtomicBool::new(false));
+        let task_clipboard_inserted = Arc::clone(&clipboard_inserted);
+        let task = tokio::spawn(async move {
+            let _ignored_cancellation = cancelled;
+            loop {
+                match channels.command_rx.try_recv() {
+                    Ok(VncCommand::GracefulDisconnect(barrier)) => {
+                        task_retained.replace(ClipboardText::try_from(b"late".to_vec()).unwrap());
+                        task_clipboard_inserted.store(true, Ordering::SeqCst);
+                        barrier.acknowledge();
+                        *task_terminal.lock().unwrap() = Some(Ok(()));
+                        return;
+                    }
+                    Ok(_) | Err(crossbeam_channel::TryRecvError::Empty) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+                }
+            }
+        });
+        let mut session = ProductionSession {
+            input: InputController::for_connection(connection, false, true, CLIPBOARD_TEXT_LIMIT)
+                .unwrap(),
+            task: Some(task),
+            terminal,
+            terminal_reported: false,
+            cancel: Some(cancel),
+        };
+        session.mark_ready();
+
+        let result = session.close().await;
+
+        assert!(clipboard_inserted.load(Ordering::SeqCst));
+        result.unwrap();
+        assert_eq!(retained.retained_count(), 0);
+        session.mark_ready();
+        assert!(session
+            .send_input(InputAction::ReceiveClipboard)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn graceful_close_full_queue_remains_bounded_queue_pressure() {
+        let (connection, channels) = bounded_vnc_channels();
+        for _ in 0..VNC_QUEUE_CAPACITY {
+            connection.send_pointer(0, 0, 0).unwrap();
+        }
+        let terminal = Arc::new(Mutex::new(None));
+        let task_terminal = Arc::clone(&terminal);
+        let (cancel, cancelled) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = cancelled.await;
+            *task_terminal.lock().unwrap() = Some(Ok(()));
+            drop(channels);
+        });
+        let mut session = ProductionSession {
+            input: InputController::for_connection(connection, false, false, CLIPBOARD_TEXT_LIMIT)
+                .unwrap(),
+            task: Some(task),
+            terminal,
+            terminal_reported: false,
+            cancel: Some(cancel),
+        };
+        session.mark_ready();
+
+        let error = timeout(Duration::from_secs(2), session.close())
+            .await
+            .expect("full-queue close was not bounded")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), PublicErrorKind::Queue);
+        assert!(!error.has_cleanup_failure());
+    }
+
+    #[tokio::test]
+    async fn graceful_close_disconnected_queue_preserves_terminal_transport_primary() {
+        let (connection, channels) = bounded_vnc_channels();
+        drop(channels.command_rx);
+        let terminal = Arc::new(Mutex::new(Some(Err(PublicError::new(
+            PublicErrorKind::RfbSecurity,
+        )))));
+        let (cancel, cancelled) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = cancelled.await;
+        });
+        let mut session = ProductionSession {
+            input: InputController::for_connection(connection, false, false, CLIPBOARD_TEXT_LIMIT)
+                .unwrap(),
+            task: Some(task),
+            terminal,
+            terminal_reported: false,
+            cancel: Some(cancel),
+        };
+        session.mark_ready();
+
+        let error = timeout(Duration::from_secs(2), session.close())
+            .await
+            .expect("disconnected-queue close was not bounded")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), PublicErrorKind::RfbSecurity);
+        assert!(error.has_cleanup_failure());
+    }
+
+    #[tokio::test]
+    async fn graceful_close_disconnected_queue_without_terminal_reports_cleanup() {
+        let (connection, channels) = bounded_vnc_channels();
+        drop(channels.command_rx);
+        let terminal = Arc::new(Mutex::new(None));
+        let (cancel, cancelled) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = cancelled.await;
+        });
+        let mut session = ProductionSession {
+            input: InputController::for_connection(connection, false, false, CLIPBOARD_TEXT_LIMIT)
+                .unwrap(),
+            task: Some(task),
+            terminal,
+            terminal_reported: false,
+            cancel: Some(cancel),
+        };
+        session.mark_ready();
+
+        let error = timeout(Duration::from_secs(2), session.close())
+            .await
+            .expect("disconnected-queue close was not bounded")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), PublicErrorKind::Cleanup);
+    }
+
     #[test]
     fn public_terminal_error_preserves_primary_kind_and_cleanup_failure() {
         let error = RfbError::new(
@@ -1237,6 +1532,11 @@ mod tests {
         opens: Arc<AtomicUsize>,
     }
 
+    struct ProductionWireBackend {
+        master: Option<SshMaster>,
+        opens: Arc<AtomicUsize>,
+    }
+
     impl SessionBackend for ProductionPathBackend {
         type Session = ProductionSession;
 
@@ -1291,6 +1591,79 @@ mod tests {
         }
     }
 
+    impl SessionBackend for ProductionWireBackend {
+        type Session = ProductionSession;
+
+        fn load_cache(
+            &mut self,
+        ) -> BackendFuture<'_, Result<Option<InventorySnapshot>, PublicError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn start_master(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async move {
+                self.master
+                    .as_mut()
+                    .ok_or_else(|| PublicError::new(PublicErrorKind::SshUnavailable))?
+                    .verify()
+                    .await
+                    .map(|_| ())
+                    .map_err(super::public_master_error)
+            })
+        }
+
+        fn fetch_inventory(&mut self) -> BackendFuture<'_, Result<InventorySnapshot, PublicError>> {
+            Box::pin(async {
+                Ok(InventorySnapshot {
+                    observed_at_unix_ms: 1,
+                    stale: false,
+                    vms: vec![VmInventoryItem {
+                        vmid: VmId::new(107).unwrap(),
+                        name: "SYNTHETIC-107".to_owned(),
+                        node: NodeName::parse("pve2").unwrap(),
+                        status: VmStatus::Running,
+                        template: false,
+                    }],
+                })
+            })
+        }
+
+        fn save_cache(
+            &mut self,
+            _snapshot: &InventorySnapshot,
+        ) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn open_session(
+            &mut self,
+            vmid: VmId,
+            options: OpenOptions,
+        ) -> BackendFuture<'_, Result<Self::Session, PublicError>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let master = self
+                    .master
+                    .as_mut()
+                    .ok_or_else(|| PublicError::new(PublicErrorKind::SshUnavailable))?;
+                let mut verified = master.verify().await.map_err(super::public_master_error)?;
+                let proxy = TrustedSshProxy::connect(&mut verified, vmid)
+                    .await
+                    .map_err(super::public_proxy_error)?;
+                ProductionSession::spawn(proxy, options)
+            })
+        }
+
+        fn close_master(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async move {
+                match self.master.as_mut() {
+                    Some(master) => master.close().await.map_err(super::public_master_error),
+                    None => Ok(()),
+                }
+            })
+        }
+    }
+
     async fn production_path_manager(
         runtime: &RuntimeDir,
         executable: PathBuf,
@@ -1332,6 +1705,55 @@ mod tests {
             .await
             .unwrap();
         (master, manager, opens, proxy_pid)
+    }
+
+    async fn production_wire_manager(
+        runtime: &RuntimeDir,
+        executable: PathBuf,
+    ) -> (SessionManager, Arc<AtomicUsize>, u32) {
+        fs::write(
+            runtime.control_socket().with_extension("proxy_track_opens"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&runtime.control_socket().with_extension("state")).await;
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut manager = SessionManager::spawn(
+            AppConfig::new(fixture_profile()),
+            ProductionWireBackend {
+                master: Some(master),
+                opens: Arc::clone(&opens),
+            },
+        );
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(manager.recv().await, Some(AppEvent::LiveInventory(_))) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("production-wire manager did not publish live inventory");
+        manager
+            .send(AppCommand::Open {
+                vmid: VmId::new(107).unwrap(),
+                options: OpenOptions::default(),
+            })
+            .await
+            .unwrap();
+        let opens_path = runtime.control_socket().with_extension("proxy.opens");
+        wait_for_proxy_open_count(&opens_path, 1).await;
+        let proxy_pid = fs::read_to_string(opens_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        (manager, opens, proxy_pid)
     }
 
     async fn assert_one_production_error_then_disconnected(
@@ -1397,6 +1819,22 @@ mod tests {
         .expect("synthetic RFB fixture did not reach the required protocol stage");
     }
 
+    async fn wait_for_proxy_open_count(path: &Path, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let observed = fs::read_to_string(path)
+                    .map(|contents| contents.lines().count())
+                    .unwrap_or(0);
+                if observed >= expected {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("synthetic proxy did not reach the expected open count");
+    }
+
     #[derive(Clone, Copy)]
     enum ProductionCloseCase {
         Close,
@@ -1414,8 +1852,7 @@ mod tests {
             b"synthetic fixture control\n",
         )
         .unwrap();
-        let (mut master, mut manager, opens, proxy_pid) =
-            production_path_manager(&runtime, executable).await;
+        let (mut manager, opens, proxy_pid) = production_wire_manager(&runtime, executable).await;
 
         let ready = timeout(Duration::from_secs(2), async {
             loop {
@@ -1481,8 +1918,22 @@ mod tests {
             }
         }
 
+        if matches!(case, ProductionCloseCase::Reconnect) {
+            wait_for_proxy_open_count(&runtime.control_socket().with_extension("proxy.opens"), 2)
+                .await;
+            wait_for_fixture_marker(
+                &runtime
+                    .control_socket()
+                    .with_extension("proxy.input-capture-skipped"),
+            )
+            .await;
+        }
         wait_for_fixture_marker(&runtime.control_socket().with_extension("proxy.key-up-read"))
             .await;
+        assert!(runtime
+            .control_socket()
+            .with_extension("proxy.input-capture-claimed")
+            .exists());
         assert_eq!(
             fs::read(runtime.control_socket().with_extension("proxy.input-wire")).unwrap(),
             [
@@ -1496,7 +1947,15 @@ mod tests {
         };
         assert_eq!(opens.load(Ordering::SeqCst), expected_opens);
         assert_exact_pid_is_gone(proxy_pid).await;
-        master.close().await.unwrap();
+        for replacement_pid in
+            fs::read_to_string(runtime.control_socket().with_extension("proxy.opens"))
+                .unwrap()
+                .lines()
+                .skip(1)
+                .map(|line| line.parse().unwrap())
+        {
+            assert_exact_pid_is_gone(replacement_pid).await;
+        }
     }
 
     #[cfg(unix)]
@@ -1511,6 +1970,77 @@ mod tests {
         ] {
             assert_production_key_release_wire_order(case).await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_post_ack_shutdown_stall_aborts_vnc_task_and_reaps_owned_proxy() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("proxy_rfb_input_capture"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("proxy_input_capture_hang_after_keyup"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&runtime.control_socket().with_extension("state")).await;
+        let mut verified = master.verify().await.unwrap();
+        let proxy = TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap())
+            .await
+            .unwrap();
+        let mut session = ProductionSession::spawn(proxy, OpenOptions::default()).unwrap();
+        let proxy_pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&proxy_pid_path).await;
+        let proxy_pid = helper_pid(&proxy_pid_path);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    session.try_recv().unwrap(),
+                    Some(SessionTransportEvent::Framebuffer(ref rects)) if !rects.is_empty()
+                ) {
+                    session.mark_ready();
+                    return;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("real stalled-shutdown session did not become ready");
+        session
+            .send_input(InputAction::Key {
+                down: true,
+                keysym: 0xffe3,
+            })
+            .unwrap();
+        wait_for_fixture_marker(
+            &runtime
+                .control_socket()
+                .with_extension("proxy.key-down-read"),
+        )
+        .await;
+
+        let error = timeout(Duration::from_secs(2), session.close())
+            .await
+            .expect("post-ack shutdown stall exceeded the total close policy")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), PublicErrorKind::Cleanup);
+        wait_for_fixture_marker(&runtime.control_socket().with_extension("proxy.key-up-read"))
+            .await;
+        assert_exact_pid_is_gone(proxy_pid).await;
+        master.close().await.unwrap();
     }
 
     #[cfg(unix)]

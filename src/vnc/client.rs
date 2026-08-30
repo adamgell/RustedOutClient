@@ -1178,12 +1178,15 @@ mod tests {
     #[tokio::test]
     async fn clipboard_pressure_replaces_one_private_slot_without_event_payloads() {
         const MESSAGE_COUNT: usize = 257;
-        const MESSAGE_BYTES: usize = 8;
+        const MESSAGE_BYTES: usize = 1_048_576;
+        const MARKER_BYTES: usize = 8;
 
-        let (client, mut peer) = duplex(128);
+        let (client, mut peer) = duplex(64 * 1024);
         let producer = tokio::spawn(async move {
             for index in 0..MESSAGE_COUNT {
-                let text = format!("{index:0MESSAGE_BYTES$}");
+                let mut text = vec![b'x'; MESSAGE_BYTES];
+                let marker = format!("{index:0MARKER_BYTES$}");
+                text[MESSAGE_BYTES - MARKER_BYTES..].copy_from_slice(marker.as_bytes());
                 assert_eq!(text.len(), MESSAGE_BYTES);
                 peer.write_all(&[server_msg::SERVER_CUT_TEXT, 0, 0, 0])
                     .await
@@ -1191,14 +1194,11 @@ mod tests {
                 peer.write_all(&(MESSAGE_BYTES as u32).to_be_bytes())
                     .await
                     .unwrap();
-                peer.write_all(text.as_bytes()).await.unwrap();
+                peer.write_all(&text).await.unwrap();
             }
             peer.shutdown().await.unwrap();
         });
-        let limits = ProtocolLimits {
-            max_clipboard_bytes: MESSAGE_BYTES as u32,
-            ..ProtocolLimits::default()
-        };
+        let limits = ProtocolLimits::default();
         let mut reader = RfbReader::new(client, limits);
         let mut framebuffer = Framebuffer::new(1, 1, limits).unwrap();
         let (connection, channels) = bounded_vnc_channels();
@@ -1222,7 +1222,11 @@ mod tests {
         assert!(connection.event_rx.try_recv().is_err());
         assert_eq!(channels.clipboard.retained_count(), 1);
         let latest = channels.clipboard.take().unwrap();
-        assert_eq!(latest.as_str(), "00000256");
+        assert_eq!(latest.as_str().len(), MESSAGE_BYTES);
+        assert_eq!(
+            &latest.as_str().as_bytes()[MESSAGE_BYTES - MARKER_BYTES..],
+            b"00000256"
+        );
         assert_eq!(channels.clipboard.retained_count(), 0);
     }
 
