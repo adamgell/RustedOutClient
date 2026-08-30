@@ -40,9 +40,11 @@ tempfile = "3"
 rustix = { version = "1.1", features = ["fs"] }
 getrandom = "0.4"
 rand = "0.8.7"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 trybuild = "1"
+tokio = { version = "1", features = ["test-util"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

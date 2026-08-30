@@ -19,6 +19,7 @@ pub enum RfbPhase {
     Encoding,
     Session,
     EventQueue,
+    Cleanup,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -56,6 +56,14 @@ impl InventoryCache {
         normalize_inventory_snapshot(snapshot, true).map_err(|_| CacheError::InvalidInventory)
     }
 
+    pub fn load_optional(&self) -> Result<Option<InventorySnapshot>, CacheError> {
+        match self.load() {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(CacheError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn save(&self, snapshot: &InventorySnapshot) -> Result<(), CacheError> {
         self.save_inner(snapshot, &NoFaults, &NoDirectoryCreateObserver)
     }

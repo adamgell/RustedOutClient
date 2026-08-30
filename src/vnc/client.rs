@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::{
     connection::{FbRect, VncCommand, VncEvent, VNC_QUEUE_CAPACITY},
-    ssh::TrustedSshProxy,
+    ssh::{ProxyTicket, TrustedSshProxy},
 };
 
 use tight::TightState;
@@ -346,60 +346,82 @@ impl VncClient {
         event_tx: Sender<VncEvent>,
         command_rx: Receiver<VncCommand>,
     ) -> Result<(), RfbError> {
-        options.limits.validate_for_phase(RfbPhase::ServerInit)?;
-        if event_tx.capacity() != Some(VNC_QUEUE_CAPACITY)
-            || command_rx.capacity() != Some(VNC_QUEUE_CAPACITY)
-        {
-            return Err(RfbError::new(
-                RfbPhase::EventQueue,
-                RfbErrorKind::Queue,
-                "queue capacity",
-            ));
-        }
-
         let limits = options.limits;
         let (stream, ticket) = proxy.into_parts();
         let mut reader = RfbReader::new(stream, limits);
-        let version = negotiate_version(&mut reader).await?;
-        negotiate_security(&mut reader, ticket, version).await?;
+        let result = run_connected(&mut reader, ticket, options, event_tx, command_rx).await;
+        finish_session(reader, result).await
+    }
+}
 
-        reader
-            .write_u8(u8::from(options.shared))
-            .await
-            .map_err(|source| RfbError::io(RfbPhase::ServerInit, source))?;
-        let init = configure_server(&mut reader).await?;
-        debug!(
-            width = init.width,
-            height = init.height,
-            "RFB ServerInit accepted"
-        );
+async fn run_connected<S>(
+    reader: &mut RfbReader<S>,
+    ticket: ProxyTicket,
+    options: VncOptions,
+    event_tx: Sender<VncEvent>,
+    command_rx: Receiver<VncCommand>,
+) -> Result<(), RfbError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    options.limits.validate_for_phase(RfbPhase::ServerInit)?;
+    if event_tx.capacity() != Some(VNC_QUEUE_CAPACITY)
+        || command_rx.capacity() != Some(VNC_QUEUE_CAPACITY)
+    {
+        return Err(RfbError::new(
+            RfbPhase::EventQueue,
+            RfbErrorKind::Queue,
+            "queue capacity",
+        ));
+    }
 
-        let ServerInit {
-            width,
-            height,
-            pixel_format: _,
-            desktop_name,
-            framebuffer: pixels,
-        } = init;
-        let mut framebuffer = Framebuffer::from_pixels(width, height, limits, pixels)
-            .map_err(encoding::map_framebuffer_error)?;
-        let mut events = EventQueue::new(event_tx, limits);
-        events.send_lossless(VncEvent::DesktopSize(
-            u32::from(framebuffer.width()),
-            u32::from(framebuffer.height()),
-        ))?;
-        events.send_lossless(VncEvent::DesktopName(desktop_name))?;
+    let limits = options.limits;
+    let version = negotiate_version(reader).await?;
+    negotiate_security(reader, ticket, version).await?;
 
-        send_fb_update_request(&mut reader, false, 0, 0, width, height).await?;
-
-        run_session(
-            &mut reader,
-            &mut framebuffer,
-            &mut events,
-            &command_rx,
-            limits,
-        )
+    reader
+        .write_u8(u8::from(options.shared))
         .await
+        .map_err(|source| RfbError::io(RfbPhase::ServerInit, source))?;
+    let init = configure_server(reader).await?;
+    debug!(
+        width = init.width,
+        height = init.height,
+        "RFB ServerInit accepted"
+    );
+
+    let ServerInit {
+        width,
+        height,
+        pixel_format: _,
+        desktop_name,
+        framebuffer: pixels,
+    } = init;
+    let mut framebuffer = Framebuffer::from_pixels(width, height, limits, pixels)
+        .map_err(encoding::map_framebuffer_error)?;
+    let mut events = EventQueue::new(event_tx, limits);
+    events.send_lossless(VncEvent::DesktopSize(
+        u32::from(framebuffer.width()),
+        u32::from(framebuffer.height()),
+    ))?;
+    events.send_lossless(VncEvent::DesktopName(desktop_name))?;
+
+    send_fb_update_request(reader, false, 0, 0, width, height).await?;
+
+    run_session(reader, &mut framebuffer, &mut events, &command_rx, limits).await
+}
+
+async fn finish_session<S>(
+    reader: RfbReader<S>,
+    result: Result<(), RfbError>,
+) -> Result<(), RfbError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut stream = reader.into_inner();
+    match stream.shutdown().await {
+        Ok(()) => result,
+        Err(source) => Err(RfbError::io(RfbPhase::Cleanup, source)),
     }
 }
 
@@ -894,8 +916,8 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        configure_server, decoder_pixel_format, framebuffer_rects, run_session, tight, EventQueue,
-        TightState,
+        configure_server, decoder_pixel_format, finish_session, framebuffer_rects, run_session,
+        tight, EventQueue, TightState,
     };
     use crate::{
         connection::{FbRect, VncCommand, VncEvent},
@@ -959,6 +981,25 @@ mod tests {
         wire.extend_from_slice(&width.to_be_bytes());
         wire.extend_from_slice(&height.to_be_bytes());
         wire.extend_from_slice(&encoding.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn terminal_protocol_error_still_shuts_down_the_owned_transport() {
+        let (client, mut peer) = duplex(16);
+        let reader = RfbReader::new(client, ProtocolLimits::default());
+        let primary = RfbError::new(
+            RfbPhase::Authentication,
+            RfbErrorKind::SecurityFailure,
+            "synthetic authentication",
+        );
+
+        let returned = finish_session(reader, Err(primary.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(returned, primary);
+
+        let mut byte = [0_u8; 1];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
     }
 
     #[tokio::test]
