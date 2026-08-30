@@ -157,7 +157,7 @@ Date: 2026-08-30
 Fix brief: `task-11-fix-round-1.md`
 Required fix base: `e1b4a37f0540c1945b715ca22394083166276e92`
 Implementation commit message: `fix: harden native session workspace`
-Final implementation commit SHA: `FIX_ROUND_1_IMPLEMENTATION_COMMIT_PENDING`
+Final implementation commit SHA: `dd4f69b0d0b02a95409021ad21a9d4042cb2b510`
 
 This section supersedes the original Task 11 report where fix-round behavior or test counts differ. The original implementation evidence above remains the record for the initial Task 11 commit.
 
