@@ -1,5 +1,6 @@
 use crate::{
     connection::FbRect,
+    fallback::FallbackPreferences,
     model::VmId,
     ssh::InventorySnapshot,
     vnc::{ClipboardText, InputError, VncOptions},
@@ -53,6 +54,10 @@ pub enum AppCommand {
     Open {
         vmid: VmId,
         options: OpenOptions,
+    },
+    OpenInTigerVnc {
+        vmid: VmId,
+        preferences: FallbackPreferences,
     },
     Reconnect {
         session_id: SessionId,

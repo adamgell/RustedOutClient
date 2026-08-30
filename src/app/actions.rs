@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 use crate::{
+    fallback::FallbackPreferences,
     model::{ScaleMode, VmId},
     session::{AppCommand, InputAction, ResizeStatus, SessionManager, SessionPhase},
 };
@@ -33,9 +34,11 @@ impl ActionAvailability {
         let open = state
             .selected_inventory_item()
             .is_some_and(|item| item.status == crate::ssh::VmStatus::Running);
+        let open_in_tigervnc = state.fallback_configured() && state.fallback_target().is_some();
         let Some(tab) = state.selected_session() else {
             return Self {
                 open,
+                open_in_tigervnc,
                 diagnostics: true,
                 ..Self::default()
             };
@@ -56,7 +59,7 @@ impl ActionAvailability {
             open,
             reconnect: live,
             close: live,
-            open_in_tigervnc: false,
+            open_in_tigervnc,
             ctrl_alt_delete: writable,
             release_all_keys: live,
             view_only: live,
@@ -213,7 +216,25 @@ where
         UiAction::Close => selected_command(state, sink, availability.close, |session_id| {
             AppCommand::Close { session_id }
         }),
-        UiAction::OpenInTigerVnc => DispatchOutcome::NotAvailable,
+        UiAction::OpenInTigerVnc => {
+            if !availability.open_in_tigervnc {
+                return DispatchOutcome::NotAvailable;
+            }
+            let Some((vmid, view_only)) = state.fallback_target() else {
+                return DispatchOutcome::NotAvailable;
+            };
+            dispatch(
+                state,
+                sink,
+                AppCommand::OpenInTigerVnc {
+                    vmid,
+                    preferences: FallbackPreferences {
+                        fullscreen: state.fullscreen(),
+                        view_only,
+                    },
+                },
+            )
+        }
         UiAction::CtrlAltDelete => selected_input(
             state,
             sink,

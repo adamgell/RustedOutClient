@@ -5,6 +5,7 @@ pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod connection;
+pub mod fallback;
 pub mod model;
 pub mod runtime;
 pub mod session;

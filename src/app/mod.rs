@@ -323,6 +323,7 @@ mod close_coordinator_tests {
     enum RecordedCommand {
         Pointer(SessionId, u8, u16, u16),
         ReleaseOwnedInput(SessionId, Option<(u16, u16)>),
+        Fallback(VmId, bool, bool),
         Shutdown,
         Other,
     }
@@ -358,6 +359,9 @@ mod close_coordinator_tests {
                     session_id,
                     action: InputAction::ReleaseOwnedInput { pointer_position },
                 } => RecordedCommand::ReleaseOwnedInput(session_id, pointer_position),
+                AppCommand::OpenInTigerVnc { vmid, preferences } => {
+                    RecordedCommand::Fallback(vmid, preferences.fullscreen, preferences.view_only)
+                }
                 AppCommand::Shutdown => {
                     self.shutdown_attempts
                         .set(self.shutdown_attempts.get().saturating_add(1));
@@ -374,11 +378,13 @@ mod close_coordinator_tests {
     }
 
     fn ready_state(first: SessionId, second: SessionId) -> AppState {
-        let mut state = AppState::from_config(&AppConfig::new(PveProfile {
+        let mut config = AppConfig::new(PveProfile {
             name: "Synthetic lab".to_owned(),
             ssh_target: SshTarget::parse("root@pve.example.invalid").unwrap(),
             node: NodeName::parse("pve2").unwrap(),
-        }));
+        });
+        config.fallback_viewer = Some(std::path::PathBuf::from("/synthetic/viewer"));
+        let mut state = AppState::from_config(&config);
         for (session_id, vmid) in [(first, 107), (second, 108)] {
             state
                 .apply(AppEvent::SessionChanged(SessionSnapshot {
@@ -475,6 +481,45 @@ mod close_coordinator_tests {
                 RecordedCommand::Other,
             ],
             "selection changes must not retarget the retained release"
+        );
+    }
+
+    #[test]
+    fn fallback_waits_behind_retained_input_owner_cleanup_on_the_same_queue() {
+        let outgoing = SessionId::new();
+        let incoming = SessionId::new();
+        let sink = ScriptedSink::new([Err(CommandQueueError::Full), Ok(()), Ok(())]);
+        let mut state = ready_state(outgoing, incoming);
+        let mut clipboard = NoClipboard;
+        let mut view = ViewResources::default();
+        view.set_test_owner(outgoing, 0b0010, 0b10, Some((40, 50)));
+        view.request_owner_cleanup();
+
+        let cleanup = view.owner_cleanup_action().unwrap();
+        dispatch_rendered_actions(
+            &mut state,
+            &sink,
+            &mut clipboard,
+            &mut view,
+            [cleanup, UiAction::OpenInTigerVnc],
+        );
+        assert!(sink.accepted().is_empty());
+        assert!(view.owner_cleanup_pending());
+
+        let cleanup = view.owner_cleanup_action().unwrap();
+        dispatch_rendered_actions(
+            &mut state,
+            &sink,
+            &mut clipboard,
+            &mut view,
+            [cleanup, UiAction::OpenInTigerVnc],
+        );
+        assert_eq!(
+            sink.accepted(),
+            [
+                RecordedCommand::ReleaseOwnedInput(outgoing, Some((40, 50))),
+                RecordedCommand::Fallback(VmId::new(107).unwrap(), false, false),
+            ]
         );
     }
 

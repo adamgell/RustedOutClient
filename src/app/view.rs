@@ -506,7 +506,7 @@ fn render_menu_bar(ctx: &egui::Context, state: &AppState, actions: &mut Vec<UiAc
                 ui.menu_button("Help", |ui| {
                     ui.label("Select a running VM, then Open.");
                     ui.label(
-                        RichText::new("TigerVNC fallback arrives in Task 12.")
+                        RichText::new("TigerVNC opens only when explicitly requested.")
                             .color(MUTED_TELEMETRY),
                     );
                 });

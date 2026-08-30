@@ -17,6 +17,9 @@ use crate::{
     cache::{CacheError, InventoryCache},
     config::AppConfig,
     connection::{bounded_vnc_channels, VncConnection, VncEvent},
+    fallback::{
+        FallbackError, FallbackErrorKind, FallbackPreferences, FallbackSession, TigerVncFallback,
+    },
     model::{PveProfile, VmId},
     runtime::RuntimeDir,
     ssh::{
@@ -37,6 +40,7 @@ use super::{
 
 pub const APP_QUEUE_CAPACITY: usize = 256;
 const MAX_ACTIVE_NATIVE_SESSIONS: usize = 2;
+const MAX_ACTIVE_FALLBACK_SESSIONS: usize = 2;
 const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 const RESIZE_OUTCOME_DEADLINE: Duration = Duration::from_secs(2);
@@ -69,6 +73,13 @@ pub trait SessionBackend: Send + 'static {
         vmid: VmId,
         options: OpenOptions,
     ) -> BackendFuture<'_, Result<Self::Session, PublicError>>;
+    fn open_fallback(
+        &mut self,
+        _vmid: VmId,
+        _preferences: FallbackPreferences,
+    ) -> BackendFuture<'_, Result<FallbackSession, PublicError>> {
+        Box::pin(async { Err(PublicError::new(PublicErrorKind::ViewerFallback)) })
+    }
     fn close_master(&mut self) -> BackendFuture<'_, Result<(), PublicError>>;
 }
 
@@ -93,6 +104,7 @@ impl SessionManager {
                 command_rx,
                 event_tx,
                 sessions: Vec::new(),
+                fallbacks: Vec::new(),
             }
             .run(),
         );
@@ -104,7 +116,11 @@ impl SessionManager {
     }
 
     pub fn spawn_production(config: AppConfig, cache_path: PathBuf) -> Result<Self, PublicError> {
-        let backend = ProductionBackend::new(config.profile.clone(), cache_path)?;
+        let backend = ProductionBackend::new(
+            config.profile.clone(),
+            cache_path,
+            config.fallback_viewer.clone(),
+        )?;
         Ok(Self::spawn(config, backend))
     }
 
@@ -182,6 +198,11 @@ struct SessionRecord<S> {
     session: Option<S>,
     error_emitted: bool,
     resize: ResizePolicy,
+}
+
+struct FallbackRecord {
+    vmid: VmId,
+    session: FallbackSession,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -295,6 +316,7 @@ where
     command_rx: mpsc::Receiver<AppCommand>,
     event_tx: mpsc::Sender<AppEvent>,
     sessions: Vec<SessionRecord<B::Session>>,
+    fallbacks: Vec<FallbackRecord>,
 }
 
 impl<B> Worker<B>
@@ -318,7 +340,10 @@ where
                     }
                 }
                 _ = refresh.tick() => self.refresh_inventory().await,
-                _ = session_poll.tick() => self.poll_sessions().await,
+                _ = session_poll.tick() => {
+                    self.poll_sessions().await;
+                    self.poll_fallbacks().await;
+                },
             }
         }
     }
@@ -357,6 +382,9 @@ where
         match command {
             AppCommand::RefreshInventory => self.refresh_inventory().await,
             AppCommand::Open { vmid, options } => self.open(vmid, options).await,
+            AppCommand::OpenInTigerVnc { vmid, preferences } => {
+                self.open_fallback(vmid, preferences).await
+            }
             AppCommand::Reconnect { session_id } => self.reconnect(session_id).await,
             AppCommand::Close { session_id } => {
                 if let Some(index) = self.session_index(session_id) {
@@ -434,6 +462,41 @@ where
             Err(error) => {
                 let contextual = error.for_session(session_id, vmid);
                 let _ = self.close_session(index, Some(contextual)).await;
+            }
+        }
+    }
+
+    async fn open_fallback(&mut self, vmid: VmId, preferences: FallbackPreferences) {
+        self.poll_fallbacks().await;
+        if self.fallbacks.iter().any(|record| record.vmid == vmid)
+            || self.fallbacks.len() >= MAX_ACTIVE_FALLBACK_SESSIONS
+        {
+            self.emit_critical(AppEvent::Error(PublicError::new(
+                PublicErrorKind::ViewerFallback,
+            )))
+            .await;
+            return;
+        }
+        match self.backend.open_fallback(vmid, preferences).await {
+            Ok(session) => self.fallbacks.push(FallbackRecord { vmid, session }),
+            Err(error) => {
+                self.emit_critical(AppEvent::Error(error)).await;
+            }
+        }
+    }
+
+    async fn poll_fallbacks(&mut self) {
+        let mut completed = Vec::new();
+        for (index, record) in self.fallbacks.iter_mut().enumerate() {
+            if let Some(result) = record.session.try_complete() {
+                completed.push((index, result));
+            }
+        }
+        for (index, result) in completed.into_iter().rev() {
+            self.fallbacks.remove(index);
+            if let Err(error) = result {
+                self.emit_critical(AppEvent::Error(public_fallback_error(error)))
+                    .await;
             }
         }
     }
@@ -908,6 +971,18 @@ where
 
     async fn shutdown(&mut self) -> Result<(), PublicError> {
         let mut first_error = None;
+        let mut fallback_errors = Vec::new();
+        for record in &mut self.fallbacks {
+            if let Err(error) = record.session.close().await {
+                let public = public_fallback_error(error);
+                first_error.get_or_insert(public);
+                fallback_errors.push(public);
+            }
+        }
+        self.fallbacks.clear();
+        for error in fallback_errors {
+            self.emit_critical(AppEvent::Error(error)).await;
+        }
         for index in 0..self.sessions.len() {
             if let Err(error) = self.close_session(index, None).await {
                 first_error.get_or_insert(error);
@@ -946,17 +1021,23 @@ pub struct ProductionBackend {
     profile: PveProfile,
     cache: InventoryCache,
     runtime: RuntimeDir,
+    fallback_viewer: Option<PathBuf>,
     master: Option<SshMaster>,
 }
 
 impl ProductionBackend {
-    pub fn new(profile: PveProfile, cache_path: PathBuf) -> Result<Self, PublicError> {
+    pub fn new(
+        profile: PveProfile,
+        cache_path: PathBuf,
+        fallback_viewer: Option<PathBuf>,
+    ) -> Result<Self, PublicError> {
         let runtime =
             RuntimeDir::create().map_err(|_| PublicError::new(PublicErrorKind::SshUnavailable))?;
         Ok(Self {
             profile,
             cache: InventoryCache::new(cache_path),
             runtime,
+            fallback_viewer,
             master: None,
         })
     }
@@ -1031,6 +1112,31 @@ impl SessionBackend for ProductionBackend {
                 .await
                 .map_err(public_proxy_error)?;
             ProductionSession::spawn(proxy, options)
+        })
+    }
+
+    fn open_fallback(
+        &mut self,
+        vmid: VmId,
+        preferences: FallbackPreferences,
+    ) -> BackendFuture<'_, Result<FallbackSession, PublicError>> {
+        Box::pin(async move {
+            let viewer_path = self
+                .fallback_viewer
+                .as_deref()
+                .ok_or_else(|| PublicError::new(PublicErrorKind::ViewerFallback))?;
+            TigerVncFallback::validate_viewer_path(viewer_path).map_err(public_fallback_error)?;
+            let master = self
+                .master
+                .as_mut()
+                .ok_or_else(|| PublicError::new(PublicErrorKind::SshUnavailable))?;
+            let mut verified = master.verify().await.map_err(public_master_error)?;
+            let proxy = TrustedSshProxy::connect(&mut verified, vmid)
+                .await
+                .map_err(public_proxy_error)?;
+            TigerVncFallback::open(proxy, &self.runtime, viewer_path, preferences)
+                .await
+                .map_err(public_fallback_error)
         })
     }
 
@@ -1373,6 +1479,18 @@ fn public_proxy_error(error: ProxyOpenError) -> PublicError {
     }
 }
 
+fn public_fallback_error(error: FallbackError) -> PublicError {
+    let mut public = if error.kind() == FallbackErrorKind::Cleanup {
+        PublicError::new(PublicErrorKind::Cleanup)
+    } else {
+        PublicError::new(PublicErrorKind::ViewerFallback)
+    };
+    if error.has_cleanup_failure() {
+        public = public.with_cleanup_failure();
+    }
+    public
+}
+
 fn public_ssh_failure(kind: SshFailureKind) -> PublicError {
     let kind = match kind {
         SshFailureKind::HostKeyUnknown => PublicErrorKind::HostKeyUnknown,
@@ -1406,6 +1524,7 @@ fn public_rfb_error(error: RfbError) -> PublicError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         fs, io,
         path::{Path, PathBuf},
         process::{Command, Stdio},
@@ -1430,6 +1549,7 @@ mod tests {
     use crate::{
         config::AppConfig,
         connection::{bounded_vnc_channels, FbRect, VncCommand, VncEvent, VNC_QUEUE_CAPACITY},
+        fallback::{FallbackPreferences, FallbackSession, TestFallbackCompletion},
         model::{NodeName, PveProfile, SshTarget, VmId},
         runtime::RuntimeDir,
         session::{
@@ -2722,5 +2842,244 @@ mod tests {
             .unwrap();
         assert_exact_pid_is_gone(proxy_pid).await;
         master.close().await.unwrap();
+    }
+
+    struct FallbackAdmissionBackend {
+        sessions: VecDeque<FallbackSession>,
+        opens: Arc<Mutex<Vec<(VmId, FallbackPreferences)>>>,
+        native_opens: Arc<AtomicUsize>,
+        closed: Vec<Arc<AtomicBool>>,
+        master_closed: Arc<AtomicBool>,
+    }
+
+    struct NoNativeSession;
+
+    impl ManagedSession for NoNativeSession {
+        fn try_recv(&mut self) -> Result<Option<SessionTransportEvent>, PublicError> {
+            Ok(None)
+        }
+
+        fn mark_ready(&mut self) {}
+
+        fn send_input(
+            &mut self,
+            _action: InputAction,
+        ) -> Result<Option<ClipboardText>, crate::vnc::InputError> {
+            Ok(None)
+        }
+
+        fn release_all_keys(&mut self) -> Result<(), PublicError> {
+            Ok(())
+        }
+
+        fn close(&mut self, _deadline: Instant) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl SessionBackend for FallbackAdmissionBackend {
+        type Session = NoNativeSession;
+
+        fn load_cache(
+            &mut self,
+        ) -> BackendFuture<'_, Result<Option<InventorySnapshot>, PublicError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn start_master(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_inventory(&mut self) -> BackendFuture<'_, Result<InventorySnapshot, PublicError>> {
+            Box::pin(async {
+                Ok(InventorySnapshot {
+                    observed_at_unix_ms: 1,
+                    stale: false,
+                    vms: Vec::new(),
+                })
+            })
+        }
+
+        fn save_cache(
+            &mut self,
+            _snapshot: &InventorySnapshot,
+        ) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn open_session(
+            &mut self,
+            _vmid: VmId,
+            _options: OpenOptions,
+        ) -> BackendFuture<'_, Result<Self::Session, PublicError>> {
+            self.native_opens.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(PublicError::new(PublicErrorKind::Proxy)) })
+        }
+
+        fn open_fallback(
+            &mut self,
+            vmid: VmId,
+            preferences: FallbackPreferences,
+        ) -> BackendFuture<'_, Result<FallbackSession, PublicError>> {
+            self.opens.lock().unwrap().push((vmid, preferences));
+            let result = self
+                .sessions
+                .pop_front()
+                .ok_or_else(|| PublicError::new(PublicErrorKind::ViewerFallback));
+            Box::pin(async move { result })
+        }
+
+        fn close_master(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async move {
+                assert!(
+                    self.closed
+                        .iter()
+                        .all(|closed| closed.load(Ordering::SeqCst)),
+                    "SSH master close ran before fallback cleanup"
+                );
+                self.master_closed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    async fn wait_for_fallback_opens(
+        opens: &Arc<Mutex<Vec<(VmId, FallbackPreferences)>>>,
+        expected: usize,
+    ) {
+        timeout(Duration::from_secs(2), async {
+            while opens.lock().unwrap().len() != expected {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("fallback command was not handled");
+    }
+
+    async fn next_public_error(manager: &mut SessionManager) -> PublicError {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(AppEvent::Error(error)) = manager.recv().await {
+                    break error;
+                }
+            }
+        })
+        .await
+        .expect("typed manager error was not published")
+    }
+
+    #[tokio::test]
+    async fn fallback_admission_completion_native_failure_and_shutdown_order_are_bounded() {
+        let opens = Arc::new(Mutex::new(Vec::new()));
+        let native_opens = Arc::new(AtomicUsize::new(0));
+        let master_closed = Arc::new(AtomicBool::new(false));
+        let mut sessions = VecDeque::new();
+        let mut completions: Vec<TestFallbackCompletion> = Vec::new();
+        let mut closed = Vec::new();
+        for _ in 0..3 {
+            let closed_flag = Arc::new(AtomicBool::new(false));
+            let (session, completion) = FallbackSession::pending_for_test(Arc::clone(&closed_flag));
+            sessions.push_back(session);
+            completions.push(completion);
+            closed.push(closed_flag);
+        }
+        let backend = FallbackAdmissionBackend {
+            sessions,
+            opens: Arc::clone(&opens),
+            native_opens: Arc::clone(&native_opens),
+            closed: closed.clone(),
+            master_closed: Arc::clone(&master_closed),
+        };
+        let mut manager = SessionManager::spawn(AppConfig::new(fixture_profile()), backend);
+        timeout(Duration::from_secs(2), async {
+            while !matches!(manager.recv().await, Some(AppEvent::LiveInventory(_))) {}
+        })
+        .await
+        .unwrap();
+
+        let first = VmId::new(107).unwrap();
+        let second = VmId::new(108).unwrap();
+        let third = VmId::new(109).unwrap();
+        let preferences = FallbackPreferences {
+            fullscreen: true,
+            view_only: true,
+        };
+        manager
+            .send(AppCommand::OpenInTigerVnc {
+                vmid: first,
+                preferences,
+            })
+            .await
+            .unwrap();
+        wait_for_fallback_opens(&opens, 1).await;
+        manager
+            .send(AppCommand::OpenInTigerVnc {
+                vmid: first,
+                preferences,
+            })
+            .await
+            .unwrap();
+        let duplicate = next_public_error(&mut manager).await;
+        assert_eq!(duplicate.kind(), PublicErrorKind::ViewerFallback);
+        assert_eq!(duplicate.vmid(), None);
+        assert_eq!(opens.lock().unwrap().len(), 1);
+
+        manager
+            .send(AppCommand::OpenInTigerVnc {
+                vmid: second,
+                preferences: FallbackPreferences::default(),
+            })
+            .await
+            .unwrap();
+        wait_for_fallback_opens(&opens, 2).await;
+        manager
+            .send(AppCommand::OpenInTigerVnc {
+                vmid: third,
+                preferences: FallbackPreferences::default(),
+            })
+            .await
+            .unwrap();
+        let capacity = next_public_error(&mut manager).await;
+        assert_eq!(capacity.kind(), PublicErrorKind::ViewerFallback);
+        assert_eq!(capacity.vmid(), None);
+        assert_eq!(opens.lock().unwrap().len(), 2);
+
+        completions.remove(0).finish(Ok(()));
+        timeout(Duration::from_secs(2), async {
+            while !closed[0].load(Ordering::SeqCst) {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        manager
+            .send(AppCommand::OpenInTigerVnc {
+                vmid: third,
+                preferences: FallbackPreferences::default(),
+            })
+            .await
+            .unwrap();
+        wait_for_fallback_opens(&opens, 3).await;
+        assert_eq!(opens.lock().unwrap()[0], (first, preferences));
+
+        manager
+            .send(AppCommand::Open {
+                vmid: first,
+                options: OpenOptions::default(),
+            })
+            .await
+            .unwrap();
+        let native_error = next_public_error(&mut manager).await;
+        assert_eq!(native_error.kind(), PublicErrorKind::Proxy);
+        assert_eq!(native_opens.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            opens.lock().unwrap().len(),
+            3,
+            "native failure auto-opened fallback"
+        );
+
+        manager.shutdown().await.unwrap();
+        assert!(closed.iter().all(|flag| flag.load(Ordering::SeqCst)));
+        assert!(master_closed.load(Ordering::SeqCst));
     }
 }

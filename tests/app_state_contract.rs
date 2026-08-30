@@ -1,4 +1,7 @@
-use std::cell::{Cell, RefCell};
+use std::{
+    cell::{Cell, RefCell},
+    path::PathBuf,
+};
 
 use rustedoutclient::{
     app::{
@@ -105,6 +108,17 @@ fn configured_state() -> AppState {
     state
 }
 
+fn configured_fallback_state() -> AppState {
+    let mut configured = config();
+    configured.fallback_viewer = Some(PathBuf::from("/synthetic/vncviewer"));
+    let mut state = AppState::from_config(&configured);
+    state
+        .apply(AppEvent::LiveInventory(inventory(2_000, false)))
+        .unwrap();
+    state.select_inventory(Some(vmid(107)));
+    state
+}
+
 #[test]
 fn visible_actions_are_gated_for_no_session_connecting_ready_view_only_error_and_disconnected() {
     let mut state = configured_state();
@@ -197,6 +211,98 @@ fn visible_actions_are_gated_for_no_session_connecting_ready_view_only_error_and
     assert!(!disconnected.reconnect && !disconnected.close && !disconnected.release_all_keys);
     assert!(!disconnected.dynamic_resolution);
     assert!(disconnected.fit_to_window && disconnected.one_to_one);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecordedFallback {
+    vmid: VmId,
+    fullscreen: bool,
+    view_only: bool,
+}
+
+#[derive(Default)]
+struct FallbackSink {
+    commands: RefCell<Vec<RecordedFallback>>,
+}
+
+impl AppCommandSink for FallbackSink {
+    fn try_send(&self, command: AppCommand) -> Result<(), CommandQueueError> {
+        if let AppCommand::OpenInTigerVnc { vmid, preferences } = command {
+            self.commands.borrow_mut().push(RecordedFallback {
+                vmid,
+                fullscreen: preferences.fullscreen,
+                view_only: preferences.view_only,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn explicit_fallback_requires_configuration_and_targets_tab_before_running_inventory() {
+    let mut unavailable = configured_state();
+    let sink = FallbackSink::default();
+    let mut clipboard = RecordingClipboard::default();
+    assert!(!unavailable.action_availability().open_in_tigervnc);
+    assert_eq!(
+        dispatch_action(
+            &mut unavailable,
+            &sink,
+            &mut clipboard,
+            UiAction::OpenInTigerVnc,
+        ),
+        DispatchOutcome::NotAvailable
+    );
+
+    let mut state = configured_fallback_state();
+    assert!(state.action_availability().open_in_tigervnc);
+    assert_eq!(
+        dispatch_action(&mut state, &sink, &mut clipboard, UiAction::OpenInTigerVnc,),
+        DispatchOutcome::Sent
+    );
+    assert_eq!(
+        sink.commands.borrow().as_slice(),
+        [RecordedFallback {
+            vmid: vmid(107),
+            fullscreen: false,
+            view_only: true,
+        }]
+    );
+
+    let session_id = SessionId::new();
+    state
+        .apply(AppEvent::SessionChanged(snapshot(
+            session_id,
+            vmid(300),
+            SessionPhase::Disconnected,
+            false,
+        )))
+        .unwrap();
+    state.select_session(Some(session_id));
+    assert!(state.action_availability().open_in_tigervnc);
+    assert_eq!(
+        dispatch_action(&mut state, &sink, &mut clipboard, UiAction::Fullscreen),
+        DispatchOutcome::AppliedLocally
+    );
+    assert_eq!(
+        dispatch_action(&mut state, &sink, &mut clipboard, UiAction::OpenInTigerVnc,),
+        DispatchOutcome::Sent
+    );
+    assert_eq!(
+        sink.commands.borrow().as_slice(),
+        [
+            RecordedFallback {
+                vmid: vmid(107),
+                fullscreen: false,
+                view_only: true,
+            },
+            RecordedFallback {
+                vmid: vmid(300),
+                fullscreen: true,
+                view_only: false,
+            },
+        ]
+    );
 }
 
 #[test]

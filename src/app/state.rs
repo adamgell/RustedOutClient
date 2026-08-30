@@ -413,6 +413,7 @@ pub struct AppState {
     profile_name: String,
     node_name: String,
     clipboard_enabled: bool,
+    fallback_configured: bool,
     default_scale_mode: ScaleMode,
     default_view_only: bool,
     favorites: Vec<FavoriteDefinition>,
@@ -434,6 +435,7 @@ impl AppState {
             profile_name: config.profile.name.clone(),
             node_name: config.profile.node.as_str().to_owned(),
             clipboard_enabled: config.clipboard_enabled,
+            fallback_configured: config.fallback_viewer.is_some(),
             default_scale_mode: config.display.scale_mode,
             default_view_only: config.display.view_only,
             favorites: config
@@ -473,6 +475,7 @@ impl AppState {
             profile_name: String::new(),
             node_name: String::new(),
             clipboard_enabled: false,
+            fallback_configured: false,
             default_scale_mode: ScaleMode::Fit,
             default_view_only: false,
             favorites: Vec::new(),
@@ -498,6 +501,10 @@ impl AppState {
 
     pub fn node_name(&self) -> &str {
         &self.node_name
+    }
+
+    pub fn fallback_configured(&self) -> bool {
+        self.fallback_configured
     }
 
     pub fn set_search(&mut self, search: impl Into<String>) {
@@ -709,6 +716,17 @@ impl AppState {
             clipboard_enabled: self.clipboard_enabled,
             dynamic_resolution: true,
         }
+    }
+
+    pub(crate) fn fallback_target(&self) -> Option<(VmId, bool)> {
+        if let Some(tab) = self.selected_session() {
+            return Some((tab.snapshot.vmid, tab.snapshot.view_only));
+        }
+        let item = self.selected_inventory_item()?;
+        if item.status != VmStatus::Running {
+            return None;
+        }
+        Some((item.vmid, self.open_options(item.vmid).view_only))
     }
 
     pub(crate) fn set_scale_mode(&mut self, mode: ScaleMode) {
