@@ -1614,12 +1614,20 @@ mod tests {
         let spec = factory
             .proxy(&fixture_profile(), VmId::new(107).unwrap(), &ticket)
             .unwrap();
+        let readiness = if matches!(
+            faults.cleanup,
+            Some(TestCleanupFault::OwnerPanic | TestCleanupFault::OwnerCancel)
+        ) {
+            runtime
+                .control_socket()
+                .with_extension("proxy.stderr-holder.pid")
+        } else {
+            runtime.control_socket().with_extension("proxy.pid")
+        };
         ProxyStream::spawn_with_test_seams(
             spec,
             faults,
-            TestStreamPolicy::short_after_ready(
-                runtime.control_socket().with_extension("proxy.pid"),
-            ),
+            TestStreamPolicy::short_after_ready(readiness),
         )
         .await
     }
