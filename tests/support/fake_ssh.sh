@@ -87,7 +87,6 @@ if [ "$proxy" = true ]; then
     case "$LC_PVE_TICKET" in
         *[!A-Za-z0-9]*) exit 72 ;;
     esac
-    printf '%s\n' "$$" > "${socket}.proxy.pid"
     : > "${socket}.proxy.env-valid"
     printf 'RFB 003.008\n'
     if [ -f "${socket}.proxy_stderr_open" ]; then
@@ -99,6 +98,7 @@ if [ "$proxy" = true ]; then
         ) &
         printf '%s\n' "$!" > "${socket}.proxy.stderr-holder.pid"
     fi
+    printf '%s\n' "$$" > "${socket}.proxy.pid"
     if [ -f "${socket}.proxy_eof_live" ]; then
         exec 1>&-
         while :; do
