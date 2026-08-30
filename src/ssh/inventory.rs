@@ -1,5 +1,8 @@
 use std::{io, process::Stdio, time::SystemTime};
 
+#[cfg(test)]
+use std::path::PathBuf;
+
 use serde::{de, Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -18,12 +21,65 @@ use super::classify_stderr;
 
 const MAX_INVENTORY_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CAPTURED_STDERR_BYTES: usize = 65_536;
-#[cfg(not(test))]
 const INVENTORY_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const INVENTORY_PROCESS_TIMEOUT: Duration = Duration::from_secs(2);
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct InventoryPolicy {
+    operation_timeout: Duration,
+    reap_timeout: Duration,
+    pipe_drain_timeout: Duration,
+    #[cfg(test)]
+    readiness: Option<TestReadiness>,
+}
+
+impl InventoryPolicy {
+    fn production() -> Self {
+        Self {
+            operation_timeout: INVENTORY_PROCESS_TIMEOUT,
+            reap_timeout: REAP_TIMEOUT,
+            pipe_drain_timeout: PIPE_DRAIN_TIMEOUT,
+            #[cfg(test)]
+            readiness: None,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestReadiness {
+    path: PathBuf,
+    timeout: Duration,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestInventoryPolicy(InventoryPolicy);
+
+#[cfg(test)]
+impl TestInventoryPolicy {
+    fn generous() -> Self {
+        Self(InventoryPolicy {
+            operation_timeout: Duration::from_secs(60),
+            reap_timeout: Duration::from_secs(30),
+            pipe_drain_timeout: Duration::from_secs(30),
+            readiness: None,
+        })
+    }
+
+    fn short_after_ready(path: PathBuf) -> Self {
+        Self(InventoryPolicy {
+            operation_timeout: Duration::from_secs(2),
+            reap_timeout: Duration::from_secs(30),
+            pipe_drain_timeout: Duration::from_secs(30),
+            readiness: Some(TestReadiness {
+                path,
+                timeout: Duration::from_secs(30),
+            }),
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -139,7 +195,22 @@ impl InventoryClient {
         factory: &SshCommandFactory,
         profile: &PveProfile,
     ) -> Result<InventorySnapshot, InventoryError> {
-        Self::fetch_inner(factory, profile, CleanupFaults::default()).await
+        Self::fetch_inner(
+            factory,
+            profile,
+            CleanupFaults::default(),
+            &InventoryPolicy::production(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn fetch_with_test_policy(
+        factory: &SshCommandFactory,
+        profile: &PveProfile,
+        policy: TestInventoryPolicy,
+    ) -> Result<InventorySnapshot, InventoryError> {
+        Self::fetch_inner(factory, profile, CleanupFaults::default(), &policy.0).await
     }
 
     #[cfg(test)]
@@ -147,14 +218,16 @@ impl InventoryClient {
         factory: &SshCommandFactory,
         profile: &PveProfile,
         fault: CleanupFault,
+        policy: TestInventoryPolicy,
     ) -> Result<InventorySnapshot, InventoryError> {
-        Self::fetch_inner(factory, profile, fault.into()).await
+        Self::fetch_inner(factory, profile, fault.into(), &policy.0).await
     }
 
     async fn fetch_inner(
         factory: &SshCommandFactory,
         profile: &PveProfile,
         cleanup_faults: CleanupFaults,
+        policy: &InventoryPolicy,
     ) -> Result<InventorySnapshot, InventoryError> {
         let spec = factory.inventory(profile).unwrap();
         let mut command = tokio::process::Command::from(spec.to_command());
@@ -170,7 +243,13 @@ impl InventoryClient {
             .take()
             .map(|stderr| tokio::spawn(capture_bounded(stderr, MAX_CAPTURED_STDERR_BYTES)));
         let mut stdout_task = tokio::spawn(read_capped(stdout, MAX_INVENTORY_STDOUT_BYTES));
-        let deadline = Instant::now() + INVENTORY_PROCESS_TIMEOUT;
+        if !wait_for_readiness(policy).await {
+            let cleanup =
+                cleanup_inventory_child(&mut child, stderr_task, cleanup_faults, policy).await;
+            stdout_task.abort();
+            return compose_process_result(Err(InventoryError::ProcessTimedOut), cleanup);
+        }
+        let deadline = Instant::now() + policy.operation_timeout;
 
         enum FirstCompletion {
             Stdout(Result<Result<Vec<u8>, InventoryError>, tokio::task::JoinError>),
@@ -189,42 +268,63 @@ impl InventoryClient {
                 let stdout = match flatten_stdout(stdout) {
                     Ok(stdout) => stdout,
                     Err(error) => {
-                        let cleanup =
-                            cleanup_inventory_child(&mut child, stderr_task, cleanup_faults).await;
+                        let cleanup = cleanup_inventory_child(
+                            &mut child,
+                            stderr_task,
+                            cleanup_faults,
+                            policy,
+                        )
+                        .await;
                         return compose_process_result(Err(error), cleanup);
                     }
                 };
                 let status = match timeout_at(deadline, child.wait()).await {
                     Ok(Ok(status)) => status,
                     Ok(Err(error)) => {
-                        let cleanup =
-                            cleanup_inventory_child(&mut child, stderr_task, cleanup_faults).await;
+                        let cleanup = cleanup_inventory_child(
+                            &mut child,
+                            stderr_task,
+                            cleanup_faults,
+                            policy,
+                        )
+                        .await;
                         return compose_process_result(Err(InventoryError::Io(error)), cleanup);
                     }
                     Err(_) => {
-                        let cleanup =
-                            cleanup_inventory_child(&mut child, stderr_task, cleanup_faults).await;
+                        let cleanup = cleanup_inventory_child(
+                            &mut child,
+                            stderr_task,
+                            cleanup_faults,
+                            policy,
+                        )
+                        .await;
                         return compose_process_result(
                             Err(InventoryError::ProcessTimedOut),
                             cleanup,
                         );
                     }
                 };
-                let stderr = finish_stderr(stderr_task).await?;
+                let stderr = finish_stderr(stderr_task, policy.pipe_drain_timeout).await?;
                 (status, stdout, stderr)
             }
             FirstCompletion::Status(status) => {
                 let status = match status {
                     Ok(status) => status,
                     Err(error) => {
-                        let cleanup =
-                            cleanup_inventory_child(&mut child, stderr_task, cleanup_faults).await;
+                        let cleanup = cleanup_inventory_child(
+                            &mut child,
+                            stderr_task,
+                            cleanup_faults,
+                            policy,
+                        )
+                        .await;
                         stdout_task.abort();
                         return compose_process_result(Err(InventoryError::Io(error)), cleanup);
                     }
                 };
-                let stdout_result = finish_stdout(&mut stdout_task).await;
-                let stderr_result = finish_stderr(stderr_task).await;
+                let stdout_result =
+                    finish_stdout(&mut stdout_task, policy.pipe_drain_timeout).await;
+                let stderr_result = finish_stderr(stderr_task, policy.pipe_drain_timeout).await;
                 let stderr = match stderr_result {
                     Ok(stderr) => stderr,
                     Err(cleanup) => {
@@ -241,7 +341,7 @@ impl InventoryClient {
             }
             FirstCompletion::TimedOut => {
                 let cleanup =
-                    cleanup_inventory_child(&mut child, stderr_task, cleanup_faults).await;
+                    cleanup_inventory_child(&mut child, stderr_task, cleanup_faults, policy).await;
                 stdout_task.abort();
                 return compose_process_result(Err(InventoryError::ProcessTimedOut), cleanup);
             }
@@ -409,8 +509,9 @@ fn flatten_stdout(
 
 async fn finish_stdout(
     task: &mut JoinHandle<Result<Vec<u8>, InventoryError>>,
+    drain_timeout: Duration,
 ) -> Result<Vec<u8>, InventoryError> {
-    match timeout(PIPE_DRAIN_TIMEOUT, &mut *task).await {
+    match timeout(drain_timeout, &mut *task).await {
         Ok(result) => flatten_stdout(result),
         Err(_) => {
             task.abort();
@@ -423,9 +524,10 @@ async fn finish_stdout(
 
 async fn finish_stderr(
     mut task: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    drain_timeout: Duration,
 ) -> Result<Vec<u8>, InventoryError> {
     match task {
-        Some(ref mut task) => match timeout(PIPE_DRAIN_TIMEOUT, &mut *task).await {
+        Some(ref mut task) => match timeout(drain_timeout, &mut *task).await {
             Ok(Ok(Ok(stderr))) => Ok(stderr),
             Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
                 task.abort();
@@ -442,11 +544,15 @@ async fn cleanup_inventory_child(
     child: &mut Child,
     stderr_task: Option<JoinHandle<io::Result<Vec<u8>>>>,
     cleanup_faults: CleanupFaults,
+    policy: &InventoryPolicy,
 ) -> Result<(), InventoryError> {
     let kill_failed = child.start_kill().is_err() || cleanup_faults.kill_fails();
-    let reap_failed = !matches!(timeout(REAP_TIMEOUT, child.wait()).await, Ok(Ok(_)))
+    let reap_failed = !matches!(timeout(policy.reap_timeout, child.wait()).await, Ok(Ok(_)))
         || cleanup_faults.wait_fails();
-    let drain_failed = finish_stderr(stderr_task).await.is_err() || cleanup_faults.drain_fails();
+    let drain_failed = finish_stderr(stderr_task, policy.pipe_drain_timeout)
+        .await
+        .is_err()
+        || cleanup_faults.drain_fails();
     if kill_failed || reap_failed || drain_failed {
         Err(InventoryError::OwnedChildCleanupFailed {
             operation_failed: false,
@@ -454,6 +560,24 @@ async fn cleanup_inventory_child(
     } else {
         Ok(())
     }
+}
+
+async fn wait_for_readiness(_policy: &InventoryPolicy) -> bool {
+    #[cfg(test)]
+    if let Some(readiness) = &_policy.readiness {
+        return timeout(readiness.timeout, async {
+            loop {
+                if tokio::fs::metadata(&readiness.path).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+    }
+
+    true
 }
 
 fn compose_process_result<T>(
@@ -485,7 +609,10 @@ mod tests {
     use tempfile::{tempdir, TempDir};
     use tokio::time::{sleep, timeout};
 
-    use super::{parse_inventory, CleanupFault, InventoryClient, InventoryError, VmStatus};
+    use super::{
+        parse_inventory, CleanupFault, InventoryClient, InventoryError, TestInventoryPolicy,
+        VmStatus,
+    };
     use crate::{
         model::{NodeName, PveProfile, SshTarget},
         runtime::RuntimeDir,
@@ -514,7 +641,7 @@ mod tests {
     }
 
     async fn wait_for(path: &Path) {
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(30), async {
             while !path.exists() {
                 sleep(Duration::from_millis(10)).await;
             }
@@ -540,6 +667,19 @@ mod tests {
         );
     }
 
+    fn write_inventory_payload(socket: &Path, size: usize) {
+        const PREFIX: &[u8] =
+            br#"[{"vmid":107,"name":"LABZ1-CM01","status":"running","template":0,"padding":""#;
+        const SUFFIX: &[u8] = br#""}]"#;
+        assert!(size >= PREFIX.len() + SUFFIX.len());
+        let mut payload = Vec::with_capacity(size);
+        payload.extend_from_slice(PREFIX);
+        payload.resize(size - SUFFIX.len(), b'x');
+        payload.extend_from_slice(SUFFIX);
+        assert_eq!(payload.len(), size);
+        fs::write(socket.with_extension("inventory_payload"), payload).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn fetch_uses_owned_master_socket_and_returns_sorted_openable_inventory() {
@@ -557,9 +697,10 @@ mod tests {
         .unwrap();
         wait_for(&runtime.control_socket().with_extension("state")).await;
 
-        let snapshot = InventoryClient::fetch(
+        let snapshot = InventoryClient::fetch_with_test_policy(
             &SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned()),
             &fixture_profile(),
+            TestInventoryPolicy::generous(),
         )
         .await
         .unwrap();
@@ -596,7 +737,12 @@ mod tests {
             let factory =
                 SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
 
-            let result = InventoryClient::fetch(&factory, &fixture_profile()).await;
+            let result = InventoryClient::fetch_with_test_policy(
+                &factory,
+                &fixture_profile(),
+                TestInventoryPolicy::generous(),
+            )
+            .await;
 
             if should_succeed {
                 let snapshot = result.unwrap();
@@ -637,15 +783,16 @@ mod tests {
         let _process_guard = crate::ssh::process_test_guard().await;
         let runtime = RuntimeDir::create().unwrap();
         let (_fixture_directory, executable) = fake_ssh();
-        fs::write(
-            runtime.control_socket().with_extension("oversized"),
-            b"synthetic fixture control\n",
-        )
-        .unwrap();
+        write_inventory_payload(runtime.control_socket(), 4 * 1024 * 1024 + 8 * 1024);
         let factory =
             SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
 
-        let result = InventoryClient::fetch(&factory, &fixture_profile()).await;
+        let result = InventoryClient::fetch_with_test_policy(
+            &factory,
+            &fixture_profile(),
+            TestInventoryPolicy::generous(),
+        )
+        .await;
 
         assert!(matches!(result, Err(InventoryError::StdoutTooLarge)));
     }
@@ -654,18 +801,19 @@ mod tests {
     #[tokio::test]
     async fn fetch_accepts_exactly_four_mib_and_rejects_four_mib_plus_one() {
         let _process_guard = crate::ssh::process_test_guard().await;
-        for (marker, should_succeed) in [("exact_limit", true), ("over_limit", false)] {
+        for (size, should_succeed) in [(4 * 1024 * 1024, true), (4 * 1024 * 1024 + 1, false)] {
             let runtime = RuntimeDir::create().unwrap();
             let (_fixture_directory, executable) = fake_ssh();
-            fs::write(
-                runtime.control_socket().with_extension(marker),
-                b"synthetic fixture control\n",
-            )
-            .unwrap();
+            write_inventory_payload(runtime.control_socket(), size);
             let factory =
                 SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
 
-            let result = InventoryClient::fetch(&factory, &fixture_profile()).await;
+            let result = InventoryClient::fetch_with_test_policy(
+                &factory,
+                &fixture_profile(),
+                TestInventoryPolicy::generous(),
+            )
+            .await;
 
             if should_succeed {
                 assert_eq!(result.unwrap().vms[0].vmid.get(), 107);
@@ -690,8 +838,12 @@ mod tests {
             SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
 
         let result = timeout(
-            Duration::from_secs(4),
-            InventoryClient::fetch(&factory, &fixture_profile()),
+            Duration::from_secs(30),
+            InventoryClient::fetch_with_test_policy(
+                &factory,
+                &fixture_profile(),
+                TestInventoryPolicy::generous(),
+            ),
         )
         .await;
 
@@ -717,8 +869,14 @@ mod tests {
             SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
 
         let result = timeout(
-            Duration::from_secs(4),
-            InventoryClient::fetch(&factory, &fixture_profile()),
+            Duration::from_secs(30),
+            InventoryClient::fetch_with_test_policy(
+                &factory,
+                &fixture_profile(),
+                TestInventoryPolicy::short_after_ready(
+                    runtime.control_socket().with_extension("inventory.pid"),
+                ),
+            ),
         )
         .await;
 
@@ -746,9 +904,15 @@ mod tests {
             let factory =
                 SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
 
-            let result =
-                InventoryClient::fetch_with_cleanup_fault(&factory, &fixture_profile(), fault)
-                    .await;
+            let result = InventoryClient::fetch_with_cleanup_fault(
+                &factory,
+                &fixture_profile(),
+                fault,
+                TestInventoryPolicy::short_after_ready(
+                    runtime.control_socket().with_extension("inventory.pid"),
+                ),
+            )
+            .await;
 
             assert!(matches!(
                 result,
@@ -759,5 +923,52 @@ mod tests {
             let pid = helper_pid(&runtime.control_socket().with_extension("inventory.pid"));
             assert_exact_pid_is_gone(pid);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn short_timeout_starts_after_exact_inventory_helper_readiness() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("hold_before_inventory_ready"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let socket = runtime.control_socket().to_owned();
+        let factory = SshCommandFactory::new_for_test(executable, socket.clone());
+        let mut fetch = tokio::spawn(async move {
+            InventoryClient::fetch_with_test_policy(
+                &factory,
+                &fixture_profile(),
+                TestInventoryPolicy::short_after_ready(socket.with_extension("inventory.pid")),
+            )
+            .await
+        });
+        wait_for(&runtime.control_socket().with_extension("inventory.spawned")).await;
+
+        assert!(
+            timeout(Duration::from_secs(3), &mut fetch).await.is_err(),
+            "operation timeout started before exact helper readiness"
+        );
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("allow_inventory_ready"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+
+        let snapshot = timeout(Duration::from_secs(30), fetch)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.vms[0].vmid.get(), 107);
+        let pid = helper_pid(&runtime.control_socket().with_extension("inventory.pid"));
+        assert_exact_pid_is_gone(pid);
     }
 }

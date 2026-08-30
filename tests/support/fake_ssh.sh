@@ -71,6 +71,14 @@ if [ "$operation" = "exit" ]; then
     exit 0
 fi
 
+if [ -f "${socket}.hold_before_inventory_ready" ]; then
+    : > "${socket}.inventory.spawned"
+    while [ -f "${socket}.hold_before_inventory_ready" ] &&
+        [ ! -f "${socket}.allow_inventory_ready" ]; do
+        sleep 0.05
+    done
+fi
+
 printf '%s\n' "$$" > "${socket}.inventory.pid"
 
 if [ -f "${socket}.hang_inventory" ]; then
@@ -79,31 +87,14 @@ if [ -f "${socket}.hang_inventory" ]; then
     done
 fi
 
-if [ -f "${socket}.exact_limit" ] || [ -f "${socket}.over_limit" ]; then
-    output_size=4194304
-    if [ -f "${socket}.over_limit" ]; then
-        output_size=4194305
-    fi
-    exec awk -v target="$output_size" 'BEGIN {
-        prefix="[{\"vmid\":107,\"name\":\"LABZ1-CM01\",\"status\":\"running\",\"template\":0,\"padding\":\"";
-        suffix="\"}]";
-        remaining=target-length(prefix)-length(suffix);
-        block=sprintf("%01024d", 0);
-        printf "%s", prefix;
-        while (remaining >= 1024) { printf "%s", block; remaining-=1024; }
-        while (remaining > 0) { printf "x"; remaining--; }
-        printf "%s", suffix;
-    }'
+if [ -f "${socket}.inventory_payload" ]; then
+    exec /bin/cat "${socket}.inventory_payload"
 fi
 
 if [ -f "${socket}.large_stderr" ]; then
     : > "${socket}.inventory_running"
     awk 'BEGIN { for (i = 0; i < 100; i++) printf "%01024d", 0 }' >&2
     rm -f "${socket}.inventory_running"
-fi
-
-if [ -f "${socket}.oversized" ]; then
-    exec awk 'BEGIN { for (i = 0; i < 4195; i++) printf "%01024d", 0 }'
 fi
 
 if [ -f "${socket}.malformed" ]; then

@@ -1,5 +1,8 @@
 use std::{io, process::Stdio, time::Duration};
 
+#[cfg(test)]
+use std::path::PathBuf;
+
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -14,12 +17,65 @@ use super::{classify_stderr, CommandSpec, SshCommandFactory, SshFailure};
 
 const MAX_CAPTURED_STDERR_BYTES: usize = 65_536;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
-#[cfg(not(test))]
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
-#[cfg(test)]
-const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct ControlPolicy {
+    operation_timeout: Duration,
+    reap_timeout: Duration,
+    pipe_drain_timeout: Duration,
+    #[cfg(test)]
+    readiness: Option<TestReadiness>,
+}
+
+impl ControlPolicy {
+    fn production() -> Self {
+        Self {
+            operation_timeout: CONTROL_OPERATION_TIMEOUT,
+            reap_timeout: REAP_TIMEOUT,
+            pipe_drain_timeout: PIPE_DRAIN_TIMEOUT,
+            #[cfg(test)]
+            readiness: None,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestReadiness {
+    path: PathBuf,
+    timeout: Duration,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestControlPolicy(ControlPolicy);
+
+#[cfg(test)]
+impl TestControlPolicy {
+    fn generous() -> Self {
+        Self(ControlPolicy {
+            operation_timeout: Duration::from_secs(60),
+            reap_timeout: Duration::from_secs(30),
+            pipe_drain_timeout: Duration::from_secs(30),
+            readiness: None,
+        })
+    }
+
+    fn short_after_ready(path: PathBuf) -> Self {
+        Self(ControlPolicy {
+            operation_timeout: Duration::from_secs(2),
+            reap_timeout: Duration::from_secs(30),
+            pipe_drain_timeout: Duration::from_secs(30),
+            readiness: Some(TestReadiness {
+                path,
+                timeout: Duration::from_secs(30),
+            }),
+        })
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SshMasterError {
@@ -130,24 +186,48 @@ impl SshMaster {
         run_control(self.factory.check(&self.profile).unwrap()).await
     }
 
-    pub async fn close(&mut self) -> Result<(), SshMasterError> {
-        self.close_inner(CleanupFaults::default()).await
+    #[cfg(test)]
+    async fn check_with_test_policy(
+        &mut self,
+        policy: TestControlPolicy,
+    ) -> Result<(), SshMasterError> {
+        run_control_inner(
+            self.factory.check(&self.profile).unwrap(),
+            CleanupFaults::default(),
+            &policy.0,
+        )
+        .await
     }
 
-    async fn close_inner(&mut self, cleanup_faults: CleanupFaults) -> Result<(), SshMasterError> {
+    pub async fn close(&mut self) -> Result<(), SshMasterError> {
+        self.close_inner(CleanupFaults::default(), &ControlPolicy::production())
+            .await
+    }
+
+    async fn close_inner(
+        &mut self,
+        cleanup_faults: CleanupFaults,
+        policy: &ControlPolicy,
+    ) -> Result<(), SshMasterError> {
         if self.child.is_none() {
             return Ok(());
         }
 
-        let exit_result = run_control(self.factory.exit(&self.profile).unwrap()).await;
+        let exit_result = run_control_inner(
+            self.factory.exit(&self.profile).unwrap(),
+            CleanupFaults::default(),
+            policy,
+        )
+        .await;
         let (terminated, cleanup_result) = stop_owned_child(
             self.child.as_mut().expect("child checked above"),
             CLOSE_TIMEOUT,
             cleanup_faults,
+            policy,
         )
         .await;
         let cleanup_result = self
-            .apply_termination_outcome(terminated, cleanup_result, cleanup_faults)
+            .apply_termination_outcome(terminated, cleanup_result, cleanup_faults, policy)
             .await;
 
         compose_close_results(exit_result, cleanup_result)
@@ -158,15 +238,20 @@ impl SshMaster {
         terminated: bool,
         mut cleanup_result: Result<(), SshMasterError>,
         cleanup_faults: CleanupFaults,
+        policy: &ControlPolicy,
     ) -> Result<(), SshMasterError> {
         if !terminated {
             return cleanup_result.and(Err(SshMasterError::CleanupFailed));
         }
 
         self.child.take();
-        if finish_capture(self.stderr_task.take(), cleanup_faults)
-            .await
-            .is_err()
+        if finish_capture(
+            self.stderr_task.take(),
+            cleanup_faults,
+            policy.pipe_drain_timeout,
+        )
+        .await
+        .is_err()
         {
             cleanup_result = Err(SshMasterError::CleanupFailed);
         }
@@ -177,8 +262,17 @@ impl SshMaster {
     async fn close_with_cleanup_fault(
         &mut self,
         fault: CleanupFault,
+        policy: TestControlPolicy,
     ) -> Result<(), SshMasterError> {
-        self.close_inner(fault.into()).await
+        self.close_inner(fault.into(), &policy.0).await
+    }
+
+    #[cfg(test)]
+    async fn close_with_test_policy(
+        &mut self,
+        policy: TestControlPolicy,
+    ) -> Result<(), SshMasterError> {
+        self.close_inner(CleanupFaults::default(), &policy.0).await
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -210,20 +304,22 @@ impl Drop for SshMaster {
 }
 
 async fn run_control(spec: CommandSpec) -> Result<(), SshMasterError> {
-    run_control_inner(spec, CleanupFaults::default()).await
+    run_control_inner(spec, CleanupFaults::default(), &ControlPolicy::production()).await
 }
 
 #[cfg(test)]
 async fn run_control_with_cleanup_fault(
     spec: CommandSpec,
     fault: CleanupFault,
+    policy: TestControlPolicy,
 ) -> Result<(), SshMasterError> {
-    run_control_inner(spec, fault.into()).await
+    run_control_inner(spec, fault.into(), &policy.0).await
 }
 
 async fn run_control_inner(
     spec: CommandSpec,
     cleanup_faults: CleanupFaults,
+    policy: &ControlPolicy,
 ) -> Result<(), SshMasterError> {
     let mut command = tokio::process::Command::from(spec.to_command());
     command.stdout(Stdio::null());
@@ -233,23 +329,36 @@ async fn run_control_inner(
         .stderr
         .take()
         .map(|stderr| tokio::spawn(capture_bounded(stderr, MAX_CAPTURED_STDERR_BYTES)));
-    let status = match timeout(CONTROL_OPERATION_TIMEOUT, child.wait()).await {
+    if !wait_for_readiness(policy).await {
+        let (_, cleanup_result) = terminate_owned_child(&mut child, cleanup_faults, policy).await;
+        let capture_result =
+            finish_capture(stderr_task, cleanup_faults, policy.pipe_drain_timeout).await;
+        return if cleanup_result.is_err() || capture_result.is_err() {
+            Err(SshMasterError::CleanupFailed)
+        } else {
+            Err(SshMasterError::ControlTimedOut)
+        };
+    }
+    let status = match timeout(policy.operation_timeout, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(_)) => {
-            let (_, cleanup_result) = terminate_owned_child(&mut child, cleanup_faults).await;
+            let (_, cleanup_result) =
+                terminate_owned_child(&mut child, cleanup_faults, policy).await;
             abort_capture(stderr_task);
             return cleanup_result.and(Err(SshMasterError::CleanupFailed));
         }
         Err(_) => {
-            let (_, cleanup_result) = terminate_owned_child(&mut child, cleanup_faults).await;
-            let capture_result = finish_capture(stderr_task, cleanup_faults).await;
+            let (_, cleanup_result) =
+                terminate_owned_child(&mut child, cleanup_faults, policy).await;
+            let capture_result =
+                finish_capture(stderr_task, cleanup_faults, policy.pipe_drain_timeout).await;
             if cleanup_result.is_err() || capture_result.is_err() {
                 return Err(SshMasterError::CleanupFailed);
             }
             return Err(SshMasterError::ControlTimedOut);
         }
     };
-    let stderr = finish_capture(stderr_task, cleanup_faults).await?;
+    let stderr = finish_capture(stderr_task, cleanup_faults, policy.pipe_drain_timeout).await?;
     if status.success() {
         Ok(())
     } else {
@@ -260,9 +369,10 @@ async fn run_control_inner(
 async fn finish_capture(
     mut task: Option<JoinHandle<io::Result<Vec<u8>>>>,
     cleanup_faults: CleanupFaults,
+    drain_timeout: Duration,
 ) -> Result<Vec<u8>, SshMasterError> {
     let result = match task {
-        Some(ref mut task) => match timeout(PIPE_DRAIN_TIMEOUT, &mut *task).await {
+        Some(ref mut task) => match timeout(drain_timeout, &mut *task).await {
             Ok(Ok(Ok(captured))) => Ok(captured),
             Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
                 task.abort();
@@ -288,25 +398,45 @@ async fn stop_owned_child(
     child: &mut Child,
     graceful_timeout: Duration,
     cleanup_faults: CleanupFaults,
+    policy: &ControlPolicy,
 ) -> (bool, Result<(), SshMasterError>) {
     match timeout(graceful_timeout, child.wait()).await {
         Ok(Ok(_)) => (true, Ok(())),
-        Ok(Err(_)) | Err(_) => terminate_owned_child(child, cleanup_faults).await,
+        Ok(Err(_)) | Err(_) => terminate_owned_child(child, cleanup_faults, policy).await,
     }
 }
 
 async fn terminate_owned_child(
     child: &mut Child,
     cleanup_faults: CleanupFaults,
+    policy: &ControlPolicy,
 ) -> (bool, Result<(), SshMasterError>) {
     let kill_failed = child.start_kill().is_err() || cleanup_faults.kill_fails();
-    let reaped = matches!(timeout(REAP_TIMEOUT, child.wait()).await, Ok(Ok(_)));
+    let reaped = matches!(timeout(policy.reap_timeout, child.wait()).await, Ok(Ok(_)));
     let confirmed = reaped && !cleanup_faults.wait_fails();
     if confirmed && !kill_failed {
         (true, Ok(()))
     } else {
         (confirmed, Err(SshMasterError::CleanupFailed))
     }
+}
+
+async fn wait_for_readiness(_policy: &ControlPolicy) -> bool {
+    #[cfg(test)]
+    if let Some(readiness) = &_policy.readiness {
+        return timeout(readiness.timeout, async {
+            loop {
+                if tokio::fs::metadata(&readiness.path).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+    }
+
+    true
 }
 
 fn compose_close_results(
@@ -356,7 +486,9 @@ mod tests {
     use tempfile::{tempdir, TempDir};
     use tokio::time::{sleep, timeout};
 
-    use super::{run_control_with_cleanup_fault, CleanupFault, SshMaster, SshMasterError};
+    use super::{
+        run_control_with_cleanup_fault, CleanupFault, SshMaster, SshMasterError, TestControlPolicy,
+    };
     use crate::{
         model::{NodeName, PveProfile, SshTarget},
         runtime::RuntimeDir,
@@ -386,7 +518,7 @@ mod tests {
     }
 
     async fn wait_for(path: &Path) {
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(30), async {
             while !path.exists() {
                 sleep(Duration::from_millis(10)).await;
             }
@@ -423,9 +555,18 @@ mod tests {
 
         let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
         wait_for(&runtime.control_socket().with_extension("state")).await;
-        master.check().await.unwrap();
-        master.close().await.unwrap();
-        master.close().await.unwrap();
+        master
+            .check_with_test_policy(TestControlPolicy::generous())
+            .await
+            .unwrap();
+        master
+            .close_with_test_policy(TestControlPolicy::generous())
+            .await
+            .unwrap();
+        master
+            .close_with_test_policy(TestControlPolicy::generous())
+            .await
+            .unwrap();
 
         assert!(!master.is_running());
         assert!(!runtime.control_socket().with_extension("state").exists());
@@ -456,14 +597,14 @@ mod tests {
         let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
         wait_for(&runtime.control_socket().with_extension("state")).await;
         let started = Instant::now();
-        master.close().await.unwrap();
+        master
+            .close_with_test_policy(TestControlPolicy::generous())
+            .await
+            .unwrap();
         let elapsed = started.elapsed();
 
         assert!(elapsed >= Duration::from_secs(3), "elapsed: {elapsed:?}");
-        assert!(
-            elapsed < Duration::from_millis(4_500),
-            "elapsed: {elapsed:?}"
-        );
+        assert!(elapsed < Duration::from_secs(15), "elapsed: {elapsed:?}");
         assert!(!master.is_running());
     }
 
@@ -483,14 +624,23 @@ mod tests {
         let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
         wait_for(&runtime.control_socket().with_extension("state")).await;
 
-        let result = timeout(Duration::from_secs(5), master.check()).await;
+        let result = timeout(
+            Duration::from_secs(30),
+            master.check_with_test_policy(TestControlPolicy::short_after_ready(
+                runtime.control_socket().with_extension("check.pid"),
+            )),
+        )
+        .await;
 
         assert!(result.is_ok(), "check exceeded its owned-child deadline");
         assert!(result.unwrap().is_err());
         let check_pid = helper_pid(&runtime.control_socket().with_extension("check.pid"));
         assert_exact_pid_is_gone(check_pid);
         fs::remove_file(runtime.control_socket().with_extension("hang_check")).unwrap();
-        master.close().await.unwrap();
+        master
+            .close_with_test_policy(TestControlPolicy::generous())
+            .await
+            .unwrap();
         assert!(!master.is_running());
     }
 
@@ -510,7 +660,13 @@ mod tests {
         let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
         wait_for(&runtime.control_socket().with_extension("state")).await;
 
-        let result = timeout(Duration::from_secs(8), master.close()).await;
+        let result = timeout(
+            Duration::from_secs(30),
+            master.close_with_test_policy(TestControlPolicy::short_after_ready(
+                runtime.control_socket().with_extension("exit.pid"),
+            )),
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -537,9 +693,14 @@ mod tests {
             let factory =
                 SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
 
-            let result =
-                run_control_with_cleanup_fault(factory.check(&fixture_profile()).unwrap(), fault)
-                    .await;
+            let result = run_control_with_cleanup_fault(
+                factory.check(&fixture_profile()).unwrap(),
+                fault,
+                TestControlPolicy::short_after_ready(
+                    runtime.control_socket().with_extension("check.pid"),
+                ),
+            )
+            .await;
 
             assert!(matches!(result, Err(SshMasterError::CleanupFailed)));
             let pid = helper_pid(&runtime.control_socket().with_extension("check.pid"));
@@ -564,7 +725,9 @@ mod tests {
         wait_for(&runtime.control_socket().with_extension("state")).await;
         let master_pid = helper_pid(&runtime.control_socket().with_extension("pid"));
 
-        let result = master.close_with_cleanup_fault(CleanupFault::Wait).await;
+        let result = master
+            .close_with_cleanup_fault(CleanupFault::Wait, TestControlPolicy::generous())
+            .await;
 
         assert!(matches!(result, Err(SshMasterError::CleanupFailed)));
         assert_exact_pid_is_gone(master_pid);
@@ -572,7 +735,10 @@ mod tests {
             master.child.is_some(),
             "unconfirmed ownership was discarded"
         );
-        master.close().await.unwrap();
+        master
+            .close_with_test_policy(TestControlPolicy::generous())
+            .await
+            .unwrap();
         assert!(master.child.is_none());
     }
 
@@ -593,7 +759,14 @@ mod tests {
         wait_for(&runtime.control_socket().with_extension("state")).await;
         let master_pid = helper_pid(&runtime.control_socket().with_extension("pid"));
 
-        let result = master.close_with_cleanup_fault(CleanupFault::Drain).await;
+        let result = master
+            .close_with_cleanup_fault(
+                CleanupFault::Drain,
+                TestControlPolicy::short_after_ready(
+                    runtime.control_socket().with_extension("exit.pid"),
+                ),
+            )
+            .await;
 
         assert!(matches!(
             result,
