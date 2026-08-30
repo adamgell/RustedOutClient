@@ -41,6 +41,7 @@ if [ "$master" = true ]; then
 fi
 
 if [ "$operation" = "check" ]; then
+    printf '%s\n' "$$" > "${socket}.check.pid"
     if [ -f "${socket}.hang_check" ]; then
         while :; do
             sleep 0.05
@@ -54,6 +55,7 @@ if [ "$operation" = "check" ]; then
 fi
 
 if [ "$operation" = "exit" ]; then
+    printf '%s\n' "$$" > "${socket}.exit.pid"
     if [ -f "${socket}.hang_exit" ]; then
         while :; do
             sleep 0.05
@@ -68,6 +70,8 @@ if [ "$operation" = "exit" ]; then
     fi
     exit 0
 fi
+
+printf '%s\n' "$$" > "${socket}.inventory.pid"
 
 if [ -f "${socket}.hang_inventory" ]; then
     while :; do

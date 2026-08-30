@@ -9,10 +9,11 @@ use rustedoutclient::{
     runtime::RuntimeDir,
     ssh::{InventorySelectionError, InventorySnapshot, VmInventoryItem, VmStatus},
 };
-use tempfile::{tempdir, TempDir};
+use tempfile::{tempdir_in, TempDir};
 
 fn private_tempdir() -> TempDir {
-    let directory = tempdir().unwrap();
+    let temporary_root = std::env::temp_dir().canonicalize().unwrap();
+    let directory = tempdir_in(temporary_root).unwrap();
     #[cfg(unix)]
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     directory
@@ -230,6 +231,54 @@ fn cache_rejects_symlink_parent_and_destination_without_touching_targets() {
 
 #[cfg(unix)]
 #[test]
+fn cache_rejects_a_symlinked_ancestor_without_creating_beneath_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let root = private_tempdir();
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+    let linked_ancestor = root.path().join("linked-ancestor");
+    symlink(&outside, &linked_ancestor).unwrap();
+    let cache = InventoryCache::new(
+        linked_ancestor
+            .join("private-cache")
+            .join("inventory-v1.json"),
+    );
+    let snapshot = InventorySnapshot::new(
+        1,
+        false,
+        vec![vm(107, "LABZ1-CM01", VmStatus::Running, false)],
+    );
+
+    assert!(cache.save(&snapshot).is_err());
+    assert!(!outside.join("private-cache").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_creates_an_absent_leaf_directory_with_mode_0700() {
+    let root = private_tempdir();
+    let stable_parent = root.path().join("stable-parent");
+    fs::create_dir(&stable_parent).unwrap();
+    fs::set_permissions(&stable_parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let leaf = stable_parent.join("private-cache");
+    let path = leaf.join("inventory-v1.json");
+    let cache = InventoryCache::new(path.clone());
+    let snapshot = InventorySnapshot::new(
+        1,
+        false,
+        vec![vm(107, "LABZ1-CM01", VmStatus::Running, false)],
+    );
+
+    cache.save(&snapshot).unwrap();
+
+    assert_eq!(fs::metadata(&leaf).unwrap().mode() & 0o777, 0o700);
+    assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
 fn cache_rejects_unknown_fields_duplicate_vmids_and_invalid_names() {
     let directory = private_tempdir();
     let path = directory.path().join("inventory-v1.json");
@@ -270,5 +319,34 @@ fn cache_rejects_unknown_fields_duplicate_vmids_and_invalid_names() {
     for invalid in cases {
         fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
         assert!(cache.load().is_err(), "accepted invalid cache: {invalid}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_rejects_malformed_status_node_and_vmid_fields() {
+    let directory = private_tempdir();
+    let path = directory.path().join("inventory-v1.json");
+    let cache = InventoryCache::new(path.clone());
+    let snapshot = InventorySnapshot::new(
+        1,
+        false,
+        vec![vm(107, "LABZ1-CM01", VmStatus::Running, false)],
+    );
+    cache.save(&snapshot).unwrap();
+    let valid: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+    for (field, invalid_value) in [
+        ("status", serde_json::json!("paused")),
+        ("node", serde_json::json!("not/a/node")),
+        ("vmid", serde_json::json!(99)),
+    ] {
+        let mut invalid = valid.clone();
+        invalid["vms"][0][field] = invalid_value;
+        fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(
+            cache.load().is_err(),
+            "accepted malformed cached {field}: {invalid}"
+        );
     }
 }

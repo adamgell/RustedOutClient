@@ -11,3 +11,14 @@ pub use inventory::{
     VmStatus,
 };
 pub use master::{SshMaster, SshMasterError};
+
+#[cfg(test)]
+pub(super) async fn process_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    use std::sync::OnceLock;
+
+    static PROCESS_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    PROCESS_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}

@@ -78,10 +78,83 @@ pub enum InventoryError {
 
 pub struct InventoryClient;
 
+#[derive(Clone, Copy, Default)]
+struct CleanupFaults {
+    #[cfg(test)]
+    fault: Option<CleanupFault>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupFault {
+    Kill,
+    Wait,
+    Drain,
+}
+
+impl CleanupFaults {
+    fn kill_fails(self) -> bool {
+        #[cfg(test)]
+        {
+            self.fault == Some(CleanupFault::Kill)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn wait_fails(self) -> bool {
+        #[cfg(test)]
+        {
+            self.fault == Some(CleanupFault::Wait)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn drain_fails(self) -> bool {
+        #[cfg(test)]
+        {
+            self.fault == Some(CleanupFault::Drain)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<CleanupFault> for CleanupFaults {
+    fn from(fault: CleanupFault) -> Self {
+        Self { fault: Some(fault) }
+    }
+}
+
 impl InventoryClient {
     pub async fn fetch(
         factory: &SshCommandFactory,
         profile: &PveProfile,
+    ) -> Result<InventorySnapshot, InventoryError> {
+        Self::fetch_inner(factory, profile, CleanupFaults::default()).await
+    }
+
+    #[cfg(test)]
+    async fn fetch_with_cleanup_fault(
+        factory: &SshCommandFactory,
+        profile: &PveProfile,
+        fault: CleanupFault,
+    ) -> Result<InventorySnapshot, InventoryError> {
+        Self::fetch_inner(factory, profile, fault.into()).await
+    }
+
+    async fn fetch_inner(
+        factory: &SshCommandFactory,
+        profile: &PveProfile,
+        cleanup_faults: CleanupFaults,
     ) -> Result<InventorySnapshot, InventoryError> {
         let spec = factory.inventory(profile).unwrap();
         let mut command = tokio::process::Command::from(spec.to_command());
@@ -116,18 +189,21 @@ impl InventoryClient {
                 let stdout = match flatten_stdout(stdout) {
                     Ok(stdout) => stdout,
                     Err(error) => {
-                        let cleanup = cleanup_inventory_child(&mut child, stderr_task).await;
+                        let cleanup =
+                            cleanup_inventory_child(&mut child, stderr_task, cleanup_faults).await;
                         return compose_process_result(Err(error), cleanup);
                     }
                 };
                 let status = match timeout_at(deadline, child.wait()).await {
                     Ok(Ok(status)) => status,
                     Ok(Err(error)) => {
-                        let cleanup = cleanup_inventory_child(&mut child, stderr_task).await;
+                        let cleanup =
+                            cleanup_inventory_child(&mut child, stderr_task, cleanup_faults).await;
                         return compose_process_result(Err(InventoryError::Io(error)), cleanup);
                     }
                     Err(_) => {
-                        let cleanup = cleanup_inventory_child(&mut child, stderr_task).await;
+                        let cleanup =
+                            cleanup_inventory_child(&mut child, stderr_task, cleanup_faults).await;
                         return compose_process_result(
                             Err(InventoryError::ProcessTimedOut),
                             cleanup,
@@ -141,7 +217,8 @@ impl InventoryClient {
                 let status = match status {
                     Ok(status) => status,
                     Err(error) => {
-                        let cleanup = cleanup_inventory_child(&mut child, stderr_task).await;
+                        let cleanup =
+                            cleanup_inventory_child(&mut child, stderr_task, cleanup_faults).await;
                         stdout_task.abort();
                         return compose_process_result(Err(InventoryError::Io(error)), cleanup);
                     }
@@ -163,7 +240,8 @@ impl InventoryClient {
                 (status, stdout_result?, stderr)
             }
             FirstCompletion::TimedOut => {
-                let cleanup = cleanup_inventory_child(&mut child, stderr_task).await;
+                let cleanup =
+                    cleanup_inventory_child(&mut child, stderr_task, cleanup_faults).await;
                 stdout_task.abort();
                 return compose_process_result(Err(InventoryError::ProcessTimedOut), cleanup);
             }
@@ -363,10 +441,12 @@ async fn finish_stderr(
 async fn cleanup_inventory_child(
     child: &mut Child,
     stderr_task: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    cleanup_faults: CleanupFaults,
 ) -> Result<(), InventoryError> {
-    let kill_failed = child.start_kill().is_err();
-    let reap_failed = !matches!(timeout(REAP_TIMEOUT, child.wait()).await, Ok(Ok(_)));
-    let drain_failed = finish_stderr(stderr_task).await.is_err();
+    let kill_failed = child.start_kill().is_err() || cleanup_faults.kill_fails();
+    let reap_failed = !matches!(timeout(REAP_TIMEOUT, child.wait()).await, Ok(Ok(_)))
+        || cleanup_faults.wait_fails();
+    let drain_failed = finish_stderr(stderr_task).await.is_err() || cleanup_faults.drain_fails();
     if kill_failed || reap_failed || drain_failed {
         Err(InventoryError::OwnedChildCleanupFailed {
             operation_failed: false,
@@ -395,6 +475,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        process::{Command, Stdio},
         time::Duration,
     };
 
@@ -404,9 +485,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
     use tokio::time::{sleep, timeout};
 
-    use super::{
-        compose_process_result, parse_inventory, InventoryClient, InventoryError, VmStatus,
-    };
+    use super::{parse_inventory, CleanupFault, InventoryClient, InventoryError, VmStatus};
     use crate::{
         model::{NodeName, PveProfile, SshTarget},
         runtime::RuntimeDir,
@@ -444,9 +523,27 @@ mod tests {
         .expect("fake SSH did not create its state file");
     }
 
+    fn helper_pid(path: &Path) -> u32 {
+        fs::read_to_string(path).unwrap().trim().parse().unwrap()
+    }
+
+    fn assert_exact_pid_is_gone(pid: u32) {
+        let status = Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "synthetic helper PID {pid} is still alive"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn fetch_uses_owned_master_socket_and_returns_sorted_openable_inventory() {
+        let _process_guard = crate::ssh::process_test_guard().await;
         let runtime = RuntimeDir::create().unwrap();
         let (_fixture_directory, executable) = fake_ssh();
         let mut master = SshMaster::start(
@@ -487,6 +584,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn optional_live_node_must_match_the_validated_endpoint_node() {
+        let _process_guard = crate::ssh::process_test_guard().await;
         for (marker, should_succeed) in [("matching_node", true), ("mismatched_node", false)] {
             let runtime = RuntimeDir::create().unwrap();
             let (_fixture_directory, executable) = fake_ssh();
@@ -536,6 +634,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn fetch_rejects_stdout_above_four_mib_before_json_parsing() {
+        let _process_guard = crate::ssh::process_test_guard().await;
         let runtime = RuntimeDir::create().unwrap();
         let (_fixture_directory, executable) = fake_ssh();
         fs::write(
@@ -554,6 +653,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn fetch_accepts_exactly_four_mib_and_rejects_four_mib_plus_one() {
+        let _process_guard = crate::ssh::process_test_guard().await;
         for (marker, should_succeed) in [("exact_limit", true), ("over_limit", false)] {
             let runtime = RuntimeDir::create().unwrap();
             let (_fixture_directory, executable) = fake_ssh();
@@ -578,6 +678,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_process_stderr_above_capture_limit_is_drained_and_reaped() {
+        let _process_guard = crate::ssh::process_test_guard().await;
         let runtime = RuntimeDir::create().unwrap();
         let (_fixture_directory, executable) = fake_ssh();
         fs::write(
@@ -604,6 +705,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn hanging_inventory_child_is_bounded_killed_and_reaped() {
+        let _process_guard = crate::ssh::process_test_guard().await;
         let runtime = RuntimeDir::create().unwrap();
         let (_fixture_directory, executable) = fake_ssh();
         fs::write(
@@ -625,22 +727,37 @@ mod tests {
             "inventory exceeded its owned-child deadline"
         );
         assert!(result.unwrap().is_err());
+        let inventory_pid = helper_pid(&runtime.control_socket().with_extension("inventory.pid"));
+        assert_exact_pid_is_gone(inventory_pid);
     }
 
-    #[test]
-    fn inventory_error_composition_preserves_operation_and_cleanup_failure() {
-        let result: Result<(), InventoryError> = compose_process_result(
-            Err(InventoryError::StdoutTooLarge),
-            Err(InventoryError::OwnedChildCleanupFailed {
-                operation_failed: false,
-            }),
-        );
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_faults_run_inventory_kill_wait_and_drain_orchestration() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        for fault in [CleanupFault::Kill, CleanupFault::Wait, CleanupFault::Drain] {
+            let runtime = RuntimeDir::create().unwrap();
+            let (_fixture_directory, executable) = fake_ssh();
+            fs::write(
+                runtime.control_socket().with_extension("hang_inventory"),
+                b"synthetic fixture control\n",
+            )
+            .unwrap();
+            let factory =
+                SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
 
-        assert!(matches!(
-            result,
-            Err(InventoryError::OwnedChildCleanupFailed {
-                operation_failed: true,
-            })
-        ));
+            let result =
+                InventoryClient::fetch_with_cleanup_fault(&factory, &fixture_profile(), fault)
+                    .await;
+
+            assert!(matches!(
+                result,
+                Err(InventoryError::OwnedChildCleanupFailed {
+                    operation_failed: true,
+                })
+            ));
+            let pid = helper_pid(&runtime.control_socket().with_extension("inventory.pid"));
+            assert_exact_pid_is_gone(pid);
+        }
     }
 }

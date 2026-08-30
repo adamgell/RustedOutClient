@@ -2,13 +2,15 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::{self, Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use rustix::fs::{open, openat, renameat, statat, unlinkat, AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{
+    mkdirat, open, openat, renameat, statat, unlinkat, AtFlags, FileType, Mode, OFlags,
+};
 use thiserror::Error;
 
 use crate::ssh::{normalize_inventory_snapshot, InventorySnapshot};
@@ -41,7 +43,7 @@ impl InventoryCache {
     }
 
     pub fn load(&self) -> Result<InventorySnapshot, CacheError> {
-        let location = open_location(&self.path, false)?;
+        let location = open_location(&self.path, false, &NoDirectoryCreateObserver)?;
         let mut file = open_existing_file(&location)?.ok_or_else(|| {
             CacheError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -55,17 +57,18 @@ impl InventoryCache {
     }
 
     pub fn save(&self, snapshot: &InventorySnapshot) -> Result<(), CacheError> {
-        self.save_inner(snapshot, &NoFaults)
+        self.save_inner(snapshot, &NoFaults, &NoDirectoryCreateObserver)
     }
 
     fn save_inner(
         &self,
         snapshot: &InventorySnapshot,
         faults: &dyn SaveFaultInjector,
+        observer: &dyn DirectoryCreateObserver,
     ) -> Result<(), CacheError> {
         faults.check(SavePoint::Serialization)?;
         let payload = serde_json::to_vec(snapshot)?;
-        let location = open_location(&self.path, true)?;
+        let location = open_location(&self.path, true, observer)?;
         drop(open_existing_file(&location)?);
 
         faults.check(SavePoint::TemporaryCreate)?;
@@ -115,7 +118,31 @@ impl InventoryCache {
         snapshot: &InventorySnapshot,
         fault: SaveFault,
     ) -> Result<(), CacheError> {
-        self.save_inner(snapshot, &fault)
+        self.save_inner(snapshot, &fault, &NoDirectoryCreateObserver)
+    }
+
+    #[cfg(test)]
+    fn save_with_directory_create_hook<F>(
+        &self,
+        snapshot: &InventorySnapshot,
+        hook: F,
+    ) -> Result<(), CacheError>
+    where
+        F: Fn(&File, &std::ffi::OsStr),
+    {
+        struct HookObserver<F>(F);
+
+        impl<F> DirectoryCreateObserver for HookObserver<F>
+        where
+            F: Fn(&File, &std::ffi::OsStr),
+        {
+            fn after_create(&self, parent: &File, leaf: &std::ffi::OsStr) {
+                (self.0)(parent, leaf);
+            }
+        }
+
+        let observer = HookObserver(hook);
+        self.save_inner(snapshot, &NoFaults, &observer)
     }
 }
 
@@ -124,7 +151,19 @@ struct CacheLocation {
     filename: OsString,
 }
 
-fn open_location(path: &Path, create: bool) -> Result<CacheLocation, CacheError> {
+trait DirectoryCreateObserver {
+    fn after_create(&self, _parent: &File, _leaf: &std::ffi::OsStr) {}
+}
+
+struct NoDirectoryCreateObserver;
+
+impl DirectoryCreateObserver for NoDirectoryCreateObserver {}
+
+fn open_location(
+    path: &Path,
+    create: bool,
+    observer: &dyn DirectoryCreateObserver,
+) -> Result<CacheLocation, CacheError> {
     let directory_path = path.parent().ok_or_else(|| {
         CacheError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -138,27 +177,66 @@ fn open_location(path: &Path, create: bool) -> Result<CacheLocation, CacheError>
         ))
     })?;
 
-    match fs::symlink_metadata(directory_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(CacheError::InsecureDirectory)
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
-            fs::create_dir_all(directory_path)?;
-            #[cfg(unix)]
-            fs::set_permissions(directory_path, fs::Permissions::from_mode(0o700))?;
-        }
-        Err(error) => return Err(CacheError::Io(error)),
-    }
-
-    let directory = File::from(
+    let mut directory = File::from(
         open(
-            directory_path,
+            if directory_path.is_absolute() {
+                Path::new("/")
+            } else {
+                Path::new(".")
+            },
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(errno_to_io)?,
     );
+
+    let mut components = Vec::new();
+    for component in directory_path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(component) => components.push(component.to_owned()),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(CacheError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cache path cannot traverse parent or prefix components",
+                )))
+            }
+        }
+    }
+
+    for (index, component) in components.iter().enumerate() {
+        let is_leaf = index + 1 == components.len();
+        match openat(
+            &directory,
+            component.as_os_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(next) => directory = File::from(next),
+            Err(error) if error == rustix::io::Errno::NOENT && create && is_leaf => {
+                mkdirat(
+                    &directory,
+                    component.as_os_str(),
+                    Mode::RUSR | Mode::WUSR | Mode::XUSR,
+                )
+                .map_err(errno_to_io)?;
+                observer.after_create(&directory, component.as_os_str());
+                let next = openat(
+                    &directory,
+                    component.as_os_str(),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(errno_to_io)?;
+                let next = File::from(next);
+                #[cfg(unix)]
+                next.set_permissions(fs::Permissions::from_mode(0o700))?;
+                directory = next;
+            }
+            Err(error) => return Err(CacheError::Io(errno_to_io(error))),
+        }
+    }
+
     let metadata = directory.metadata()?;
     #[cfg(unix)]
     if !metadata.is_dir() || metadata.mode() & 0o777 != 0o700 {
@@ -290,12 +368,18 @@ impl SaveFaultInjector for SaveFault {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        ffi::OsStr,
+        fs::{self, File},
+        path::Path,
+    };
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{tempdir_in, TempDir};
+
+    use rustix::fs::{symlinkat, unlinkat, AtFlags};
 
     use super::{CacheError, InventoryCache, SaveFault};
     use crate::{
@@ -304,7 +388,8 @@ mod tests {
     };
 
     fn private_tempdir() -> TempDir {
-        let directory = tempdir().unwrap();
+        let temporary_root = std::env::temp_dir().canonicalize().unwrap();
+        let directory = tempdir_in(temporary_root).unwrap();
         #[cfg(unix)]
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         directory
@@ -370,5 +455,34 @@ mod tests {
         let loaded = cache.load().unwrap();
         assert_eq!(loaded.observed_at_unix_ms, 2);
         assert_eq!(loaded.vms[0].vmid.get(), 205);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_symlink_between_leaf_create_and_open_is_rejected() {
+        let root = private_tempdir();
+        let stable_parent = root.path().join("stable-parent");
+        fs::create_dir(&stable_parent).unwrap();
+        fs::set_permissions(&stable_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let attacker = root.path().join("attacker");
+        fs::create_dir(&attacker).unwrap();
+        fs::set_permissions(&attacker, fs::Permissions::from_mode(0o700)).unwrap();
+        let leaf = stable_parent.join("private-cache");
+        let cache = InventoryCache::new(leaf.join("inventory-v1.json"));
+
+        let result = cache.save_with_directory_create_hook(
+            &snapshot(1, 107),
+            |parent: &File, leaf_name: &OsStr| {
+                unlinkat(parent, leaf_name, AtFlags::REMOVEDIR).unwrap();
+                symlinkat(&attacker, parent, leaf_name).unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(fs::symlink_metadata(&leaf)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!attacker.join("inventory-v1.json").exists());
     }
 }
