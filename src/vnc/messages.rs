@@ -228,6 +228,7 @@ pub mod encoding {
     pub const ZRLE: i32 = 16;
     pub const CURSOR: i32 = -239;
     pub const DESKTOP_SIZE: i32 = -223;
+    pub const EXTENDED_DESKTOP_SIZE: i32 = -308;
 }
 
 pub mod client_msg {
@@ -237,6 +238,7 @@ pub mod client_msg {
     pub const KEY_EVENT: u8 = 4;
     pub const POINTER_EVENT: u8 = 5;
     pub const CLIENT_CUT_TEXT: u8 = 6;
+    pub const SET_DESKTOP_SIZE: u8 = 251;
 }
 
 pub mod server_msg {

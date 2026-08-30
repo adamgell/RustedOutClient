@@ -7,11 +7,25 @@ use crate::{
 
 use super::{PublicError, SessionId, SessionSnapshot};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub use crate::connection::{DesktopSize, ResizeProtocolOutcome};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpenOptions {
     pub vnc: VncOptions,
     pub view_only: bool,
     pub clipboard_enabled: bool,
+    pub dynamic_resolution: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            vnc: VncOptions::default(),
+            view_only: false,
+            clipboard_enabled: false,
+            dynamic_resolution: true,
+        }
+    }
 }
 
 pub enum InputAction {
@@ -41,6 +55,18 @@ pub enum AppCommand {
         session_id: SessionId,
         action: InputAction,
     },
+    ViewportChanged {
+        session_id: SessionId,
+        backing_width: u32,
+        backing_height: u32,
+    },
+    SetDynamicResolution {
+        session_id: SessionId,
+        enabled: bool,
+    },
+    RetryDynamicResolution {
+        session_id: SessionId,
+    },
     Shutdown,
 }
 
@@ -68,6 +94,8 @@ pub enum AppEvent {
 
 pub enum SessionTransportEvent {
     Framebuffer(Vec<FbRect>),
+    DesktopSize(DesktopSize),
+    ResizeOutcome(ResizeProtocolOutcome),
     Error(PublicError),
     Disconnected,
 }

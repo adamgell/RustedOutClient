@@ -28,12 +28,29 @@ pub enum SessionPhase {
     Disconnected,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResizeStatus {
+    Disabled,
+    Waiting,
+    Requested(crate::connection::DesktopSize),
+    Pending(crate::connection::DesktopSize),
+    Applied(crate::connection::DesktopSize),
+    Rejected,
+    Unsupported,
+    TimedOut,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionSnapshot {
     pub session_id: SessionId,
     pub profile_name: String,
     pub vmid: VmId,
     pub phase: SessionPhase,
+    pub view_only: bool,
+    pub clipboard_enabled: bool,
+    pub dynamic_resolution_enabled: bool,
+    pub guest_size: Option<crate::connection::DesktopSize>,
+    pub resize_status: ResizeStatus,
 }
 
 impl SessionSnapshot {
@@ -43,7 +60,30 @@ impl SessionSnapshot {
             profile_name,
             vmid,
             phase: SessionPhase::Opening,
+            view_only: false,
+            clipboard_enabled: false,
+            dynamic_resolution_enabled: true,
+            guest_size: None,
+            resize_status: ResizeStatus::Waiting,
         }
+    }
+
+    pub fn opening_with_options(
+        session_id: SessionId,
+        profile_name: String,
+        vmid: VmId,
+        view_only: bool,
+        clipboard_enabled: bool,
+        dynamic_resolution_enabled: bool,
+    ) -> Self {
+        let mut snapshot = Self::opening(session_id, profile_name, vmid);
+        snapshot.view_only = view_only;
+        snapshot.clipboard_enabled = clipboard_enabled;
+        snapshot.dynamic_resolution_enabled = dynamic_resolution_enabled;
+        if !dynamic_resolution_enabled {
+            snapshot.resize_status = ResizeStatus::Disabled;
+        }
+        snapshot
     }
 
     pub fn transition_to(&mut self, next: SessionPhase) -> Result<(), SessionTransitionError> {
@@ -134,10 +174,14 @@ impl PublicError {
         self.cleanup_failed
     }
 
-    pub(crate) fn for_session(mut self, session_id: SessionId, vmid: VmId) -> Self {
+    pub fn with_public_context(mut self, session_id: SessionId, vmid: VmId) -> Self {
         self.session_id = Some(session_id);
         self.vmid = Some(vmid);
         self
+    }
+
+    pub(crate) fn for_session(self, session_id: SessionId, vmid: VmId) -> Self {
+        self.with_public_context(session_id, vmid)
     }
 
     pub(crate) fn with_cleanup_failure(mut self) -> Self {

@@ -24,18 +24,22 @@ use crate::{
         SshMaster, SshMasterError, TrustedSshProxy,
     },
     vnc::{
-        ClipboardText, InputController, InputError, RfbError, RfbErrorKind, RfbPhase, VncClient,
+        normalize_resize_request, ClipboardText, InputController, InputError, RfbError,
+        RfbErrorKind, RfbPhase, VncClient,
     },
 };
 
 use super::{
-    AppCommand, AppEvent, InputAction, OpenOptions, PublicError, PublicErrorKind, SessionId,
-    SessionPhase, SessionSnapshot, SessionTransportEvent,
+    AppCommand, AppEvent, DesktopSize, InputAction, OpenOptions, PublicError, PublicErrorKind,
+    ResizeProtocolOutcome, ResizeStatus, SessionId, SessionPhase, SessionSnapshot,
+    SessionTransportEvent,
 };
 
 pub const APP_QUEUE_CAPACITY: usize = 256;
 const MAX_ACTIVE_NATIVE_SESSIONS: usize = 2;
 const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
+const RESIZE_OUTCOME_DEADLINE: Duration = Duration::from_secs(2);
 
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -43,6 +47,9 @@ pub trait ManagedSession: Send + 'static {
     fn try_recv(&mut self) -> Result<Option<SessionTransportEvent>, PublicError>;
     fn mark_ready(&mut self);
     fn send_input(&mut self, action: InputAction) -> Result<Option<ClipboardText>, InputError>;
+    fn request_resize(&mut self, _requested: DesktopSize) -> Result<(), PublicError> {
+        Err(PublicError::new(PublicErrorKind::Queue))
+    }
     fn release_all_keys(&mut self) -> Result<(), PublicError>;
     fn close(&mut self, deadline: Instant) -> BackendFuture<'_, Result<(), PublicError>>;
 }
@@ -112,6 +119,13 @@ impl SessionManager {
         self.event_rx.recv().await
     }
 
+    pub fn try_send(
+        &self,
+        command: AppCommand,
+    ) -> Result<(), mpsc::error::TrySendError<AppCommand>> {
+        self.command_tx.try_send(command)
+    }
+
     pub fn try_recv(&mut self) -> Result<AppEvent, mpsc::error::TryRecvError> {
         self.event_rx.try_recv()
     }
@@ -167,6 +181,38 @@ struct SessionRecord<S> {
     options: OpenOptions,
     session: Option<S>,
     error_emitted: bool,
+    resize: ResizePolicy,
+}
+
+#[derive(Clone, Copy)]
+struct InFlightResize {
+    requested: DesktopSize,
+    deadline: Instant,
+}
+
+struct ResizePolicy {
+    desired: Option<DesktopSize>,
+    debounce_deadline: Option<Instant>,
+    in_flight: Option<InFlightResize>,
+    pending_replacement: Option<DesktopSize>,
+    automatic_allowed: bool,
+}
+
+impl ResizePolicy {
+    fn new(enabled: bool) -> Self {
+        Self {
+            desired: None,
+            debounce_deadline: None,
+            in_flight: None,
+            pending_replacement: None,
+            automatic_allowed: enabled,
+        }
+    }
+
+    fn cancel_automatic_work(&mut self) {
+        self.debounce_deadline = None;
+        self.pending_replacement = None;
+    }
 }
 
 struct Worker<B>
@@ -255,6 +301,21 @@ where
             AppCommand::SendInput { session_id, action } => {
                 self.send_input(session_id, action).await
             }
+            AppCommand::ViewportChanged {
+                session_id,
+                backing_width,
+                backing_height,
+            } => {
+                self.viewport_changed(session_id, backing_width, backing_height)
+                    .await
+            }
+            AppCommand::SetDynamicResolution {
+                session_id,
+                enabled,
+            } => self.set_dynamic_resolution(session_id, enabled).await,
+            AppCommand::RetryDynamicResolution { session_id } => {
+                self.retry_dynamic_resolution(session_id).await
+            }
             AppCommand::Shutdown => {}
         }
     }
@@ -276,12 +337,20 @@ where
         }
 
         let session_id = SessionId::new();
-        let snapshot = SessionSnapshot::opening(session_id, self.profile_name.clone(), vmid);
+        let snapshot = SessionSnapshot::opening_with_options(
+            session_id,
+            self.profile_name.clone(),
+            vmid,
+            options.view_only,
+            options.clipboard_enabled,
+            options.dynamic_resolution,
+        );
         self.sessions.push(SessionRecord {
             snapshot: snapshot.clone(),
             options,
             session: None,
             error_emitted: false,
+            resize: ResizePolicy::new(options.dynamic_resolution),
         });
         let index = self.sessions.len() - 1;
         self.emit_critical(AppEvent::SessionChanged(snapshot)).await;
@@ -323,10 +392,27 @@ where
             return;
         };
         let vmid = self.sessions[index].snapshot.vmid;
+        let requested_view_only = match &action {
+            InputAction::SetViewOnly(enabled) => Some(*enabled),
+            _ => None,
+        };
         let result = self.sessions[index]
             .session
             .as_mut()
             .map(|session| session.send_input(action));
+        let accepted = result.as_ref().is_some_and(Result::is_ok);
+        let mut snapshot_changed = false;
+        if let Some(enabled) = requested_view_only {
+            let authoritative = enabled || accepted;
+            if authoritative {
+                self.sessions[index].options.view_only = enabled;
+                self.sessions[index].snapshot.view_only = enabled;
+                snapshot_changed = true;
+            }
+        }
+        if snapshot_changed {
+            self.emit_session_snapshot(index).await;
+        }
         match result {
             Some(Ok(Some(text))) => {
                 self.emit_critical(AppEvent::ClipboardReceived { session_id, text })
@@ -344,6 +430,100 @@ where
                 .await;
             }
         }
+    }
+
+    async fn viewport_changed(
+        &mut self,
+        session_id: SessionId,
+        backing_width: u32,
+        backing_height: u32,
+    ) {
+        let Some(index) = self.session_index(session_id) else {
+            self.emit_critical(AppEvent::Error(PublicError::new(
+                PublicErrorKind::VmNotFound,
+            )))
+            .await;
+            return;
+        };
+        let limits = self.sessions[index].options.vnc.limits;
+        let requested = normalize_resize_request(backing_width, backing_height, limits).ok();
+        let previous_status = self.sessions[index].snapshot.resize_status;
+        self.sessions[index].resize.desired = requested;
+        self.sessions[index].resize.pending_replacement = None;
+        self.sessions[index].resize.debounce_deadline = None;
+        if requested.is_some()
+            && self.sessions[index].options.dynamic_resolution
+            && self.sessions[index].resize.automatic_allowed
+            && self.sessions[index].snapshot.phase == SessionPhase::Ready
+        {
+            self.sessions[index].resize.debounce_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
+            if self.sessions[index].resize.in_flight.is_none() {
+                self.sessions[index].snapshot.resize_status = ResizeStatus::Waiting;
+            }
+        } else if requested.is_none()
+            && self.sessions[index].resize.in_flight.is_none()
+            && self.sessions[index].resize.automatic_allowed
+        {
+            self.sessions[index].snapshot.resize_status =
+                if self.sessions[index].options.dynamic_resolution {
+                    ResizeStatus::Waiting
+                } else {
+                    ResizeStatus::Disabled
+                };
+        }
+        if self.sessions[index].snapshot.resize_status != previous_status {
+            self.emit_session_snapshot(index).await;
+        }
+    }
+
+    async fn set_dynamic_resolution(&mut self, session_id: SessionId, enabled: bool) {
+        let Some(index) = self.session_index(session_id) else {
+            self.emit_critical(AppEvent::Error(PublicError::new(
+                PublicErrorKind::VmNotFound,
+            )))
+            .await;
+            return;
+        };
+        self.sessions[index].options.dynamic_resolution = enabled;
+        self.sessions[index].snapshot.dynamic_resolution_enabled = enabled;
+        self.sessions[index].resize.cancel_automatic_work();
+        self.sessions[index].resize.in_flight = None;
+        self.sessions[index].resize.automatic_allowed = enabled;
+        self.sessions[index].snapshot.resize_status = if enabled {
+            ResizeStatus::Waiting
+        } else {
+            ResizeStatus::Disabled
+        };
+        if enabled
+            && self.sessions[index].resize.desired.is_some()
+            && self.sessions[index].snapshot.phase == SessionPhase::Ready
+        {
+            self.sessions[index].resize.debounce_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
+        }
+        self.emit_session_snapshot(index).await;
+    }
+
+    async fn retry_dynamic_resolution(&mut self, session_id: SessionId) {
+        let Some(index) = self.session_index(session_id) else {
+            self.emit_critical(AppEvent::Error(PublicError::new(
+                PublicErrorKind::VmNotFound,
+            )))
+            .await;
+            return;
+        };
+        if !self.sessions[index].options.dynamic_resolution {
+            return;
+        }
+        self.sessions[index].resize.automatic_allowed = true;
+        self.sessions[index].resize.in_flight = None;
+        self.sessions[index].resize.pending_replacement = None;
+        self.sessions[index].snapshot.resize_status = ResizeStatus::Waiting;
+        self.sessions[index].resize.debounce_deadline = self.sessions[index]
+            .resize
+            .desired
+            .filter(|_| self.sessions[index].snapshot.phase == SessionPhase::Ready)
+            .map(|_| Instant::now() + RESIZE_DEBOUNCE);
+        self.emit_session_snapshot(index).await;
     }
 
     async fn poll_sessions(&mut self) {
@@ -369,9 +549,16 @@ where
                             session.mark_ready();
                         }
                         self.transition(index, SessionPhase::Ready).await;
+                        self.arm_resize_after_ready(index);
                     }
                     let session_id = self.sessions[index].snapshot.session_id;
                     self.emit_framebuffer(AppEvent::Framebuffer { session_id, rects });
+                }
+                SessionTransportEvent::DesktopSize(size) => {
+                    self.handle_desktop_size(index, size).await;
+                }
+                SessionTransportEvent::ResizeOutcome(outcome) => {
+                    self.handle_resize_outcome(index, outcome).await;
                 }
                 SessionTransportEvent::Error(error) => {
                     let snapshot = &self.sessions[index].snapshot;
@@ -383,6 +570,146 @@ where
                 }
             }
         }
+        self.poll_resize_policy().await;
+    }
+
+    fn arm_resize_after_ready(&mut self, index: usize) {
+        let record = &mut self.sessions[index];
+        if record.options.dynamic_resolution
+            && record.resize.automatic_allowed
+            && record.resize.desired.is_some()
+        {
+            record.resize.debounce_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
+            record.snapshot.resize_status = ResizeStatus::Waiting;
+        }
+    }
+
+    async fn handle_desktop_size(&mut self, index: usize, size: DesktopSize) {
+        self.sessions[index].snapshot.guest_size = Some(size);
+        let matching = self.sessions[index]
+            .resize
+            .in_flight
+            .is_some_and(|request| request.requested == size);
+        if matching {
+            self.sessions[index].resize.in_flight = None;
+            self.sessions[index].snapshot.resize_status = ResizeStatus::Applied(size);
+            let follow_up = self.sessions[index].resize.pending_replacement.take();
+            self.emit_session_snapshot(index).await;
+            if let Some(follow_up) = follow_up.filter(|requested| *requested != size) {
+                if self.sessions[index].options.dynamic_resolution
+                    && self.sessions[index].resize.automatic_allowed
+                    && self.sessions[index].snapshot.phase == SessionPhase::Ready
+                {
+                    self.issue_resize(index, follow_up).await;
+                }
+            }
+        } else {
+            self.emit_session_snapshot(index).await;
+        }
+    }
+
+    async fn handle_resize_outcome(&mut self, index: usize, outcome: ResizeProtocolOutcome) {
+        let Some(in_flight) = self.sessions[index].resize.in_flight else {
+            return;
+        };
+        match outcome {
+            ResizeProtocolOutcome::Forwarded(size) if size == in_flight.requested => {
+                self.sessions[index].snapshot.resize_status = ResizeStatus::Pending(size);
+            }
+            ResizeProtocolOutcome::Forwarded(_) | ResizeProtocolOutcome::Unsupported => {
+                self.sessions[index].resize.in_flight = None;
+                self.sessions[index].resize.automatic_allowed = false;
+                self.sessions[index].resize.cancel_automatic_work();
+                self.sessions[index].snapshot.resize_status = ResizeStatus::Unsupported;
+            }
+            ResizeProtocolOutcome::Rejected => {
+                self.sessions[index].resize.in_flight = None;
+                self.sessions[index].resize.automatic_allowed = false;
+                self.sessions[index].resize.cancel_automatic_work();
+                self.sessions[index].snapshot.resize_status = ResizeStatus::Rejected;
+            }
+        }
+        self.emit_session_snapshot(index).await;
+    }
+
+    async fn poll_resize_policy(&mut self) {
+        let now = Instant::now();
+        for index in 0..self.sessions.len() {
+            let mut emit_snapshot = false;
+            let mut issue = None;
+            {
+                let record = &mut self.sessions[index];
+                if record
+                    .resize
+                    .in_flight
+                    .is_some_and(|request| now >= request.deadline)
+                {
+                    record.resize.in_flight = None;
+                    record.resize.automatic_allowed = false;
+                    record.resize.cancel_automatic_work();
+                    record.snapshot.resize_status = ResizeStatus::TimedOut;
+                    emit_snapshot = true;
+                } else if record
+                    .resize
+                    .debounce_deadline
+                    .is_some_and(|deadline| now >= deadline)
+                {
+                    record.resize.debounce_deadline = None;
+                    if let Some(desired) = record.resize.desired {
+                        if record.resize.in_flight.is_some() {
+                            record.resize.pending_replacement = Some(desired);
+                        } else if record.options.dynamic_resolution
+                            && record.resize.automatic_allowed
+                            && record.snapshot.phase == SessionPhase::Ready
+                        {
+                            issue = Some(desired);
+                        }
+                    }
+                }
+            }
+            if emit_snapshot {
+                self.emit_session_snapshot(index).await;
+            }
+            if let Some(requested) = issue {
+                self.issue_resize(index, requested).await;
+            }
+        }
+    }
+
+    async fn issue_resize(&mut self, index: usize, requested: DesktopSize) {
+        if self.sessions[index].resize.in_flight.is_some()
+            || self.sessions[index].snapshot.phase != SessionPhase::Ready
+        {
+            return;
+        }
+        let result = self.sessions[index]
+            .session
+            .as_mut()
+            .ok_or_else(|| PublicError::new(PublicErrorKind::Queue))
+            .and_then(|session| session.request_resize(requested));
+        match result {
+            Ok(()) => {
+                self.sessions[index].resize.in_flight = Some(InFlightResize {
+                    requested,
+                    deadline: Instant::now() + RESIZE_OUTCOME_DEADLINE,
+                });
+                self.sessions[index].snapshot.resize_status = ResizeStatus::Requested(requested);
+                self.emit_session_snapshot(index).await;
+            }
+            Err(error) => {
+                self.sessions[index].resize.automatic_allowed = false;
+                self.sessions[index].snapshot.resize_status = ResizeStatus::Waiting;
+                let snapshot = &self.sessions[index].snapshot;
+                let contextual = error.for_session(snapshot.session_id, snapshot.vmid);
+                self.emit_session_snapshot(index).await;
+                self.emit_critical(AppEvent::Error(contextual)).await;
+            }
+        }
+    }
+
+    async fn emit_session_snapshot(&mut self, index: usize) {
+        let snapshot = self.sessions[index].snapshot.clone();
+        self.emit_critical(AppEvent::SessionChanged(snapshot)).await;
     }
 
     async fn close_session(
@@ -644,6 +971,12 @@ impl ManagedSession for ProductionSession {
                 Ok(VncEvent::FramebufferRects(rects)) => {
                     return Ok(Some(SessionTransportEvent::Framebuffer(rects)));
                 }
+                Ok(VncEvent::DesktopSize(size)) => {
+                    return Ok(Some(SessionTransportEvent::DesktopSize(size)));
+                }
+                Ok(VncEvent::ResizeOutcome(outcome)) => {
+                    return Ok(Some(SessionTransportEvent::ResizeOutcome(outcome)));
+                }
                 Ok(VncEvent::Error(error)) => {
                     self.terminal_reported = true;
                     return Ok(Some(SessionTransportEvent::Error(public_rfb_error(error))));
@@ -652,7 +985,7 @@ impl ManagedSession for ProductionSession {
                     self.terminal_reported = true;
                     return Ok(Some(SessionTransportEvent::Disconnected));
                 }
-                Ok(VncEvent::DesktopSize(_, _) | VncEvent::DesktopName(_)) => {}
+                Ok(VncEvent::DesktopName(_)) => {}
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     return Ok(self.take_terminal_event());
                 }
@@ -689,6 +1022,16 @@ impl ManagedSession for ProductionSession {
             InputAction::SendClipboard(text) => self.input.send_clipboard(text).map(|()| None),
             InputAction::ReceiveClipboard => self.input.receive_clipboard(),
         }
+    }
+
+    fn request_resize(&mut self, requested: DesktopSize) -> Result<(), PublicError> {
+        self.input
+            .connection()
+            .request_desktop_size(requested)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => PublicError::new(PublicErrorKind::Queue),
+                TrySendError::Disconnected(_) => PublicError::new(PublicErrorKind::Cleanup),
+            })
     }
 
     fn release_all_keys(&mut self) -> Result<(), PublicError> {

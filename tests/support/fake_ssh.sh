@@ -112,7 +112,7 @@ if [ "$proxy" = true ]; then
         printf '\000\001\000\001'
         printf '\040\030\000\001\000\377\000\377\000\377\020\010\000\000\000\000'
         printf '\000\000\000\000'
-        dd bs=1 count=58 of=/dev/null 2>/dev/null || exit 74
+        dd bs=1 count=62 of=/dev/null 2>/dev/null || exit 74
         printf '\000\000\000\001'
         printf '\000\000\000\000\000\002\000\001\000\000\000\000'
         : > "${socket}.proxy.first-frame-sent"
@@ -132,7 +132,7 @@ if [ "$proxy" = true ]; then
             printf '\000\001\000\001'
             printf '\040\030\000\001\000\377\000\377\000\377\020\010\000\000\000\000'
             printf '\000\000\000\000'
-            dd bs=1 count=58 of=/dev/null 2>/dev/null || exit 74
+            dd bs=1 count=62 of=/dev/null 2>/dev/null || exit 74
             printf '\000\000\000\001'
             printf '\000\000\000\000\000\001\000\001\000\000\000\000'
             printf '\000\000\000\000'

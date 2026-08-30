@@ -7,7 +7,11 @@ pub mod messages;
 mod security;
 mod wire;
 
-pub use client::{read_server_init, ServerInit, VncClient, VncOptions};
+pub use client::{
+    encode_set_desktop_size, encode_set_encodings, normalize_resize_request,
+    parse_extended_desktop_size, read_server_init, ExtendedDesktopSize, ServerInit, VncClient,
+    VncOptions,
+};
 pub use framebuffer::{CheckedRect, Framebuffer};
 pub use input::{ClipboardText, InputController, InputError, InputSink, CLIPBOARD_TEXT_LIMIT};
 pub use limits::{validate_framebuffer_layout, FramebufferLayout, ProtocolLimits};

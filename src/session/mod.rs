@@ -2,11 +2,15 @@ mod events;
 mod manager;
 mod model;
 
-pub use events::{AppCommand, AppEvent, InputAction, OpenOptions, SessionTransportEvent};
+pub use events::{
+    AppCommand, AppEvent, DesktopSize, InputAction, OpenOptions, ResizeProtocolOutcome,
+    SessionTransportEvent,
+};
 pub use manager::{
     BackendFuture, ManagedSession, ProductionBackend, SessionBackend, SessionManager,
     APP_QUEUE_CAPACITY,
 };
 pub use model::{
-    PublicError, PublicErrorKind, SessionId, SessionPhase, SessionSnapshot, SessionTransitionError,
+    PublicError, PublicErrorKind, ResizeStatus, SessionId, SessionPhase, SessionSnapshot,
+    SessionTransitionError,
 };

@@ -7,7 +7,8 @@ use tracing::debug;
 
 use crate::{
     connection::{
-        ClipboardSlot, FbRect, VncCommand, VncEvent, VncSessionChannels, VNC_QUEUE_CAPACITY,
+        ClipboardSlot, DesktopSize, FbRect, ResizeProtocolOutcome, VncCommand, VncEvent,
+        VncSessionChannels, VNC_QUEUE_CAPACITY,
     },
     ssh::{ProxyTicket, TrustedSshProxy},
 };
@@ -30,6 +31,14 @@ use super::{
 pub struct VncOptions {
     pub limits: ProtocolLimits,
     pub shared: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtendedDesktopSize {
+    ServerSize(DesktopSize),
+    Pending(DesktopSize),
+    Rejected,
+    Unsupported,
 }
 
 impl Default for VncOptions {
@@ -183,6 +192,237 @@ where
     send_set_pixel_format(reader).await?;
     send_set_encodings(reader).await?;
     Ok(init)
+}
+
+pub fn normalize_resize_request(
+    backing_width: u32,
+    backing_height: u32,
+    limits: ProtocolLimits,
+) -> Result<DesktopSize, RfbError> {
+    limits.validate_for_phase(RfbPhase::Session)?;
+    if backing_width < 640
+        || backing_height < 480
+        || backing_width > u32::from(limits.max_dimension)
+        || backing_height > u32::from(limits.max_dimension)
+    {
+        return Err(RfbError::limit(
+            RfbPhase::Session,
+            "dynamic resize dimensions",
+        ));
+    }
+    let backing_pixels = u64::from(backing_width)
+        .checked_mul(u64::from(backing_height))
+        .ok_or_else(|| RfbError::limit(RfbPhase::Session, "dynamic resize pixels"))?;
+    if backing_pixels > limits.max_pixels {
+        return Err(RfbError::limit(RfbPhase::Session, "dynamic resize pixels"));
+    }
+
+    let width = backing_width - backing_width % 8;
+    let height = backing_height - backing_height % 8;
+    let width = u16::try_from(width)
+        .map_err(|_| RfbError::limit(RfbPhase::Session, "dynamic resize width"))?;
+    let height = u16::try_from(height)
+        .map_err(|_| RfbError::limit(RfbPhase::Session, "dynamic resize height"))?;
+    if width < 640 || height < 480 {
+        return Err(RfbError::limit(
+            RfbPhase::Session,
+            "dynamic resize dimensions",
+        ));
+    }
+    validate_framebuffer_layout_for_phase(width, height, limits, RfbPhase::Session)?;
+    Ok(DesktopSize::new(width, height))
+}
+
+pub fn encode_set_encodings() -> [u8; 32] {
+    let encodings = [
+        enc::ZRLE,
+        enc::HEXTILE,
+        enc::COPY_RECT,
+        enc::RAW,
+        enc::DESKTOP_SIZE,
+        enc::EXTENDED_DESKTOP_SIZE,
+        enc::TIGHT,
+    ];
+    let mut message = [0_u8; 32];
+    message[0] = client_msg::SET_ENCODINGS;
+    message[2..4].copy_from_slice(&(encodings.len() as u16).to_be_bytes());
+    for (index, encoding) in encodings.iter().enumerate() {
+        let start = 4 + index * 4;
+        message[start..start + 4].copy_from_slice(&encoding.to_be_bytes());
+    }
+    message
+}
+
+pub fn encode_set_desktop_size(
+    size: DesktopSize,
+    limits: ProtocolLimits,
+) -> Result<[u8; 24], RfbError> {
+    if size.width < 640 || size.height < 480 {
+        return Err(RfbError::limit(
+            RfbPhase::Session,
+            "dynamic resize dimensions",
+        ));
+    }
+    validate_framebuffer_layout_for_phase(size.width, size.height, limits, RfbPhase::Session)?;
+
+    let mut message = [0_u8; 24];
+    message[0] = client_msg::SET_DESKTOP_SIZE;
+    message[2..4].copy_from_slice(&size.width.to_be_bytes());
+    message[4..6].copy_from_slice(&size.height.to_be_bytes());
+    message[6] = 1;
+    message[16..18].copy_from_slice(&size.width.to_be_bytes());
+    message[18..20].copy_from_slice(&size.height.to_be_bytes());
+    Ok(message)
+}
+
+pub fn parse_extended_desktop_size(
+    reason: u16,
+    result: u16,
+    size: DesktopSize,
+    payload: &[u8],
+    limits: ProtocolLimits,
+) -> Result<ExtendedDesktopSize, RfbError> {
+    validate_framebuffer_layout_for_phase(size.width, size.height, limits, RfbPhase::Session)?;
+    let header = payload.get(..4).ok_or_else(|| {
+        RfbError::new(
+            RfbPhase::Session,
+            RfbErrorKind::Protocol,
+            "extended desktop size header",
+        )
+    })?;
+    if header[1..] != [0, 0, 0] {
+        return Err(RfbError::new(
+            RfbPhase::Session,
+            RfbErrorKind::Protocol,
+            "extended desktop size padding",
+        ));
+    }
+    let screen_count = usize::from(header[0]);
+    if screen_count == 0 {
+        return Err(RfbError::new(
+            RfbPhase::Session,
+            RfbErrorKind::Protocol,
+            "extended desktop size screens",
+        ));
+    }
+    let expected = screen_count
+        .checked_mul(16)
+        .and_then(|bytes| bytes.checked_add(4))
+        .ok_or_else(|| RfbError::limit(RfbPhase::Session, "extended desktop size screens"))?;
+    if payload.len() != expected {
+        return Err(RfbError::new(
+            RfbPhase::Session,
+            RfbErrorKind::Protocol,
+            "extended desktop size payload",
+        ));
+    }
+    if !matches!(reason, 0..=2)
+        || (reason == 1 && !matches!(result, 0..=3))
+        || (reason != 1 && result != 0)
+    {
+        return Err(RfbError::new(
+            RfbPhase::Session,
+            RfbErrorKind::Protocol,
+            "extended desktop size reason/result",
+        ));
+    }
+
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(screen_count)
+        .map_err(|_| RfbError::allocation(RfbPhase::Session, "extended desktop screens"))?;
+    let mut exact_single = false;
+    for (index, screen) in payload[4..].chunks_exact(16).enumerate() {
+        let id = u32::from_be_bytes(screen[0..4].try_into().map_err(|_| {
+            RfbError::new(
+                RfbPhase::Session,
+                RfbErrorKind::Protocol,
+                "extended desktop screen id",
+            )
+        })?);
+        if ids.contains(&id) {
+            return Err(RfbError::new(
+                RfbPhase::Session,
+                RfbErrorKind::Protocol,
+                "extended desktop duplicate screen id",
+            ));
+        }
+        ids.push(id);
+        let x = u16::from_be_bytes(screen[4..6].try_into().map_err(|_| {
+            RfbError::new(
+                RfbPhase::Session,
+                RfbErrorKind::Protocol,
+                "extended desktop screen x",
+            )
+        })?);
+        let y = u16::from_be_bytes(screen[6..8].try_into().map_err(|_| {
+            RfbError::new(
+                RfbPhase::Session,
+                RfbErrorKind::Protocol,
+                "extended desktop screen y",
+            )
+        })?);
+        let width = u16::from_be_bytes(screen[8..10].try_into().map_err(|_| {
+            RfbError::new(
+                RfbPhase::Session,
+                RfbErrorKind::Protocol,
+                "extended desktop screen width",
+            )
+        })?);
+        let height = u16::from_be_bytes(screen[10..12].try_into().map_err(|_| {
+            RfbError::new(
+                RfbPhase::Session,
+                RfbErrorKind::Protocol,
+                "extended desktop screen height",
+            )
+        })?);
+        let flags = u32::from_be_bytes(screen[12..16].try_into().map_err(|_| {
+            RfbError::new(
+                RfbPhase::Session,
+                RfbErrorKind::Protocol,
+                "extended desktop screen flags",
+            )
+        })?);
+        let right = x
+            .checked_add(width)
+            .ok_or_else(|| RfbError::limit(RfbPhase::Session, "extended desktop screen bounds"))?;
+        let bottom = y
+            .checked_add(height)
+            .ok_or_else(|| RfbError::limit(RfbPhase::Session, "extended desktop screen bounds"))?;
+        if width == 0 || height == 0 || right > size.width || bottom > size.height {
+            return Err(RfbError::new(
+                RfbPhase::Session,
+                RfbErrorKind::Protocol,
+                "extended desktop screen bounds",
+            ));
+        }
+        if screen_count == 1 && (width != size.width || height != size.height) {
+            return Err(RfbError::new(
+                RfbPhase::Session,
+                RfbErrorKind::Protocol,
+                "extended desktop size contradiction",
+            ));
+        }
+        exact_single = index == 0
+            && screen_count == 1
+            && id == 0
+            && x == 0
+            && y == 0
+            && width == size.width
+            && height == size.height
+            && flags == 0;
+    }
+
+    if result == 1 || result == 2 {
+        return Ok(ExtendedDesktopSize::Rejected);
+    }
+    if result == 3 || !exact_single {
+        return Ok(ExtendedDesktopSize::Unsupported);
+    }
+    if reason == 1 {
+        Ok(ExtendedDesktopSize::Pending(size))
+    } else {
+        Ok(ExtendedDesktopSize::ServerSize(size))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -467,10 +707,10 @@ where
     let mut framebuffer = Framebuffer::from_pixels(width, height, limits, pixels)
         .map_err(encoding::map_framebuffer_error)?;
     let mut events = EventQueue::new(event_tx, limits);
-    events.send_lossless(VncEvent::DesktopSize(
-        u32::from(framebuffer.width()),
-        u32::from(framebuffer.height()),
-    ))?;
+    events.send_lossless(VncEvent::DesktopSize(DesktopSize::new(
+        framebuffer.width(),
+        framebuffer.height(),
+    )))?;
     events.send_lossless(VncEvent::DesktopName(desktop_name))?;
 
     send_fb_update_request(reader, false, 0, 0, width, height).await?;
@@ -537,6 +777,9 @@ where
                 }
                 Ok(VncCommand::SetClipboard(text)) => {
                     send_client_cut_text(reader, &text, limits).await?;
+                }
+                Ok(VncCommand::SetDesktopSize(size)) => {
+                    send_set_desktop_size(reader, size, limits).await?;
                 }
                 Ok(VncCommand::GracefulDisconnect(barrier)) => {
                     reader
@@ -656,11 +899,91 @@ where
                             }
                             events.flush_pending(framebuffer)?;
                             encoding::decode_desktop_size(framebuffer, width, height)?;
-                            events.send_lossless(VncEvent::DesktopSize(
-                                u32::from(framebuffer.width()),
-                                u32::from(framebuffer.height()),
-                            ))?;
+                            events.send_lossless(VncEvent::DesktopSize(DesktopSize::new(
+                                framebuffer.width(),
+                                framebuffer.height(),
+                            )))?;
                             send_fb_update_request(reader, false, 0, 0, width, height).await?;
+                        }
+                        enc::EXTENDED_DESKTOP_SIZE => {
+                            let mut payload_header = [0_u8; 4];
+                            reader
+                                .read_exact(&mut payload_header)
+                                .await
+                                .map_err(|source| RfbError::io(RfbPhase::Session, source))?;
+                            let screen_bytes = u64::from(payload_header[0])
+                                .checked_mul(16)
+                                .ok_or_else(|| {
+                                    RfbError::limit(RfbPhase::Session, "extended desktop screens")
+                                })?;
+                            let screens = reader
+                                .read_bounded_bytes(
+                                    screen_bytes,
+                                    u64::from(u8::MAX) * 16,
+                                    "extended desktop screens",
+                                    RfbPhase::Session,
+                                )
+                                .await?;
+                            let payload_len =
+                                4_usize.checked_add(screens.len()).ok_or_else(|| {
+                                    RfbError::limit(RfbPhase::Session, "extended desktop payload")
+                                })?;
+                            let mut payload = Vec::new();
+                            payload.try_reserve_exact(payload_len).map_err(|_| {
+                                RfbError::allocation(RfbPhase::Session, "extended desktop payload")
+                            })?;
+                            payload.extend_from_slice(&payload_header);
+                            payload.extend_from_slice(&screens);
+                            let size = DesktopSize::new(width, height);
+                            match parse_extended_desktop_size(x, y, size, &payload, limits)? {
+                                ExtendedDesktopSize::ServerSize(size) => {
+                                    if let Some(region) = dirty.take() {
+                                        let rect = snapshot_rect(
+                                            framebuffer,
+                                            region.left,
+                                            region.top,
+                                            region.right - region.left,
+                                            region.bottom - region.top,
+                                            limits,
+                                        )?;
+                                        events.send_framebuffer(
+                                            framebuffer,
+                                            framebuffer_rects(rect)?,
+                                        )?;
+                                    }
+                                    events.flush_pending(framebuffer)?;
+                                    encoding::decode_desktop_size(
+                                        framebuffer,
+                                        size.width,
+                                        size.height,
+                                    )?;
+                                    events.send_lossless(VncEvent::DesktopSize(size))?;
+                                    send_fb_update_request(
+                                        reader,
+                                        false,
+                                        0,
+                                        0,
+                                        size.width,
+                                        size.height,
+                                    )
+                                    .await?;
+                                }
+                                ExtendedDesktopSize::Pending(size) => {
+                                    events.send_lossless(VncEvent::ResizeOutcome(
+                                        ResizeProtocolOutcome::Forwarded(size),
+                                    ))?;
+                                }
+                                ExtendedDesktopSize::Rejected => {
+                                    events.send_lossless(VncEvent::ResizeOutcome(
+                                        ResizeProtocolOutcome::Rejected,
+                                    ))?;
+                                }
+                                ExtendedDesktopSize::Unsupported => {
+                                    events.send_lossless(VncEvent::ResizeOutcome(
+                                        ResizeProtocolOutcome::Unsupported,
+                                    ))?;
+                                }
+                            }
                         }
                         enc::CURSOR => {
                             encoding::decode_cursor(reader, pixel_format, x, y, width, height)
@@ -896,21 +1219,22 @@ async fn send_set_encodings<S>(reader: &mut RfbReader<S>) -> Result<(), RfbError
 where
     S: AsyncWrite + Unpin,
 {
-    let encodings = [
-        enc::ZRLE,
-        enc::HEXTILE,
-        enc::COPY_RECT,
-        enc::RAW,
-        enc::DESKTOP_SIZE,
-        enc::TIGHT,
-    ];
-    let mut message = [0_u8; 28];
-    message[0] = client_msg::SET_ENCODINGS;
-    message[2..4].copy_from_slice(&(encodings.len() as u16).to_be_bytes());
-    for (index, encoding) in encodings.iter().enumerate() {
-        let start = 4 + index * 4;
-        message[start..start + 4].copy_from_slice(&encoding.to_be_bytes());
-    }
+    let message = encode_set_encodings();
+    reader
+        .write_all(&message)
+        .await
+        .map_err(|source| RfbError::io(RfbPhase::Session, source))
+}
+
+async fn send_set_desktop_size<S>(
+    reader: &mut RfbReader<S>,
+    size: DesktopSize,
+    limits: ProtocolLimits,
+) -> Result<(), RfbError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let message = encode_set_desktop_size(size, limits)?;
     reader
         .write_all(&message)
         .await
@@ -1021,7 +1345,9 @@ mod tests {
         tight, EventQueue, TightState,
     };
     use crate::{
-        connection::{bounded_vnc_channels, ClipboardSlot, FbRect, VncCommand, VncEvent},
+        connection::{
+            bounded_vnc_channels, ClipboardSlot, DesktopSize, FbRect, VncCommand, VncEvent,
+        },
         vnc::{
             messages::{encoding as enc, server_msg},
             CheckedRect, Framebuffer, ProtocolLimits, RfbError, RfbErrorKind, RfbPhase, RfbReader,
@@ -1034,8 +1360,9 @@ mod tests {
     const CANONICAL_SET_PIXEL_FORMAT: [u8; 20] = [
         0, 0, 0, 0, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0,
     ];
-    const SET_ENCODINGS: [u8; 28] = [
-        2, 0, 0, 6, 0, 0, 0, 16, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, 255, 255, 255, 33, 0, 0, 0, 7,
+    const SET_ENCODINGS: [u8; 32] = [
+        2, 0, 0, 7, 0, 0, 0, 16, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, 255, 255, 255, 33, 255, 255,
+        254, 204, 0, 0, 0, 7,
     ];
 
     fn server_init_bytes(pixel_format: [u8; 16]) -> Vec<u8> {
@@ -1047,14 +1374,14 @@ mod tests {
         bytes
     }
 
-    async fn configure_fixture(pixel_format: [u8; 16]) -> ([u8; 48], super::ServerInit) {
+    async fn configure_fixture(pixel_format: [u8; 16]) -> ([u8; 52], super::ServerInit) {
         let (client, mut peer) = duplex(256);
         peer.write_all(&server_init_bytes(pixel_format))
             .await
             .unwrap();
         let mut reader = RfbReader::new(client, ProtocolLimits::default());
         let init = configure_server(&mut reader).await.unwrap();
-        let mut outbound = [0_u8; 48];
+        let mut outbound = [0_u8; 52];
         peer.read_exact(&mut outbound).await.unwrap();
         (outbound, init)
     }
@@ -1082,6 +1409,30 @@ mod tests {
         wire.extend_from_slice(&width.to_be_bytes());
         wire.extend_from_slice(&height.to_be_bytes());
         wire.extend_from_slice(&encoding.to_be_bytes());
+    }
+
+    fn push_one_screen_extended_size(
+        wire: &mut Vec<u8>,
+        reason: u16,
+        result: u16,
+        width: u16,
+        height: u16,
+    ) {
+        push_rectangle_header(
+            wire,
+            reason,
+            result,
+            width,
+            height,
+            enc::EXTENDED_DESKTOP_SIZE,
+        );
+        wire.extend_from_slice(&[1, 0, 0, 0]);
+        wire.extend_from_slice(&0_u32.to_be_bytes());
+        wire.extend_from_slice(&0_u16.to_be_bytes());
+        wire.extend_from_slice(&0_u16.to_be_bytes());
+        wire.extend_from_slice(&width.to_be_bytes());
+        wire.extend_from_slice(&height.to_be_bytes());
+        wire.extend_from_slice(&0_u32.to_be_bytes());
     }
 
     #[tokio::test]
@@ -1418,7 +1769,10 @@ mod tests {
         );
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(VncEvent::DesktopSize(3, 1))
+            Ok(VncEvent::DesktopSize(DesktopSize {
+                width: 3,
+                height: 1
+            }))
         ));
         let VncEvent::FramebufferRects(new_rects) = event_rx.try_recv().unwrap() else {
             panic!("expected new-dimension framebuffer event after DesktopSize");
@@ -1440,6 +1794,57 @@ mod tests {
             framebuffer.pixels(),
             [0, 0, 0, 0, 0, 0, 0, 0, 0x07, 0x08, 0x09, 0xff]
         );
+    }
+
+    #[tokio::test]
+    async fn production_parser_keeps_forwarded_resize_pending_until_later_server_size() {
+        let mut updates = vec![server_msg::FB_UPDATE, 0];
+        updates.extend_from_slice(&1_u16.to_be_bytes());
+        push_one_screen_extended_size(&mut updates, 1, 0, 1_600, 900);
+        updates.extend_from_slice(&[server_msg::FB_UPDATE, 0]);
+        updates.extend_from_slice(&1_u16.to_be_bytes());
+        push_one_screen_extended_size(&mut updates, 0, 0, 1_600, 900);
+
+        let (client, mut peer) = duplex(512);
+        peer.write_all(&updates).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let limits = ProtocolLimits::default();
+        let mut reader = RfbReader::new(client, limits);
+        let mut framebuffer = Framebuffer::new(640, 480, limits).unwrap();
+        let (event_tx, event_rx) = bounded(8);
+        let mut events = EventQueue::new(event_tx, limits);
+        let (_command_tx, command_rx) = bounded::<VncCommand>(1);
+        let clipboard = ClipboardSlot::default();
+
+        let error = run_session(
+            &mut reader,
+            &mut framebuffer,
+            &mut events,
+            &command_rx,
+            limits,
+            &clipboard,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), RfbErrorKind::Io);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(VncEvent::ResizeOutcome(
+                crate::connection::ResizeProtocolOutcome::Forwarded(DesktopSize {
+                    width: 1_600,
+                    height: 900
+                })
+            ))
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(VncEvent::DesktopSize(DesktopSize {
+                width: 1_600,
+                height: 900
+            }))
+        ));
+        assert_eq!(framebuffer.dimensions(), (1_600, 900));
     }
 
     #[test]

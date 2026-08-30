@@ -7,6 +7,25 @@ use crate::vnc::{ClipboardText, RfbError};
 
 pub const VNC_QUEUE_CAPACITY: usize = 256;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DesktopSize {
+    pub width: u16,
+    pub height: u16,
+}
+
+impl DesktopSize {
+    pub const fn new(width: u16, height: u16) -> Self {
+        Self { width, height }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResizeProtocolOutcome {
+    Forwarded(DesktopSize),
+    Rejected,
+    Unsupported,
+}
+
 /// A single changed rectangle: tightly-packed `w*h*4` RGBA bytes at `(x, y)`.
 pub struct FbRect {
     pub x: u32,
@@ -18,7 +37,8 @@ pub struct FbRect {
 
 /// Messages sent from the VNC task to the UI.
 pub enum VncEvent {
-    DesktopSize(u32, u32),
+    DesktopSize(DesktopSize),
+    ResizeOutcome(ResizeProtocolOutcome),
     FramebufferRects(Vec<FbRect>),
     DesktopName(String),
     Error(RfbError),
@@ -30,6 +50,7 @@ pub enum VncCommand {
     KeyEvent { down: bool, keysym: u32 },
     PointerEvent { buttons: u8, x: u16, y: u16 },
     SetClipboard(String),
+    SetDesktopSize(DesktopSize),
     GracefulDisconnect(CloseBarrier),
     Disconnect,
 }
@@ -130,6 +151,13 @@ impl VncConnection {
 
     pub fn send_clipboard(&self, text: String) -> Result<(), TrySendError<VncCommand>> {
         self.command_tx.try_send(VncCommand::SetClipboard(text))
+    }
+
+    pub(crate) fn request_desktop_size(
+        &self,
+        size: DesktopSize,
+    ) -> Result<(), TrySendError<VncCommand>> {
+        self.command_tx.try_send(VncCommand::SetDesktopSize(size))
     }
 
     pub fn disconnect(&self) -> Result<(), TrySendError<VncCommand>> {
