@@ -15,6 +15,8 @@ pub enum RfbPhase {
     Authentication,
     SecurityResult,
     ServerInit,
+    Framebuffer,
+    Encoding,
     Session,
     EventQueue,
 }
@@ -27,6 +29,7 @@ pub enum RfbErrorKind {
     Limit,
     Allocation,
     ServerInit,
+    Decoder,
     Protocol,
     Queue,
     Io,
@@ -67,6 +70,10 @@ impl RfbError {
 
     pub(crate) fn allocation(phase: RfbPhase, field: &'static str) -> Self {
         Self::new(phase, RfbErrorKind::Allocation, field)
+    }
+
+    pub(crate) fn decoder(field: &'static str) -> Self {
+        Self::new(RfbPhase::Encoding, RfbErrorKind::Decoder, field)
     }
 
     pub fn phase(&self) -> RfbPhase {

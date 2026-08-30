@@ -1,20 +1,20 @@
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
-use flate2::Decompress;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 use crate::{
     connection::{FbRect, VncCommand, VncEvent, VNC_QUEUE_CAPACITY},
-    framebuffer::Framebuffer,
-    protocol::encoding::{copyrect, hextile, raw, tight, zrle},
     ssh::TrustedSshProxy,
 };
 
 use tight::TightState;
+use zrle::ZrleState;
 
 use super::{
+    encoding::{self, copyrect, hextile, raw, tight, zrle},
+    framebuffer::{CheckedRect, Framebuffer},
     limits::validate_framebuffer_layout_for_phase,
     messages::{client_msg, encoding as enc, server_msg, PixelFormat},
     negotiate_version,
@@ -58,64 +58,6 @@ const CANONICAL_DECODER_FORMAT: PixelFormat = PixelFormat {
     green_shift: 8,
     blue_shift: 0,
 };
-
-fn pixel_format_error() -> RfbError {
-    RfbError::new(
-        RfbPhase::ServerInit,
-        RfbErrorKind::ServerInit,
-        "pixel format",
-    )
-}
-
-fn checked_channel_mask(maximum: u16, shift: u8, bits_per_pixel: u8) -> Option<(u64, u32)> {
-    if maximum == 0 {
-        return None;
-    }
-    let levels = u32::from(maximum).checked_add(1)?;
-    if !levels.is_power_of_two() {
-        return None;
-    }
-    let channel_bits = levels.trailing_zeros();
-    let mask = u64::from(maximum).checked_shl(u32::from(shift))?;
-    let pixel_mask = (1_u64.checked_shl(u32::from(bits_per_pixel))?).checked_sub(1)?;
-    if mask & !pixel_mask != 0 {
-        return None;
-    }
-    Some((mask, channel_bits))
-}
-
-fn validate_pixel_format(pixel_format: &PixelFormat) -> Result<(), RfbError> {
-    let bits = pixel_format.bits_per_pixel;
-    if !matches!(bits, 8 | 16 | 32)
-        || pixel_format.depth == 0
-        || pixel_format.depth > bits
-        || !pixel_format.true_colour
-    {
-        return Err(pixel_format_error());
-    }
-
-    let (red_mask, red_bits) =
-        checked_channel_mask(pixel_format.red_max, pixel_format.red_shift, bits)
-            .ok_or_else(pixel_format_error)?;
-    let (green_mask, green_bits) =
-        checked_channel_mask(pixel_format.green_max, pixel_format.green_shift, bits)
-            .ok_or_else(pixel_format_error)?;
-    let (blue_mask, blue_bits) =
-        checked_channel_mask(pixel_format.blue_max, pixel_format.blue_shift, bits)
-            .ok_or_else(pixel_format_error)?;
-    let useful_bits = red_bits
-        .checked_add(green_bits)
-        .and_then(|count| count.checked_add(blue_bits))
-        .ok_or_else(pixel_format_error)?;
-    if red_mask & green_mask != 0
-        || red_mask & blue_mask != 0
-        || green_mask & blue_mask != 0
-        || useful_bits != u32::from(pixel_format.depth)
-    {
-        return Err(pixel_format_error());
-    }
-    Ok(())
-}
 
 pub async fn read_server_init<S>(reader: &mut RfbReader<S>) -> Result<ServerInit, RfbError>
 where
@@ -196,7 +138,7 @@ where
         green_shift,
         blue_shift,
     };
-    validate_pixel_format(&pixel_format)?;
+    pixel_format.validate_for_phase(RfbPhase::ServerInit)?;
 
     let name_length = reader
         .read_u32()
@@ -278,7 +220,11 @@ impl DirtyRegion {
         let bottom = y
             .checked_add(height)
             .ok_or_else(|| RfbError::limit(RfbPhase::EventQueue, "dirty rectangle"))?;
-        if width == 0 || height == 0 || right > framebuffer.width || bottom > framebuffer.height {
+        if width == 0
+            || height == 0
+            || right > u32::from(framebuffer.width())
+            || bottom > u32::from(framebuffer.height())
+        {
             return Err(RfbError::new(
                 RfbPhase::EventQueue,
                 RfbErrorKind::Protocol,
@@ -435,13 +381,13 @@ impl VncClient {
             desktop_name,
             framebuffer: pixels,
         } = init;
-        let mut framebuffer = Framebuffer {
-            width: u32::from(width),
-            height: u32::from(height),
-            pixels,
-        };
+        let mut framebuffer = Framebuffer::from_pixels(width, height, limits, pixels)
+            .map_err(encoding::map_framebuffer_error)?;
         let mut events = EventQueue::new(event_tx, limits);
-        events.send_lossless(VncEvent::DesktopSize(framebuffer.width, framebuffer.height))?;
+        events.send_lossless(VncEvent::DesktopSize(
+            u32::from(framebuffer.width()),
+            u32::from(framebuffer.height()),
+        ))?;
         events.send_lossless(VncEvent::DesktopName(desktop_name))?;
 
         send_fb_update_request(&mut reader, false, 0, 0, width, height).await?;
@@ -468,7 +414,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let pixel_format = decoder_pixel_format();
-    let mut zrle_decompressor = Decompress::new(true);
+    let mut zrle_state = ZrleState::new();
     let mut tight_state = TightState::new();
 
     loop {
@@ -545,14 +491,11 @@ where
                     match encoding {
                         enc::RAW => {
                             raw::decode(reader, framebuffer, pixel_format, x, y, width, height)
-                                .await
-                                .map_err(|_| decoder_error())?;
+                                .await?;
                             include_dirty(&mut dirty, framebuffer, x, y, width, height)?;
                         }
                         enc::COPY_RECT => {
-                            copyrect::decode(reader, framebuffer, x, y, width, height)
-                                .await
-                                .map_err(|_| decoder_error())?;
+                            copyrect::decode(reader, framebuffer, x, y, width, height).await?;
                             include_dirty(&mut dirty, framebuffer, x, y, width, height)?;
                         }
                         enc::ZRLE => {
@@ -564,16 +507,14 @@ where
                                 y,
                                 width,
                                 height,
-                                &mut zrle_decompressor,
+                                &mut zrle_state,
                             )
-                            .await
-                            .map_err(|_| decoder_error())?;
+                            .await?;
                             include_dirty(&mut dirty, framebuffer, x, y, width, height)?;
                         }
                         enc::HEXTILE => {
                             hextile::decode(reader, framebuffer, pixel_format, x, y, width, height)
-                                .await
-                                .map_err(|_| decoder_error())?;
+                                .await?;
                             include_dirty(&mut dirty, framebuffer, x, y, width, height)?;
                         }
                         enc::TIGHT => {
@@ -587,8 +528,7 @@ where
                                 height,
                                 &mut tight_state,
                             )
-                            .await
-                            .map_err(|_| decoder_error())?;
+                            .await?;
                             include_dirty(&mut dirty, framebuffer, x, y, width, height)?;
                         }
                         enc::DESKTOP_SIZE => {
@@ -604,28 +544,16 @@ where
                                 events.send_framebuffer(framebuffer, framebuffer_rects(rect)?)?;
                             }
                             events.flush_pending(framebuffer)?;
-                            let layout = validate_framebuffer_layout_for_phase(
-                                width,
-                                height,
-                                limits,
-                                RfbPhase::Session,
-                            )?;
-                            let pixels = allocate_zeroed(
-                                layout.rgba_bytes,
-                                RfbPhase::Session,
-                                "resized framebuffer",
-                            )?;
-                            framebuffer.width = u32::from(width);
-                            framebuffer.height = u32::from(height);
-                            framebuffer.pixels = pixels;
+                            encoding::decode_desktop_size(framebuffer, width, height)?;
                             events.send_lossless(VncEvent::DesktopSize(
-                                framebuffer.width,
-                                framebuffer.height,
+                                u32::from(framebuffer.width()),
+                                u32::from(framebuffer.height()),
                             ))?;
                             send_fb_update_request(reader, false, 0, 0, width, height).await?;
                         }
                         enc::CURSOR => {
-                            discard_cursor(reader, pixel_format, width, height, limits).await?;
+                            encoding::decode_cursor(reader, pixel_format, x, y, width, height)
+                                .await?;
                         }
                         _ => {
                             return Err(RfbError::new(
@@ -649,10 +577,8 @@ where
                     events.send_framebuffer(framebuffer, framebuffer_rects(rect)?)?;
                 }
 
-                let width = u16::try_from(framebuffer.width)
-                    .map_err(|_| RfbError::limit(RfbPhase::Session, "framebuffer update width"))?;
-                let height = u16::try_from(framebuffer.height)
-                    .map_err(|_| RfbError::limit(RfbPhase::Session, "framebuffer update height"))?;
+                let width = framebuffer.width();
+                let height = framebuffer.height();
                 send_fb_update_request(reader, true, 0, 0, width, height).await?;
             }
             server_msg::SET_COLOUR_MAP_ENTRIES => {
@@ -710,14 +636,6 @@ where
     }
 }
 
-fn decoder_error() -> RfbError {
-    RfbError::new(
-        RfbPhase::Session,
-        RfbErrorKind::Protocol,
-        "framebuffer decoder",
-    )
-}
-
 fn include_dirty(
     dirty: &mut Option<DirtyRegion>,
     framebuffer: &Framebuffer,
@@ -764,7 +682,11 @@ fn snapshot_rect(
     let bottom = y
         .checked_add(height)
         .ok_or_else(|| RfbError::limit(RfbPhase::EventQueue, "framebuffer event bounds"))?;
-    if width == 0 || height == 0 || right > framebuffer.width || bottom > framebuffer.height {
+    if width == 0
+        || height == 0
+        || right > u32::from(framebuffer.width())
+        || bottom > u32::from(framebuffer.height())
+    {
         return Err(RfbError::new(
             RfbPhase::EventQueue,
             RfbErrorKind::Protocol,
@@ -782,100 +704,50 @@ fn snapshot_rect(
             "framebuffer event bytes",
         ));
     }
-    let byte_count = usize::try_from(byte_count)
-        .map_err(|_| RfbError::limit(RfbPhase::EventQueue, "framebuffer event bytes"))?;
-    let mut rgba = allocate_zeroed(byte_count, RfbPhase::EventQueue, "framebuffer event")?;
-    let row_bytes_u64 = u64::from(width)
-        .checked_mul(4)
-        .ok_or_else(|| RfbError::limit(RfbPhase::EventQueue, "framebuffer event row"))?;
-    let row_bytes = usize::try_from(row_bytes_u64)
-        .map_err(|_| RfbError::limit(RfbPhase::EventQueue, "framebuffer event row"))?;
-
-    for row in 0..height {
-        let source_pixel = u64::from(y + row)
-            .checked_mul(u64::from(framebuffer.width))
-            .and_then(|offset| offset.checked_add(u64::from(x)))
-            .ok_or_else(|| RfbError::limit(RfbPhase::EventQueue, "framebuffer event source"))?;
-        let source_start = source_pixel
-            .checked_mul(4)
-            .and_then(|offset| usize::try_from(offset).ok())
-            .ok_or_else(|| RfbError::limit(RfbPhase::EventQueue, "framebuffer event source"))?;
-        let source_end = source_start
-            .checked_add(row_bytes)
-            .ok_or_else(|| RfbError::limit(RfbPhase::EventQueue, "framebuffer event source"))?;
-        let destination_start = usize::try_from(u64::from(row) * row_bytes_u64)
-            .map_err(|_| RfbError::limit(RfbPhase::EventQueue, "framebuffer event target"))?;
-        let destination_end = destination_start
-            .checked_add(row_bytes)
-            .ok_or_else(|| RfbError::limit(RfbPhase::EventQueue, "framebuffer event target"))?;
-        let source = framebuffer
-            .pixels
-            .get(source_start..source_end)
-            .ok_or_else(|| {
-                RfbError::new(
-                    RfbPhase::EventQueue,
-                    RfbErrorKind::Protocol,
-                    "framebuffer event source",
-                )
-            })?;
-        let destination = rgba
-            .get_mut(destination_start..destination_end)
-            .ok_or_else(|| {
-                RfbError::new(
-                    RfbPhase::EventQueue,
-                    RfbErrorKind::Protocol,
-                    "framebuffer event target",
-                )
-            })?;
-        destination.copy_from_slice(source);
-    }
-
-    Ok(FbRect {
+    let x = u16::try_from(x)
+        .map_err(|_| RfbError::limit(RfbPhase::EventQueue, "framebuffer event x"))?;
+    let y = u16::try_from(y)
+        .map_err(|_| RfbError::limit(RfbPhase::EventQueue, "framebuffer event y"))?;
+    let width_u16 = u16::try_from(width)
+        .map_err(|_| RfbError::limit(RfbPhase::EventQueue, "framebuffer event width"))?;
+    let height_u16 = u16::try_from(height)
+        .map_err(|_| RfbError::limit(RfbPhase::EventQueue, "framebuffer event height"))?;
+    let rectangle = CheckedRect::new(
         x,
         y,
+        width_u16,
+        height_u16,
+        framebuffer.width(),
+        framebuffer.height(),
+    )
+    .map_err(|_| {
+        RfbError::new(
+            RfbPhase::EventQueue,
+            RfbErrorKind::Protocol,
+            "framebuffer event bounds",
+        )
+    })?;
+    let rgba = framebuffer
+        .snapshot(rectangle)
+        .map_err(|error| match error.kind() {
+            RfbErrorKind::Allocation => {
+                RfbError::allocation(RfbPhase::EventQueue, "framebuffer event")
+            }
+            RfbErrorKind::Limit => RfbError::limit(RfbPhase::EventQueue, "framebuffer event bytes"),
+            _ => RfbError::new(
+                RfbPhase::EventQueue,
+                RfbErrorKind::Protocol,
+                "framebuffer event bytes",
+            ),
+        })?;
+
+    Ok(FbRect {
+        x: u32::from(x),
+        y: u32::from(y),
         w: width,
         h: height,
         rgba,
     })
-}
-
-async fn discard_cursor<S>(
-    reader: &mut RfbReader<S>,
-    pixel_format: &PixelFormat,
-    width: u16,
-    height: u16,
-    limits: ProtocolLimits,
-) -> Result<(), RfbError>
-where
-    S: AsyncRead + Unpin,
-{
-    let bytes_per_pixel = u64::from(pixel_format.bits_per_pixel / 8);
-    let pixels = u64::from(width)
-        .checked_mul(u64::from(height))
-        .ok_or_else(|| RfbError::limit(RfbPhase::Session, "cursor pixels"))?;
-    let image_bytes = pixels
-        .checked_mul(bytes_per_pixel)
-        .ok_or_else(|| RfbError::limit(RfbPhase::Session, "cursor image"))?;
-    let mask_row_bytes = u64::from(width)
-        .checked_add(7)
-        .ok_or_else(|| RfbError::limit(RfbPhase::Session, "cursor mask"))?
-        / 8;
-    let mask_bytes = mask_row_bytes
-        .checked_mul(u64::from(height))
-        .ok_or_else(|| RfbError::limit(RfbPhase::Session, "cursor mask"))?;
-    let declared = image_bytes
-        .checked_add(mask_bytes)
-        .ok_or_else(|| RfbError::limit(RfbPhase::Session, "cursor payload"))?;
-    let bytes = reader
-        .read_bounded_bytes(
-            declared,
-            limits.max_framebuffer_bytes,
-            "cursor payload",
-            RfbPhase::Session,
-        )
-        .await?;
-    drop(bytes);
-    Ok(())
 }
 
 async fn send_set_pixel_format<S>(reader: &mut RfbReader<S>) -> Result<(), RfbError>
@@ -1024,8 +896,9 @@ mod tests {
     };
     use crate::{
         connection::{FbRect, VncEvent},
-        framebuffer::Framebuffer,
-        vnc::{ProtocolLimits, RfbError, RfbErrorKind, RfbPhase, RfbReader},
+        vnc::{
+            CheckedRect, Framebuffer, ProtocolLimits, RfbError, RfbErrorKind, RfbPhase, RfbReader,
+        },
     };
 
     const CANONICAL_FORMAT: [u8; 16] = [32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0];
@@ -1085,16 +958,13 @@ mod tests {
         let (_outbound, init) = configure_fixture(RGB565_32_FORMAT).await;
         assert_eq!(init.pixel_format.depth, 16);
 
-        let (mut peer, mut client) = duplex(16);
-        peer.write_all(&[0x08, 0x33, 0x22, 0x11]).await.unwrap();
+        let (mut peer, client) = duplex(16);
+        peer.write_all(&[0x80, 0x11, 0x22, 0x33]).await.unwrap();
         peer.shutdown().await.unwrap();
-        let mut framebuffer = Framebuffer {
-            width: 1,
-            height: 1,
-            pixels: vec![0; 4],
-        };
+        let mut framebuffer = Framebuffer::new(1, 1, ProtocolLimits::default()).unwrap();
+        let mut reader = RfbReader::new(client, ProtocolLimits::default());
         tight::decode(
-            &mut client,
+            &mut reader,
             &mut framebuffer,
             decoder_pixel_format(),
             0,
@@ -1105,18 +975,18 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(framebuffer.pixels, [0x11, 0x22, 0x33, 0xff]);
+        assert_eq!(framebuffer.pixels(), [0x11, 0x22, 0x33, 0xff]);
     }
 
     #[test]
     fn framebuffer_pressure_coalesces_into_one_fixed_dirty_region() {
         let (sender, receiver) = bounded(1);
         let mut events = EventQueue::new(sender, ProtocolLimits::default());
-        let framebuffer = Framebuffer {
-            width: 2,
-            height: 2,
-            pixels: (0_u8..16).collect(),
-        };
+        let mut framebuffer = Framebuffer::new(2, 2, ProtocolLimits::default()).unwrap();
+        let whole = CheckedRect::new(0, 0, 2, 2, 2, 2).unwrap();
+        framebuffer
+            .write_rgba(whole, &(0_u8..16).collect::<Vec<_>>())
+            .unwrap();
 
         events.send_lossless(VncEvent::Disconnected).unwrap();
         events
@@ -1147,7 +1017,7 @@ mod tests {
         assert_eq!(rects.len(), 1);
         let rect = &rects[0];
         assert_eq!((rect.x, rect.y, rect.w, rect.h), (0, 0, 2, 2));
-        assert_eq!(rect.rgba, framebuffer.pixels);
+        assert_eq!(rect.rgba, framebuffer.pixels());
     }
 
     #[test]
