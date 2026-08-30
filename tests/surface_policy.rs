@@ -6,7 +6,16 @@ fn product_surface_excludes_removed_features_and_password_cli() {
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let main = fs::read_to_string(root.join("src/main.rs")).unwrap();
 
-    for forbidden in ["russh-sftp", "rfd =", "eax =", "aes =", "rsa ="] {
+    for forbidden in [
+        "russh-sftp",
+        "rfd =",
+        "eax =",
+        "aes =",
+        "rsa =",
+        "sha1 = \"0.10\"",
+        "sha2 = \"0.10\"",
+        "rand = \"0.8\"",
+    ] {
         assert!(
             !manifest.contains(forbidden),
             "forbidden dependency: {forbidden}"

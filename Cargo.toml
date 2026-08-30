@@ -31,9 +31,6 @@ crossbeam-channel = "0.5"
 byteorder = "1"
 arboard = "3"
 image = { version = "0.25", features = ["jpeg"] }
-sha1 = "0.10"
-sha2 = "0.10"
-rand = "0.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
