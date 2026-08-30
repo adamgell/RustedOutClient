@@ -1898,6 +1898,73 @@ mod input_tests {
     }
 
     #[test]
+    fn pointer_gone_keeps_last_position_until_remote_release_cleanup_is_accepted() {
+        let session_id = SessionId::new();
+        let image = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0));
+        let mut ownership = InputOwnership::for_session(session_id);
+        let mut actions = Vec::new();
+
+        collect_pointer_events(
+            session_id,
+            &[egui::Event::PointerButton {
+                pos: egui::pos2(50.0, 50.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+            image,
+            image,
+            (100, 100),
+            &mut ownership,
+            &mut actions,
+        );
+        assert_eq!(
+            actions,
+            [UiAction::Pointer {
+                session_id,
+                buttons: 1,
+                x: 50,
+                y: 50,
+            }]
+        );
+        ownership.begin_pointer_dispatch(session_id, 1, (50, 50));
+        ownership.acknowledge_pointer_dispatch(session_id, 1, DispatchOutcome::Sent);
+
+        actions.clear();
+        collect_pointer_events(
+            session_id,
+            &[egui::Event::PointerGone],
+            image,
+            image,
+            (100, 100),
+            &mut ownership,
+            &mut actions,
+        );
+        assert_eq!(
+            actions,
+            [UiAction::Pointer {
+                session_id,
+                buttons: 0,
+                x: 50,
+                y: 50,
+            }]
+        );
+        assert_eq!(ownership.pointer_buttons(), 0);
+
+        ownership.begin_pointer_dispatch(session_id, 0, (50, 50));
+        ownership.acknowledge_pointer_dispatch(session_id, 0, DispatchOutcome::Busy);
+        assert_eq!(
+            ownership.pending_cleanup_action(),
+            Some(UiAction::ReleaseOwnedInput {
+                session_id,
+                pointer_position: Some((50, 50)),
+            })
+        );
+        ownership.acknowledge_cleanup(DispatchOutcome::Sent);
+        assert!(ownership.is_clear());
+    }
+
+    #[test]
     fn every_supported_pointer_button_releases_on_the_original_session() {
         let outgoing = SessionId::new();
         let incoming = SessionId::new();
