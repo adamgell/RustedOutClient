@@ -1,7 +1,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use anyhow::Result;
+use clap::Parser;
 use rustedoutclient::app::RustedOutClient;
+use rustedoutclient::cli::Cli;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -10,6 +12,10 @@ fn main() -> Result<()> {
                 .add_directive(tracing::Level::INFO.into()),
         )
         .init();
+
+    if Cli::parse().command.is_some() {
+        anyhow::bail!("CLI commands are not wired until the session manager is available")
+    }
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
