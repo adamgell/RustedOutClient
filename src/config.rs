@@ -6,9 +6,9 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::model::{NodeName, PveProfile, ScaleMode, SshTarget, VmId};
@@ -17,7 +17,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 const MIN_INVENTORY_REFRESH_SECONDS: u64 = 5;
 const MAX_INVENTORY_REFRESH_SECONDS: u64 = 300;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct AppConfig {
     pub schema_version: u32,
     pub profile: PveProfile,
@@ -26,6 +26,17 @@ pub struct AppConfig {
     pub clipboard_enabled: bool,
     pub favorites: Vec<FavoriteVm>,
     pub display: DisplayPreferences,
+}
+
+#[derive(Deserialize)]
+struct RawAppConfig {
+    schema_version: u32,
+    profile: PveProfile,
+    inventory_refresh_seconds: u64,
+    fallback_viewer: Option<PathBuf>,
+    clipboard_enabled: bool,
+    favorites: Vec<FavoriteVm>,
+    display: DisplayPreferences,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,6 +62,10 @@ pub enum ConfigError {
     InvalidRefreshInterval,
     #[error("fallback viewer must be an absolute path")]
     RelativeFallbackViewer,
+    #[error("configuration directory must have mode 0700")]
+    InsecureConfigDirectory,
+    #[error("configuration file must have mode 0600")]
+    InsecureConfigFile,
     #[error("could not determine the home directory")]
     MissingHomeDirectory,
     #[error("configuration I/O failed: {0}")]
@@ -94,6 +109,30 @@ impl AppConfig {
 
         Ok(())
     }
+
+    fn from_raw(raw: RawAppConfig) -> Result<Self, ConfigError> {
+        let config = Self {
+            schema_version: raw.schema_version,
+            profile: raw.profile,
+            inventory_refresh_seconds: raw.inventory_refresh_seconds,
+            fallback_viewer: raw.fallback_viewer,
+            clipboard_enabled: raw.clipboard_enabled,
+            favorites: raw.favorites,
+            display: raw.display,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+impl<'de> Deserialize<'de> for AppConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        RawAppConfig::deserialize(deserializer)
+            .and_then(|raw| Self::from_raw(raw).map_err(de::Error::custom))
+    }
 }
 
 #[derive(Deserialize)]
@@ -135,8 +174,10 @@ pub fn default_config_path() -> Result<PathBuf, ConfigError> {
 }
 
 pub fn load_config_from_path(path: &Path) -> Result<AppConfig, ConfigError> {
+    let directory = parent_directory(path)?;
+    ensure_private_existing_directory(directory)?;
+    ensure_private_existing_file(path)?;
     let config: AppConfig = serde_json::from_slice(&fs::read(path)?)?;
-    config.validate()?;
     Ok(config)
 }
 
@@ -163,13 +204,9 @@ pub fn save_config_to_path_with_renamer(
 ) -> Result<(), ConfigError> {
     config.validate()?;
     let payload = serde_json::to_vec_pretty(config)?;
-    let directory = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "configuration path must have a parent directory",
-        )
-    })?;
+    let directory = parent_directory(path)?;
     ensure_private_directory(directory)?;
+    ensure_private_file_if_present(path)?;
 
     let (temporary_path, mut temporary_file) = create_temporary_file(directory, path)?;
     let result = (|| -> io::Result<()> {
@@ -188,10 +225,51 @@ pub fn save_config_to_path_with_renamer(
     result.map_err(ConfigError::Io)
 }
 
-fn ensure_private_directory(path: &Path) -> io::Result<()> {
+fn parent_directory(path: &Path) -> Result<&Path, ConfigError> {
+    path.parent().ok_or_else(|| {
+        ConfigError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configuration path must have a parent directory",
+        ))
+    })
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), ConfigError> {
+    match fs::metadata(path) {
+        Ok(_) => return ensure_private_existing_directory(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ConfigError::Io(error)),
+    }
+
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn ensure_private_existing_directory(path: &Path) -> Result<(), ConfigError> {
+    let metadata = fs::metadata(path)?;
+    #[cfg(unix)]
+    if metadata.mode() & 0o777 != 0o700 {
+        return Err(ConfigError::InsecureConfigDirectory);
+    }
+    Ok(())
+}
+
+fn ensure_private_file_if_present(path: &Path) -> Result<(), ConfigError> {
+    match fs::metadata(path) {
+        Ok(_) => ensure_private_existing_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ConfigError::Io(error)),
+    }
+}
+
+fn ensure_private_existing_file(path: &Path) -> Result<(), ConfigError> {
+    let metadata = fs::metadata(path)?;
+    #[cfg(unix)]
+    if metadata.mode() & 0o777 != 0o600 {
+        return Err(ConfigError::InsecureConfigFile);
+    }
     Ok(())
 }
 

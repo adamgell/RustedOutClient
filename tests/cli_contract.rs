@@ -11,6 +11,32 @@ fn cli_has_compatibility_commands_without_endpoint_or_secret_flags() {
 }
 
 #[test]
+fn cli_rejects_ticket_and_arbitrary_endpoint_flags() {
+    for arguments in [
+        &["rustedoutclient", "open", "107", "--ticket", "bad"][..],
+        &["rustedoutclient", "open", "107", "--port", "5900"][..],
+        &[
+            "rustedoutclient",
+            "probe",
+            "107",
+            "--endpoint",
+            "example.invalid",
+        ][..],
+        &[
+            "rustedoutclient",
+            "list",
+            "--ssh-target",
+            "root@example.invalid",
+        ][..],
+    ] {
+        assert!(
+            Cli::try_parse_from(arguments).is_err(),
+            "accepted: {arguments:?}"
+        );
+    }
+}
+
+#[test]
 fn cli_defaults_to_gui_native_open_and_thirty_second_probe() {
     assert!(Cli::try_parse_from(["rustedoutclient"])
         .unwrap()
