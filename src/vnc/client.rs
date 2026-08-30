@@ -600,9 +600,11 @@ impl VncClient {
         Self::run_inner(
             proxy,
             options,
-            event_tx,
-            command_rx,
-            ClipboardSlot::default(),
+            VncSessionChannels {
+                event_tx,
+                command_rx,
+                clipboard: ClipboardSlot::default(),
+            },
             false,
             std::future::pending(),
         )
@@ -616,35 +618,73 @@ impl VncClient {
         clipboard_enabled: bool,
         cancelled: oneshot::Receiver<()>,
     ) -> Result<(), RfbError> {
-        Self::run_inner(
-            proxy,
-            options,
-            channels.event_tx,
-            channels.command_rx,
-            channels.clipboard,
-            clipboard_enabled,
-            async move {
-                let _ = cancelled.await;
-            },
-        )
+        Self::run_inner(proxy, options, channels, clipboard_enabled, async move {
+            let _ = cancelled.await;
+        })
         .await
     }
 
     async fn run_inner<C>(
         proxy: TrustedSshProxy,
         options: VncOptions,
-        event_tx: Sender<VncEvent>,
-        command_rx: Receiver<VncCommand>,
-        clipboard: ClipboardSlot,
+        channels: VncSessionChannels,
         clipboard_enabled: bool,
         cancelled: C,
     ) -> Result<(), RfbError>
     where
         C: std::future::Future<Output = ()>,
     {
-        let limits = options.limits;
         let (stream, ticket) = proxy.into_parts();
+        let limits = options.limits;
+        let VncSessionChannels {
+            event_tx,
+            command_rx,
+            clipboard,
+        } = channels;
         let mut reader = RfbReader::new(stream, limits);
+        tokio::pin!(cancelled);
+        let result = {
+            let connected = run_connected(
+                &mut reader,
+                ticket,
+                options,
+                event_tx,
+                command_rx,
+                clipboard,
+                clipboard_enabled,
+            );
+            tokio::pin!(connected);
+            tokio::select! {
+                biased;
+                result = &mut connected => result,
+                () = &mut cancelled => Ok(()),
+            }
+        };
+        finish_session(reader, result).await
+    }
+
+    #[cfg(test)]
+    async fn run_test_stream<S>(
+        stream: S,
+        ticket: ProxyTicket,
+        options: VncOptions,
+        channels: VncSessionChannels,
+        clipboard_enabled: bool,
+        cancelled: oneshot::Receiver<()>,
+    ) -> Result<(), RfbError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let limits = options.limits;
+        let VncSessionChannels {
+            event_tx,
+            command_rx,
+            clipboard,
+        } = channels;
+        let mut reader = RfbReader::new(stream, limits);
+        let cancelled = async move {
+            let _ = cancelled.await;
+        };
         tokio::pin!(cancelled);
         let result = {
             let connected = run_connected(
@@ -1373,6 +1413,10 @@ where
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/rfb_peer.rs"]
+mod test_rfb_peer;
+
+#[cfg(test)]
 mod tests {
     use std::{
         io,
@@ -1381,19 +1425,26 @@ mod tests {
     };
 
     use crossbeam_channel::bounded;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::{
+        io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+        sync::oneshot,
+        time::{sleep, timeout, Duration},
+    };
 
     use super::{
         configure_server, decoder_pixel_format, finish_session, framebuffer_rects, run_session,
-        tight, EventQueue, TightState,
+        test_rfb_peer as rfb_peer, tight, EventQueue, TightState,
     };
     use crate::{
         connection::{
-            bounded_vnc_channels, ClipboardSlot, DesktopSize, FbRect, VncCommand, VncEvent,
+            bounded_vnc_channels, ClipboardSlot, DesktopSize, FbRect, ResizeProtocolOutcome,
+            VncCommand, VncEvent,
         },
+        ssh::ProxyTicket,
         vnc::{
             messages::{encoding as enc, server_msg},
-            CheckedRect, Framebuffer, ProtocolLimits, RfbError, RfbErrorKind, RfbPhase, RfbReader,
+            CheckedRect, Framebuffer, InputController, ProtocolLimits, RfbError, RfbErrorKind,
+            RfbPhase, RfbReader, VncClient, VncOptions, CLIPBOARD_TEXT_LIMIT,
         },
     };
 
@@ -2143,5 +2194,298 @@ mod tests {
         let error = events.send_lossless(error_event).unwrap_err();
         assert_eq!(error.phase(), RfbPhase::EventQueue);
         assert_eq!(error.kind(), RfbErrorKind::Queue);
+    }
+
+    async fn next_event(
+        connection: &crate::connection::VncConnection,
+    ) -> crate::connection::VncEvent {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(event) = connection.event_rx.try_recv() {
+                    return event;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("synthetic peer did not produce a client event")
+    }
+
+    async fn wait_for_non_black_frame(
+        connection: &crate::connection::VncConnection,
+    ) -> Vec<FbRect> {
+        loop {
+            if let VncEvent::FramebufferRects(rects) = next_event(connection).await {
+                assert!(rects.iter().any(|rect| {
+                    rect.rgba
+                        .chunks_exact(4)
+                        .any(|pixel| pixel[..3] != [0, 0, 0])
+                }));
+                return rects;
+            }
+        }
+    }
+
+    fn fixed_test_ticket() -> ProxyTicket {
+        ProxyTicket::for_auth_test_with_drop_signal("password").0
+    }
+
+    #[tokio::test]
+    async fn deterministic_rfb_peer_authenticates_and_decodes_every_supported_image_encoding() {
+        for encoding in rfb_peer::EncodingCase::ALL {
+            let (client_stream, peer_stream) = duplex(2 * 1024 * 1024);
+            let (connection, channels) = bounded_vnc_channels();
+            let capture = rfb_peer::PeerCapture::default();
+            let peer_capture = capture.clone();
+            let peer = tokio::spawn(rfb_peer::run_peer(
+                peer_stream,
+                rfb_peer::PeerBehavior::Valid {
+                    encoding,
+                    resize_reply: rfb_peer::ResizeReply::None,
+                },
+                peer_capture,
+            ));
+            let (cancel, cancelled) = oneshot::channel();
+            let client = tokio::spawn(VncClient::run_test_stream(
+                client_stream,
+                fixed_test_ticket(),
+                VncOptions::default(),
+                channels,
+                false,
+                cancelled,
+            ));
+
+            let rects = wait_for_non_black_frame(&connection).await;
+            assert!(
+                !rects.is_empty(),
+                "{encoding:?} produced no dirty rectangle"
+            );
+            assert!(
+                capture.auth_valid(),
+                "{encoding:?} did not validate DES auth"
+            );
+            let facts = capture.messages();
+            assert!(facts.iter().any(|fact| matches!(
+                fact,
+                rfb_peer::ClientMessageFact::SetEncodings(encodings)
+                    if encodings == &[16, 5, 1, 0, -223, -308, 7]
+            )));
+
+            let _ = cancel.send(());
+            timeout(Duration::from_secs(2), client)
+                .await
+                .expect("client task retained after cancellation")
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(2), peer)
+                .await
+                .expect("peer task retained after cancellation")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_records_bounded_semantic_input_update_clipboard_and_resize_facts_without_payloads(
+    ) {
+        use rfb_peer::ClientMessageFact as Fact;
+
+        let (client_stream, peer_stream) = duplex(2 * 1024 * 1024);
+        let (connection, channels) = bounded_vnc_channels();
+        let capture = rfb_peer::PeerCapture::default();
+        let peer = tokio::spawn(rfb_peer::run_peer(
+            peer_stream,
+            rfb_peer::PeerBehavior::Valid {
+                encoding: rfb_peer::EncodingCase::Raw,
+                resize_reply: rfb_peer::ResizeReply::Apply,
+            },
+            capture.clone(),
+        ));
+        let (cancel, cancelled) = oneshot::channel();
+        let client = tokio::spawn(VncClient::run_test_stream(
+            client_stream,
+            fixed_test_ticket(),
+            VncOptions::default(),
+            channels,
+            true,
+            cancelled,
+        ));
+        wait_for_non_black_frame(&connection).await;
+
+        let mut input =
+            InputController::for_connection(connection, false, true, CLIPBOARD_TEXT_LIMIT).unwrap();
+        input.mark_ready();
+        input.pointer(1, 10, 20).unwrap();
+        input.key(true, 0x41).unwrap();
+        input.ctrl_alt_delete().unwrap();
+        input.release_owned_input(Some((11, 21))).unwrap();
+        input.key(true, 0x42).unwrap();
+        input.release_all_keys().unwrap();
+        input
+            .send_clipboard("bounded synthetic clipboard".to_owned())
+            .unwrap();
+
+        for requested in [DesktopSize::new(1600, 896), DesktopSize::new(1920, 1080)] {
+            input.connection().request_desktop_size(requested).unwrap();
+            let mut forwarded = false;
+            let mut applied = false;
+            timeout(Duration::from_secs(2), async {
+                while !(forwarded && applied) {
+                    match next_event(input.connection()).await {
+                        VncEvent::ResizeOutcome(ResizeProtocolOutcome::Forwarded(size))
+                            if size == requested =>
+                        {
+                            forwarded = true;
+                        }
+                        VncEvent::DesktopSize(size) if size == requested => applied = true,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("resize lifecycle did not reach forwarded and applied");
+        }
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let facts = capture.messages();
+                if facts
+                    .iter()
+                    .filter(|fact| matches!(fact, Fact::SetDesktopSize { .. }))
+                    .count()
+                    == 2
+                    && facts
+                        .iter()
+                        .any(|fact| matches!(fact, Fact::ClipboardLength(27)))
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("bounded peer capture did not observe all client messages");
+
+        let facts = capture.messages();
+        let cad = [
+            Fact::Key {
+                down: true,
+                keysym: 0xffe3,
+            },
+            Fact::Key {
+                down: true,
+                keysym: 0xffe9,
+            },
+            Fact::Key {
+                down: true,
+                keysym: 0xffff,
+            },
+            Fact::Key {
+                down: false,
+                keysym: 0xffff,
+            },
+            Fact::Key {
+                down: false,
+                keysym: 0xffe9,
+            },
+            Fact::Key {
+                down: false,
+                keysym: 0xffe3,
+            },
+        ];
+        assert!(facts.windows(cad.len()).any(|window| window == cad));
+        assert!(facts.contains(&Fact::Pointer {
+            buttons: 1,
+            x: 10,
+            y: 20,
+        }));
+        assert!(facts.contains(&Fact::Pointer {
+            buttons: 0,
+            x: 11,
+            y: 21,
+        }));
+        assert!(facts.contains(&Fact::Key {
+            down: false,
+            keysym: 0x41,
+        }));
+        assert!(facts.contains(&Fact::Key {
+            down: false,
+            keysym: 0x42,
+        }));
+        assert!(facts.contains(&Fact::ClipboardLength(27)));
+        assert!(facts.iter().any(|fact| matches!(
+            fact,
+            Fact::UpdateRequest {
+                width: 64,
+                height: 64,
+                ..
+            }
+        )));
+        assert!(facts.contains(&Fact::SetDesktopSize {
+            width: 1600,
+            height: 896,
+            screens: 1,
+        }));
+        assert!(facts.contains(&Fact::SetDesktopSize {
+            width: 1920,
+            height: 1080,
+            screens: 1,
+        }));
+        assert!(facts.len() <= 128);
+        assert!(!format!("{facts:?}").contains("bounded synthetic clipboard"));
+
+        let _ = cancel.send(());
+        timeout(Duration::from_secs(2), client)
+            .await
+            .expect("input client task retained after cancellation")
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("input peer task retained after cancellation")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_malformed_peer_cases_fail_finitely_with_typed_errors_and_no_retained_task() {
+        for malformed in rfb_peer::MalformedCase::ALL {
+            let (client_stream, peer_stream) = duplex(2 * 1024 * 1024);
+            let (_connection, channels) = bounded_vnc_channels();
+            let peer = tokio::spawn(rfb_peer::run_peer(
+                peer_stream,
+                rfb_peer::PeerBehavior::Malformed(malformed),
+                rfb_peer::PeerCapture::default(),
+            ));
+            let (_cancel, cancelled) = oneshot::channel::<()>();
+            let client = tokio::spawn(VncClient::run_test_stream(
+                client_stream,
+                fixed_test_ticket(),
+                VncOptions::default(),
+                channels,
+                false,
+                cancelled,
+            ));
+
+            let error = timeout(Duration::from_secs(2), client)
+                .await
+                .expect("malformed client case did not terminate")
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                RfbErrorKind::ProtocolBanner
+                    | RfbErrorKind::Protocol
+                    | RfbErrorKind::SecurityFailure
+                    | RfbErrorKind::SecurityAllowlist
+                    | RfbErrorKind::Decoder
+                    | RfbErrorKind::Io
+            ));
+            timeout(Duration::from_secs(2), peer)
+                .await
+                .expect("malformed peer task did not terminate")
+                .unwrap()
+                .unwrap();
+        }
     }
 }

@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::{
     config::AppConfig,
     connection::FbRect,
+    diagnostics::{ChildExitStatus, DiagnosticFailure, DiagnosticRecord, PhaseTiming},
     model::{ScaleMode, VmId},
     session::{
         AppEvent, DesktopSize, OpenOptions, PublicErrorKind, SessionId, SessionPhase,
@@ -351,6 +352,9 @@ pub struct SessionTabState {
     pub last_error: Option<PublicErrorKind>,
     pub last_input_error: Option<InputError>,
     phase_history: Vec<SessionPhase>,
+    phase_timings: Vec<PhaseTiming>,
+    child_exit_status: Option<ChildExitStatus>,
+    last_cleanup_failed: bool,
     framebuffer: Option<FramebufferImage>,
 }
 
@@ -424,6 +428,7 @@ pub struct AppState {
     selected_session: Option<SessionId>,
     queue_status: QueueStatus,
     last_error: Option<PublicErrorKind>,
+    last_cleanup_failed: bool,
     fullscreen: bool,
     diagnostics_open: bool,
 }
@@ -456,6 +461,7 @@ impl AppState {
             selected_session: None,
             queue_status: QueueStatus::Ready,
             last_error: None,
+            last_cleanup_failed: false,
             fullscreen: false,
             diagnostics_open: false,
         }
@@ -486,6 +492,7 @@ impl AppState {
             selected_session: None,
             queue_status: QueueStatus::Disconnected,
             last_error: None,
+            last_cleanup_failed: false,
             fullscreen: false,
             diagnostics_open: false,
         }
@@ -739,6 +746,10 @@ impl AppState {
         self.fullscreen = !self.fullscreen;
     }
 
+    pub(crate) fn set_fullscreen(&mut self, fullscreen: bool) {
+        self.fullscreen = fullscreen;
+    }
+
     pub fn fullscreen(&self) -> bool {
         self.fullscreen
     }
@@ -791,8 +802,28 @@ impl AppState {
                     tab.last_input_error = Some(reason);
                 }
             }
+            AppEvent::PhaseTiming { session_id, timing } => {
+                let tab = self
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.snapshot.session_id == session_id)
+                    .ok_or(AppStateError::UnknownSession)?;
+                if tab.phase_timings.len() == 16 {
+                    tab.phase_timings.remove(0);
+                }
+                tab.phase_timings.push(timing);
+            }
+            AppEvent::ChildExitStatus { session_id, status } => {
+                let tab = self
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.snapshot.session_id == session_id)
+                    .ok_or(AppStateError::UnknownSession)?;
+                tab.child_exit_status = Some(status);
+            }
             AppEvent::Error(error) => {
                 self.last_error = Some(error.kind());
+                self.last_cleanup_failed = error.has_cleanup_failure();
                 if error.kind() != PublicErrorKind::Queue {
                     if let Some(session_id) = error.session_id() {
                         if let Some(tab) = self
@@ -801,6 +832,7 @@ impl AppState {
                             .find(|tab| tab.snapshot.session_id == session_id)
                         {
                             tab.last_error = Some(error.kind());
+                            tab.last_cleanup_failed = error.has_cleanup_failure();
                         }
                     }
                 }
@@ -834,6 +866,7 @@ impl AppState {
             }
             if tab.snapshot.phase == SessionPhase::Ready {
                 tab.last_error = None;
+                tab.last_cleanup_failed = false;
             }
         } else {
             self.tabs
@@ -867,6 +900,9 @@ impl AppState {
                 clipboard_status,
                 last_error: None,
                 last_input_error: None,
+                phase_timings: Vec::new(),
+                child_exit_status: None,
+                last_cleanup_failed: false,
                 framebuffer,
             });
             self.selected_session = Some(session_id);
@@ -914,47 +950,47 @@ impl AppState {
         self.favorites.iter().find(|favorite| favorite.vmid == vmid)
     }
 
+    pub fn diagnostic_record(&self) -> DiagnosticRecord {
+        let node = crate::model::NodeName::parse(self.node_name.clone())
+            .unwrap_or_else(|_| crate::model::NodeName::parse("unconfigured").unwrap());
+        let selected = self.selected_session();
+        let (vmid, phases, child_exit_status, selected_failure) =
+            selected.map_or((None, Vec::new(), None, None), |tab| {
+                (
+                    Some(tab.snapshot.vmid),
+                    tab.phase_timings.clone(),
+                    tab.child_exit_status,
+                    tab.last_error.map(|kind| {
+                        let error = if tab.last_cleanup_failed {
+                            crate::session::PublicError::new(kind).with_cleanup_failure()
+                        } else {
+                            crate::session::PublicError::new(kind)
+                        };
+                        DiagnosticFailure::from_public(error)
+                    }),
+                )
+            });
+        let failure = selected_failure.or_else(|| {
+            self.last_error.map(|kind| {
+                let error = if self.last_cleanup_failed {
+                    crate::session::PublicError::new(kind).with_cleanup_failure()
+                } else {
+                    crate::session::PublicError::new(kind)
+                };
+                DiagnosticFailure::from_public(error)
+            })
+        });
+        DiagnosticRecord::new(
+            self.profile_name.clone(),
+            node,
+            vmid,
+            phases,
+            child_exit_status,
+            failure,
+        )
+    }
+
     pub fn diagnostics_summary(&self) -> String {
-        let mut lines = vec![
-            format!("RustedOutClient {}", env!("CARGO_PKG_VERSION")),
-            format!(
-                "Upstream base: {}",
-                "999e00e3a3672efdbf8e8f307e7bd60875dee67e"
-            ),
-            format!(
-                "Platform: {}/{}",
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            ),
-            format!("Profile: {}", self.profile_name),
-            format!("Node: {}", self.node_name),
-        ];
-        if let Some((observed, stale)) = self.inventory_age_source() {
-            lines.push(format!(
-                "Inventory: {} at {observed}",
-                if stale { "stale" } else { "live" }
-            ));
-        }
-        if let Some(tab) = self.selected_session() {
-            lines.push(format!("VMID: {}", tab.snapshot.vmid));
-            if let Some(name) = self.vm_name(tab.snapshot.vmid) {
-                lines.push(format!("VM name: {name}"));
-            }
-            lines.push(format!("Phase: {:?}", tab.snapshot.phase));
-            lines.push(format!("Phase history: {:?}", tab.phase_history));
-            lines.push(format!("Scale mode: {:?}", tab.scale_mode));
-            lines.push(format!("View only: {}", tab.snapshot.view_only));
-            if let Some(size) = tab.snapshot.guest_size {
-                lines.push(format!("Guest size: {}x{}", size.width, size.height));
-            }
-            lines.push(format!("Resize state: {:?}", tab.snapshot.resize_status));
-            if let Some(error) = tab.last_error {
-                lines.push(format!("Error category: {error:?}"));
-            }
-        }
-        if let Some(error) = self.last_error {
-            lines.push(format!("Last app error category: {error:?}"));
-        }
-        lines.join("\n")
+        self.diagnostic_record().to_text()
     }
 }

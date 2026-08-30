@@ -94,7 +94,7 @@ impl ProxyTicket {
     }
 
     #[cfg(test)]
-    fn test_generation_count() -> usize {
+    pub(crate) fn test_generation_count() -> usize {
         PROXY_TICKET_GENERATIONS.load(Ordering::SeqCst)
     }
 }

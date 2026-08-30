@@ -1,5 +1,6 @@
 use crate::{
     connection::FbRect,
+    diagnostics::{ChildExitStatus, PhaseTiming},
     fallback::FallbackPreferences,
     model::VmId,
     ssh::InventorySnapshot,
@@ -102,6 +103,14 @@ pub enum AppEvent {
     InputRejected {
         session_id: SessionId,
         reason: InputError,
+    },
+    PhaseTiming {
+        session_id: SessionId,
+        timing: PhaseTiming,
+    },
+    ChildExitStatus {
+        session_id: SessionId,
+        status: ChildExitStatus,
     },
     Error(PublicError),
 }

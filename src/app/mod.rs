@@ -8,8 +8,11 @@ use eframe::egui;
 use tokio::sync::mpsc;
 
 use crate::{
+    cli::{StartupRequest, ViewerMode},
     config::{default_config_path, load_config_from_path, AppConfig},
+    fallback::FallbackPreferences,
     session::{AppCommand, PublicError, PublicErrorKind, SessionManager, SessionPhase},
+    ssh::VmStatus,
 };
 
 pub use actions::{
@@ -20,6 +23,70 @@ pub use state::{
     AppState, AppStateError, BackingViewport, ClipboardStatus, FramebufferImage, FramebufferUpload,
     FramebufferUploadKind, InventoryRow, QueueStatus, SessionTabState, SetupState, UiEffect,
 };
+
+pub struct StartupCoordinator {
+    request: Option<StartupRequest>,
+}
+
+impl StartupCoordinator {
+    pub fn new(request: StartupRequest) -> Self {
+        Self {
+            request: Some(request),
+        }
+    }
+
+    pub fn observe(
+        &mut self,
+        event: &crate::session::AppEvent,
+        fallback_configured: bool,
+    ) -> Option<Result<AppCommand, PublicError>> {
+        let crate::session::AppEvent::LiveInventory(snapshot) = event else {
+            return None;
+        };
+        let request = self.request.take()?;
+        let selected = match snapshot.select(request.selector()) {
+            Ok(selected) => selected,
+            Err(_) => return Some(Err(PublicError::new(PublicErrorKind::VmNotFound))),
+        };
+        if selected.status != VmStatus::Running {
+            return Some(Err(PublicError::new(PublicErrorKind::VmNotRunning)));
+        }
+        match request.viewer() {
+            ViewerMode::Native => {
+                let options = crate::session::OpenOptions {
+                    view_only: request.view_only(),
+                    ..crate::session::OpenOptions::default()
+                };
+                Some(Ok(AppCommand::Open {
+                    vmid: selected.vmid,
+                    options,
+                }))
+            }
+            ViewerMode::TigerVnc if fallback_configured => Some(Ok(AppCommand::OpenInTigerVnc {
+                vmid: selected.vmid,
+                preferences: FallbackPreferences {
+                    fullscreen: request.fullscreen(),
+                    view_only: request.view_only(),
+                },
+            })),
+            ViewerMode::TigerVnc => Some(Err(PublicError::new(PublicErrorKind::ViewerFallback))),
+        }
+    }
+}
+
+fn configured_startup_command(state: &AppState, command: AppCommand) -> AppCommand {
+    match command {
+        AppCommand::Open { vmid, options } => {
+            let mut configured = state.open_options(vmid);
+            configured.view_only = options.view_only;
+            AppCommand::Open {
+                vmid,
+                options: configured,
+            }
+        }
+        command => command,
+    }
+}
 
 struct DisconnectedSink;
 
@@ -111,18 +178,33 @@ pub struct RustedOutClient {
     clipboard: Box<dyn ClipboardAdapter>,
     view: view::ViewResources,
     close: CloseCoordinator,
+    startup: Option<StartupCoordinator>,
 }
 
 impl RustedOutClient {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::new_with_startup(cc, None)
+    }
+
+    pub fn new_with_startup(
+        cc: &eframe::CreationContext<'_>,
+        startup_request: Option<StartupRequest>,
+    ) -> Self {
         view::configure_visuals(&cc.egui_ctx);
-        let (state, manager) = load_application();
+        let (mut state, manager) = load_application();
+        if startup_request
+            .as_ref()
+            .is_some_and(StartupRequest::fullscreen)
+        {
+            state.set_fullscreen(true);
+        }
         Self {
             state,
             manager,
             clipboard: Box::<SystemClipboard>::default(),
             view: view::ViewResources::default(),
             close: CloseCoordinator::default(),
+            startup: startup_request.map(StartupCoordinator::new),
         }
     }
 
@@ -134,6 +216,9 @@ impl RustedOutClient {
         for _ in 0..crate::session::APP_QUEUE_CAPACITY {
             match manager.try_recv() {
                 Ok(event) => {
+                    let startup_command = self.startup.as_mut().and_then(|startup| {
+                        startup.observe(&event, self.state.fallback_configured())
+                    });
                     match self.state.apply(event) {
                         Ok(effects) => {
                             apply_ui_effects(&mut self.state, &mut *self.clipboard, effects);
@@ -142,6 +227,21 @@ impl RustedOutClient {
                             let _ = self.state.apply(crate::session::AppEvent::Error(
                                 PublicError::new(PublicErrorKind::RfbLimit),
                             ));
+                        }
+                    }
+                    if let Some(startup_command) = startup_command {
+                        match startup_command {
+                            Ok(command) => {
+                                let command = configured_startup_command(&self.state, command);
+                                if manager.try_send(command).is_err() {
+                                    let _ = self.state.apply(crate::session::AppEvent::Error(
+                                        PublicError::new(PublicErrorKind::Queue),
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                let _ = self.state.apply(crate::session::AppEvent::Error(error));
+                            }
                         }
                     }
                 }
@@ -310,9 +410,41 @@ mod close_coordinator_tests {
 
     use super::view::ViewResources;
     use super::{
-        dispatch_rendered_actions, AppCommand, AppCommandSink, AppState, ClipboardAdapter,
-        ClipboardAdapterError, CloseCoordinator, CommandQueueError, NativeCloseAction, UiAction,
+        configured_startup_command, dispatch_rendered_actions, AppCommand, AppCommandSink,
+        AppState, ClipboardAdapter, ClipboardAdapterError, CloseCoordinator, CommandQueueError,
+        NativeCloseAction, UiAction,
     };
+
+    #[test]
+    fn native_startup_preserves_configured_clipboard_while_honoring_explicit_view_only() {
+        let mut config = AppConfig::new(PveProfile {
+            name: "Synthetic lab".to_owned(),
+            ssh_target: SshTarget::parse("root@pve.example.invalid").unwrap(),
+            node: NodeName::parse("pve2").unwrap(),
+        });
+        config.clipboard_enabled = true;
+        config.display.view_only = true;
+        let state = AppState::from_config(&config);
+        let selected = VmId::new(107).unwrap();
+
+        let command = configured_startup_command(
+            &state,
+            AppCommand::Open {
+                vmid: selected,
+                options: crate::session::OpenOptions::default(),
+            },
+        );
+
+        match command {
+            AppCommand::Open { vmid, options } => {
+                assert_eq!(vmid, selected);
+                assert!(options.clipboard_enabled);
+                assert!(!options.view_only);
+                assert!(options.dynamic_resolution);
+            }
+            _ => panic!("native startup command changed transport"),
+        }
+    }
     use crate::{
         config::AppConfig,
         model::{NodeName, PveProfile, SshTarget, VmId},

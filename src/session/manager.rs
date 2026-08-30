@@ -17,6 +17,7 @@ use crate::{
     cache::{CacheError, InventoryCache},
     config::AppConfig,
     connection::{bounded_vnc_channels, VncConnection, VncEvent},
+    diagnostics::PhaseTiming,
     fallback::{
         FallbackError, FallbackErrorKind, FallbackPreferences, FallbackSession, TigerVncFallback,
     },
@@ -198,6 +199,7 @@ struct SessionRecord<S> {
     session: Option<S>,
     error_emitted: bool,
     resize: ResizePolicy,
+    phase_started: Instant,
 }
 
 struct FallbackRecord {
@@ -449,6 +451,7 @@ where
             session: None,
             error_emitted: false,
             resize: ResizePolicy::new(options.dynamic_resolution),
+            phase_started: Instant::now(),
         });
         let index = self.sessions.len() - 1;
         self.emit_critical(AppEvent::SessionChanged(snapshot)).await;
@@ -955,6 +958,8 @@ where
     }
 
     async fn transition(&mut self, index: usize, phase: SessionPhase) {
+        let previous = self.sessions[index].snapshot.phase;
+        let transitioned_at = Instant::now();
         if self.sessions[index].snapshot.transition_to(phase).is_err() {
             let snapshot = &self.sessions[index].snapshot;
             let error = PublicError::new(PublicErrorKind::Cleanup)
@@ -965,6 +970,14 @@ where
             }
             return;
         }
+        let timing = PhaseTiming::new(
+            previous,
+            transitioned_at.saturating_duration_since(self.sessions[index].phase_started),
+        );
+        self.sessions[index].phase_started = transitioned_at;
+        let session_id = self.sessions[index].snapshot.session_id;
+        self.emit_critical(AppEvent::PhaseTiming { session_id, timing })
+            .await;
         let snapshot = self.sessions[index].snapshot.clone();
         self.emit_critical(AppEvent::SessionChanged(snapshot)).await;
     }
@@ -1556,8 +1569,8 @@ mod tests {
             SessionTransportEvent,
         },
         ssh::{
-            InventorySnapshot, SshCommandFactory, SshMaster, TrustedSshProxy, VmInventoryItem,
-            VmStatus,
+            InventorySnapshot, ProxyTicket, SshCommandFactory, SshMaster, TrustedSshProxy,
+            VmInventoryItem, VmStatus,
         },
         vnc::{
             ClipboardText, InputController, RfbError, RfbErrorKind, RfbPhase, CLIPBOARD_TEXT_LIMIT,
@@ -2676,6 +2689,17 @@ mod tests {
         ] {
             assert_production_key_release_wire_order(case).await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_reconnect_generates_two_fresh_tickets_without_exposing_their_values() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let before = ProxyTicket::test_generation_count();
+
+        assert_production_key_release_wire_order(ProductionCloseCase::Reconnect).await;
+
+        assert_eq!(ProxyTicket::test_generation_count(), before + 2);
     }
 
     #[cfg(unix)]

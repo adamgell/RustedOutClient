@@ -184,7 +184,7 @@ impl PublicError {
         self.with_public_context(session_id, vmid)
     }
 
-    pub(crate) fn with_cleanup_failure(mut self) -> Self {
+    pub fn with_cleanup_failure(mut self) -> Self {
         self.cleanup_failed = true;
         self
     }
