@@ -326,12 +326,64 @@ fn release_all_attempts_every_key_and_clears_tracking_after_failures() {
 }
 
 #[test]
+fn release_owned_input_attempts_pointer_and_all_keys_returns_first_error_and_clears_tracking() {
+    let sink = RecordingSink::default().fail_with([
+        (3, InputError::QueueUnavailable),
+        (4, InputError::ClipboardDisabled),
+    ]);
+    let mut controller = ready_controller(sink.clone(), false, false);
+    controller.key(true, 1).unwrap();
+    controller.key(true, 2).unwrap();
+
+    assert_eq!(
+        controller
+            .release_owned_input(Some((123, 234)))
+            .unwrap_err(),
+        InputError::QueueUnavailable,
+        "the pointer failure is returned after key cleanup is still attempted"
+    );
+    assert_eq!(
+        sink.attempts(),
+        [
+            Attempt::Key {
+                down: true,
+                keysym: 1,
+            },
+            Attempt::Key {
+                down: true,
+                keysym: 2,
+            },
+            Attempt::Pointer {
+                buttons: 0,
+                x: 123,
+                y: 234,
+            },
+            Attempt::Key {
+                down: false,
+                keysym: 2,
+            },
+            Attempt::Key {
+                down: false,
+                keysym: 1,
+            },
+        ]
+    );
+
+    controller.release_owned_input(None).unwrap();
+    assert_eq!(
+        sink.attempts().len(),
+        5,
+        "failed key releases must still clear bounded tracking"
+    );
+}
+
+#[test]
 fn focus_loss_and_view_only_activation_release_keys_and_view_only_sticks_on_error() {
     let sink = RecordingSink::default().fail_with([(4, InputError::QueueUnavailable)]);
     let mut controller = ready_controller(sink.clone(), false, false);
 
     controller.key(true, 1).unwrap();
-    controller.focus_lost().unwrap();
+    controller.release_owned_input(None).unwrap();
     controller.key(true, 2).unwrap();
     assert_eq!(
         controller.set_view_only(true).unwrap_err(),
@@ -387,7 +439,7 @@ fn interactive_actions_are_gated_but_release_all_is_always_available() {
         InputError::NotReady
     );
     controller.release_all_keys().unwrap();
-    controller.release_pointer(10, 20).unwrap();
+    controller.release_owned_input(Some((10, 20))).unwrap();
     assert_eq!(
         sink.attempts(),
         [Attempt::Pointer {
@@ -421,7 +473,7 @@ fn interactive_actions_are_gated_but_release_all_is_always_available() {
         InputError::ViewOnly
     );
     controller.release_all_keys().unwrap();
-    controller.release_pointer(30, 40).unwrap();
+    controller.release_owned_input(Some((30, 40))).unwrap();
     assert_eq!(
         sink.attempts(),
         [
@@ -543,15 +595,15 @@ fn public_input_actions_are_semantic_and_clipboard_payloads_are_not_debuggable()
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/ui/raw_input_forward.rs");
     cases.compile_fail("tests/ui/clipboard_debug.rs");
+    cases.compile_fail("tests/ui/legacy_split_cleanup.rs");
 
     fn assert_reviewed_semantic_action(action: InputAction) {
         match action {
             InputAction::Key { .. }
             | InputAction::Pointer { .. }
-            | InputAction::ReleasePointer { .. }
+            | InputAction::ReleaseOwnedInput { .. }
             | InputAction::CtrlAltDelete
             | InputAction::ReleaseAllKeys
-            | InputAction::FocusLost
             | InputAction::SetViewOnly(_)
             | InputAction::SendClipboard(_)
             | InputAction::ReceiveClipboard => {}
@@ -568,10 +620,11 @@ fn public_input_actions_are_semantic_and_clipboard_payloads_are_not_debuggable()
             x: 0,
             y: 0,
         },
-        InputAction::ReleasePointer { x: 0, y: 0 },
+        InputAction::ReleaseOwnedInput {
+            pointer_position: Some((0, 0)),
+        },
         InputAction::CtrlAltDelete,
         InputAction::ReleaseAllKeys,
-        InputAction::FocusLost,
         InputAction::SetViewOnly(true),
         InputAction::SendClipboard(String::new()),
         InputAction::ReceiveClipboard,

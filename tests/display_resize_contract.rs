@@ -695,7 +695,11 @@ async fn off_on_and_retry_do_not_replace_an_unanswered_transmitted_resize() {
         snapshot.session_id == session_id && snapshot.resize_status == ResizeStatus::TimedOut
     })
     .await;
-    assert_eq!(control.resize_requests(), [size(1_600, 896)]);
+    assert_eq!(
+        control.resize_requests(),
+        [size(1_600, 896), size(1_920, 1_080)],
+        "the Retry armed while Awaiting is released once Forwarded times out"
+    );
 
     manager
         .send(AppCommand::RetryDynamicResolution { session_id })
@@ -706,7 +710,8 @@ async fn off_on_and_retry_do_not_replace_an_unanswered_transmitted_resize() {
     settle().await;
     assert_eq!(
         control.resize_requests(),
-        [size(1_600, 896), size(1_920, 1_080)]
+        [size(1_600, 896), size(1_920, 1_080)],
+        "Retry while the replacement is in flight must not create a third request"
     );
     manager.shutdown().await.unwrap();
 }
@@ -1032,6 +1037,288 @@ async fn server_unsupported_geometry_updates_size_and_capability_without_an_in_f
     assert_eq!(unsupported.guest_size, Some(size(1_600, 900)));
     assert_eq!(unsupported.phase, SessionPhase::Ready);
     assert!(control.resize_requests().is_empty());
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn server_unsupported_geometry_does_not_consume_an_awaiting_client_request() {
+    let control = FakeControl::default();
+    let mut manager = SessionManager::spawn(
+        app_config(),
+        FakeBackend {
+            control: control.clone(),
+        },
+    );
+    settle().await;
+    drain(&mut manager);
+    let session_id = open_ready_session(&mut manager, &control, OpenOptions::default()).await;
+    drain(&mut manager);
+    let original = size(1_600, 896);
+    let replacement = size(1_920, 1_080);
+
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_600,
+            backing_height: 900,
+        })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    assert_eq!(control.resize_requests(), [original]);
+
+    control.push_event(SessionTransportEvent::DesktopSize(size(1_360, 768)));
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::ServerUnsupported,
+    ));
+    poll_worker().await;
+    poll_worker().await;
+    let unsupported = wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id
+            && snapshot.guest_size == Some(size(1_360, 768))
+            && snapshot.resize_status == ResizeStatus::Unsupported
+    })
+    .await;
+    assert_eq!(unsupported.phase, SessionPhase::Ready);
+
+    for _ in 0..3 {
+        manager
+            .send(AppCommand::ViewportChanged {
+                session_id,
+                backing_width: 1_920,
+                backing_height: 1_080,
+            })
+            .await
+            .unwrap();
+        manager
+            .send(AppCommand::RetryDynamicResolution { session_id })
+            .await
+            .unwrap();
+    }
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    assert_eq!(
+        control.resize_requests(),
+        [original],
+        "server layout capability must not free the old client wire slot"
+    );
+
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::Rejected,
+    ));
+    poll_worker().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id
+            && snapshot.resize_status == ResizeStatus::Requested(replacement)
+    })
+    .await;
+    assert_eq!(
+        control.resize_requests(),
+        [original, replacement],
+        "the late old response is consumed before one newest replacement is issued"
+    );
+    manager.shutdown().await.unwrap();
+}
+
+#[derive(Clone, Copy)]
+enum DisabledResizeEvent {
+    Forwarded,
+    Rejected,
+    Unsupported,
+    ServerUnsupported,
+    MatchingDesktopSize,
+    Timeout,
+}
+
+#[tokio::test(start_paused = true)]
+async fn disabled_status_has_priority_over_every_late_resize_event_then_reprojects_on_enable() {
+    for (late_event, expected_when_enabled) in [
+        (
+            DisabledResizeEvent::Forwarded,
+            ResizeStatus::Pending(size(1_600, 896)),
+        ),
+        (DisabledResizeEvent::Rejected, ResizeStatus::Rejected),
+        (DisabledResizeEvent::Unsupported, ResizeStatus::Unsupported),
+        (
+            DisabledResizeEvent::ServerUnsupported,
+            ResizeStatus::Unsupported,
+        ),
+        (
+            DisabledResizeEvent::MatchingDesktopSize,
+            ResizeStatus::Applied(size(1_600, 896)),
+        ),
+        (DisabledResizeEvent::Timeout, ResizeStatus::TimedOut),
+    ] {
+        let control = FakeControl::default();
+        let mut manager = SessionManager::spawn(
+            app_config(),
+            FakeBackend {
+                control: control.clone(),
+            },
+        );
+        settle().await;
+        drain(&mut manager);
+        let session_id = open_ready_session(&mut manager, &control, OpenOptions::default()).await;
+        drain(&mut manager);
+
+        manager
+            .send(AppCommand::ViewportChanged {
+                session_id,
+                backing_width: 1_600,
+                backing_height: 900,
+            })
+            .await
+            .unwrap();
+        settle().await;
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
+        settle().await;
+        assert_eq!(control.resize_requests(), [size(1_600, 896)]);
+        manager
+            .send(AppCommand::SetDynamicResolution {
+                session_id,
+                enabled: false,
+            })
+            .await
+            .unwrap();
+        wait_for_snapshot(&mut manager, |snapshot| {
+            snapshot.session_id == session_id
+                && !snapshot.dynamic_resolution_enabled
+                && snapshot.resize_status == ResizeStatus::Disabled
+        })
+        .await;
+
+        match late_event {
+            DisabledResizeEvent::Forwarded => {
+                control.push_event(SessionTransportEvent::ResizeOutcome(
+                    ResizeProtocolOutcome::Forwarded(size(1_600, 896)),
+                ));
+                poll_worker().await;
+            }
+            DisabledResizeEvent::Rejected => {
+                control.push_event(SessionTransportEvent::ResizeOutcome(
+                    ResizeProtocolOutcome::Rejected,
+                ));
+                poll_worker().await;
+            }
+            DisabledResizeEvent::Unsupported => {
+                control.push_event(SessionTransportEvent::ResizeOutcome(
+                    ResizeProtocolOutcome::Unsupported,
+                ));
+                poll_worker().await;
+            }
+            DisabledResizeEvent::ServerUnsupported => {
+                control.push_event(SessionTransportEvent::DesktopSize(size(1_360, 768)));
+                control.push_event(SessionTransportEvent::ResizeOutcome(
+                    ResizeProtocolOutcome::ServerUnsupported,
+                ));
+                poll_worker().await;
+                poll_worker().await;
+            }
+            DisabledResizeEvent::MatchingDesktopSize => {
+                control.push_event(SessionTransportEvent::DesktopSize(size(1_600, 896)));
+                poll_worker().await;
+            }
+            DisabledResizeEvent::Timeout => {
+                tokio::time::advance(std::time::Duration::from_secs(2)).await;
+                settle().await;
+            }
+        }
+        let disabled = latest_resize_status(drain(&mut manager), session_id)
+            .expect("late resize activity must publish a snapshot");
+        assert_eq!(
+            disabled,
+            ResizeStatus::Disabled,
+            "the checked-off control is the highest-priority public state"
+        );
+
+        manager
+            .send(AppCommand::SetDynamicResolution {
+                session_id,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        let reenabled = wait_for_snapshot(&mut manager, |snapshot| {
+            snapshot.session_id == session_id && snapshot.dynamic_resolution_enabled
+        })
+        .await;
+        assert_eq!(reenabled.resize_status, expected_when_enabled);
+        assert_eq!(reenabled.phase, SessionPhase::Ready);
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn forwarded_timeout_releases_one_armed_newest_replacement_without_a_second_click() {
+    let control = FakeControl::default();
+    let mut manager = SessionManager::spawn(
+        app_config(),
+        FakeBackend {
+            control: control.clone(),
+        },
+    );
+    settle().await;
+    drain(&mut manager);
+    let session_id = open_ready_session(&mut manager, &control, OpenOptions::default()).await;
+    drain(&mut manager);
+    let original = size(1_600, 896);
+    let newest = size(1_992, 1_080);
+
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_600,
+            backing_height: 900,
+        })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::Forwarded(original),
+    ));
+    poll_worker().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id
+            && snapshot.resize_status == ResizeStatus::Pending(original)
+    })
+    .await;
+
+    for index in 0..1_000_u32 {
+        manager
+            .send(AppCommand::ViewportChanged {
+                session_id,
+                backing_width: 1_800 + index % 200,
+                backing_height: 1_087,
+            })
+            .await
+            .unwrap();
+    }
+    manager
+        .send(AppCommand::RetryDynamicResolution { session_id })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    assert_eq!(control.resize_requests(), [original]);
+
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    settle().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id
+            && snapshot.resize_status == ResizeStatus::Requested(newest)
+    })
+    .await;
+    assert_eq!(
+        control.resize_requests(),
+        [original, newest],
+        "the one explicit replacement is issued as soon as Forwarded times out"
+    );
     manager.shutdown().await.unwrap();
 }
 

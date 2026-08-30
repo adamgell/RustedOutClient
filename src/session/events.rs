@@ -29,12 +29,20 @@ impl Default for OpenOptions {
 }
 
 pub enum InputAction {
-    Key { down: bool, keysym: u32 },
-    Pointer { buttons: u8, x: u16, y: u16 },
-    ReleasePointer { x: u16, y: u16 },
+    Key {
+        down: bool,
+        keysym: u32,
+    },
+    Pointer {
+        buttons: u8,
+        x: u16,
+        y: u16,
+    },
+    ReleaseOwnedInput {
+        pointer_position: Option<(u16, u16)>,
+    },
     CtrlAltDelete,
     ReleaseAllKeys,
-    FocusLost,
     SetViewOnly(bool),
     SendClipboard(String),
     ReceiveClipboard,

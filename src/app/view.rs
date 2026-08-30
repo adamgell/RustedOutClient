@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-    actions::{selected_tab, UiAction},
+    actions::{selected_tab, DispatchOutcome, UiAction},
     state::{AppState, ClipboardStatus, FramebufferUploadKind, QueueStatus, SetupState},
 };
 
@@ -46,6 +46,42 @@ impl Default for ViewResources {
     }
 }
 
+impl ViewResources {
+    pub(crate) fn request_owner_cleanup(&mut self) {
+        self.input.schedule_cleanup();
+    }
+
+    pub(crate) fn owner_cleanup_pending(&self) -> bool {
+        self.input.cleanup != CleanupDispatchState::None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_cleanup_action(&self) -> Option<UiAction> {
+        self.input.pending_cleanup_action()
+    }
+
+    pub(crate) fn acknowledge_owner_cleanup(&mut self, outcome: DispatchOutcome) {
+        self.input.acknowledge_cleanup(outcome);
+    }
+
+    pub(crate) fn manager_completed(&mut self) {
+        self.input.manager_completed();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_owner(
+        &mut self,
+        session_id: SessionId,
+        modifier_bits: u8,
+        pointer_buttons: u8,
+        pointer_position: Option<(u16, u16)>,
+    ) {
+        self.input = InputOwnership::for_session(session_id);
+        self.input
+            .set_test_state(modifier_bits, pointer_buttons, pointer_position);
+    }
+}
+
 #[derive(Default)]
 struct InputOwnership {
     session_id: Option<SessionId>,
@@ -53,6 +89,15 @@ struct InputOwnership {
     modifier_bits: u8,
     pointer_buttons: u8,
     pointer_position: Option<(u16, u16)>,
+    cleanup: CleanupDispatchState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CleanupDispatchState {
+    #[default]
+    None,
+    Pending,
+    Disconnected,
 }
 
 impl InputOwnership {
@@ -66,6 +111,9 @@ impl InputOwnership {
     }
 
     fn claim(&mut self, session_id: SessionId, keyboard_focused: bool) {
+        if self.cleanup != CleanupDispatchState::None {
+            return;
+        }
         if self.session_id.is_none() {
             self.session_id = Some(session_id);
         }
@@ -74,29 +122,75 @@ impl InputOwnership {
         }
     }
 
-    fn release(&mut self, actions: &mut Vec<UiAction>) {
+    fn schedule_cleanup(&mut self) {
+        if self.session_id.is_some() && self.cleanup == CleanupDispatchState::None {
+            self.cleanup = CleanupDispatchState::Pending;
+        }
+    }
+
+    fn release_if_not(&mut self, session_id: Option<SessionId>) {
+        if self.session_id.is_some() && self.session_id != session_id {
+            self.schedule_cleanup();
+        }
+    }
+
+    fn validate_against_state(&mut self, state: &AppState) {
         let Some(session_id) = self.session_id else {
             return;
         };
-        if self.pointer_buttons != 0 {
-            if let Some((x, y)) = self.pointer_position {
-                actions.push(UiAction::ReleasePointer { session_id, x, y });
-            }
+        let writable = state.tabs().iter().any(|tab| {
+            tab.snapshot.session_id == session_id
+                && tab.snapshot.phase == SessionPhase::Ready
+                && !tab.snapshot.view_only
+                && tab.last_error.is_none()
+        });
+        if !writable {
+            self.schedule_cleanup();
         }
-        actions.push(UiAction::FocusLost { session_id });
+    }
+
+    fn pending_cleanup_action(&self) -> Option<UiAction> {
+        let session_id = self
+            .session_id
+            .filter(|_| self.cleanup == CleanupDispatchState::Pending)?;
+        Some(UiAction::ReleaseOwnedInput {
+            session_id,
+            pointer_position: (self.pointer_buttons != 0)
+                .then_some(self.pointer_position)
+                .flatten(),
+        })
+    }
+
+    fn acknowledge_cleanup(&mut self, outcome: DispatchOutcome) {
+        if self.cleanup != CleanupDispatchState::Pending {
+            return;
+        }
+        match outcome {
+            DispatchOutcome::Sent => *self = Self::default(),
+            DispatchOutcome::Disconnected => {
+                self.cleanup = CleanupDispatchState::Disconnected;
+            }
+            _ => {}
+        }
+    }
+
+    fn manager_completed(&mut self) {
         *self = Self::default();
     }
 
-    fn release_if_not(&mut self, session_id: Option<SessionId>, actions: &mut Vec<UiAction>) {
-        if self.session_id.is_some() && self.session_id != session_id {
-            self.release(actions);
-        }
+    fn blocks_fresh_input(&self) -> bool {
+        self.cleanup != CleanupDispatchState::None
     }
 
     fn release_pointer(&mut self, actions: &mut Vec<UiAction>) {
         if self.pointer_buttons != 0 {
             if let (Some(session_id), Some((x, y))) = (self.session_id, self.pointer_position) {
-                actions.push(UiAction::ReleasePointer { session_id, x, y });
+                actions.push(UiAction::Pointer {
+                    session_id,
+                    buttons: 0,
+                    x,
+                    y,
+                });
             }
         }
         self.pointer_buttons = 0;
@@ -122,6 +216,7 @@ impl InputOwnership {
             && self.modifier_bits == 0
             && self.pointer_buttons == 0
             && self.pointer_position.is_none()
+            && self.cleanup == CleanupDispatchState::None
     }
 
     #[cfg(test)]
@@ -160,6 +255,7 @@ pub(crate) fn render(
     state: &mut AppState,
     resources: &mut ViewResources,
 ) -> Vec<UiAction> {
+    resources.input.validate_against_state(state);
     resources.textures.retain(|session_id, _| {
         state
             .tabs()
@@ -167,13 +263,12 @@ pub(crate) fn render(
             .any(|tab| tab.snapshot.session_id == *session_id)
     });
     let mut actions = Vec::new();
-    resources
-        .input
-        .release_if_not(state.selected_session_id(), &mut actions);
+    resources.input.release_if_not(state.selected_session_id());
     render_menu_bar(ctx, state, &mut actions);
 
     if state.setup_state() != &SetupState::Configured {
         render_setup(ctx, state.setup_state());
+        prepare_actions(&resources.input, &mut actions);
         return actions;
     }
 
@@ -184,28 +279,41 @@ pub(crate) fn render(
 
     let focused = ctx.input(|input| input.focused);
     if resources.app_focused && !focused {
-        resources.input.release(&mut actions);
+        resources.input.schedule_cleanup();
     }
     resources.app_focused = focused;
-    release_owner_for_control_actions(&mut resources.input, &mut actions);
+    release_owner_for_control_actions(&mut resources.input, &actions);
+    prepare_actions(&resources.input, &mut actions);
     actions
 }
 
-fn release_owner_for_control_actions(ownership: &mut InputOwnership, actions: &mut Vec<UiAction>) {
+fn release_owner_for_control_actions(ownership: &mut InputOwnership, actions: &[UiAction]) {
     if actions.iter().any(|action| {
         !matches!(
             action,
             UiAction::ViewportChanged { .. }
                 | UiAction::Key { .. }
                 | UiAction::Pointer { .. }
-                | UiAction::ReleasePointer { .. }
-                | UiAction::FocusLost { .. }
+                | UiAction::ReleaseOwnedInput { .. }
         )
     }) {
-        let mut cleanup = Vec::new();
-        ownership.release(&mut cleanup);
-        cleanup.append(actions);
-        *actions = cleanup;
+        ownership.schedule_cleanup();
+    }
+}
+
+fn prepare_actions(ownership: &InputOwnership, actions: &mut Vec<UiAction>) {
+    if let Some(cleanup) = ownership.pending_cleanup_action() {
+        actions.retain(|action| {
+            !matches!(
+                action,
+                UiAction::Key { .. }
+                    | UiAction::Pointer { .. }
+                    | UiAction::ReleaseOwnedInput { .. }
+            )
+        });
+        actions.insert(0, cleanup);
+    } else if ownership.blocks_fresh_input() {
+        actions.clear();
     }
 }
 
@@ -704,11 +812,11 @@ fn render_instrument_bay(
         return;
     };
     let session_id = tab.snapshot.session_id;
-    resources.input.release_if_not(Some(session_id), actions);
+    resources.input.release_if_not(Some(session_id));
     if response.has_focus() {
         resources.input.claim(session_id, true);
     } else if resources.input.session_id == Some(session_id) && resources.input.keyboard_focused {
-        resources.input.release(actions);
+        resources.input.schedule_cleanup();
     }
     let backing_width = (inner.width().max(0.0) * ui.ctx().pixels_per_point()) as u32;
     let backing_height = (inner.height().max(0.0) * ui.ctx().pixels_per_point()) as u32;
@@ -752,12 +860,7 @@ fn render_instrument_bay(
         ui.ctx().pixels_per_point(),
     );
     let image_rect = egui::Rect::from_center_size(inner.center(), image_size);
-    ui.painter().image(
-        texture.id(),
-        image_rect,
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
+    paint_framebuffer(ui.painter(), texture.id(), image_rect, inner);
     let events = ui.ctx().input(|input| input.events.clone());
     if response.has_focus() && resources.input.session_id == Some(session_id) {
         let modifiers = ui.ctx().input(|input| input.modifiers);
@@ -871,6 +974,9 @@ fn collect_keyboard_events(
     ownership: &mut InputOwnership,
     actions: &mut Vec<UiAction>,
 ) {
+    if ownership.blocks_fresh_input() {
+        return;
+    }
     for event in events {
         match event {
             egui::Event::Key {
@@ -947,6 +1053,26 @@ fn visible_console_rect(
     image_rect.intersect(inner_rect).intersect(clip_rect)
 }
 
+fn framebuffer_paint_clip(inner_rect: egui::Rect, clip_rect: egui::Rect) -> egui::Rect {
+    inner_rect.intersect(clip_rect)
+}
+
+fn paint_framebuffer(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    image_rect: egui::Rect,
+    inner_rect: egui::Rect,
+) {
+    painter
+        .with_clip_rect(framebuffer_paint_clip(inner_rect, painter.clip_rect()))
+        .image(
+            texture_id,
+            image_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+}
+
 fn collect_pointer_events(
     session_id: SessionId,
     events: &[egui::Event],
@@ -956,6 +1082,9 @@ fn collect_pointer_events(
     ownership: &mut InputOwnership,
     actions: &mut Vec<UiAction>,
 ) {
+    if ownership.blocks_fresh_input() {
+        return;
+    }
     for event in events {
         match event {
             egui::Event::PointerButton {
@@ -993,7 +1122,12 @@ fn collect_pointer_events(
                 if let Some((x, y)) = position {
                     ownership.pointer_position = Some((x, y));
                     if ownership.pointer_buttons == 0 {
-                        actions.push(UiAction::ReleasePointer { session_id, x, y });
+                        actions.push(UiAction::Pointer {
+                            session_id,
+                            buttons: 0,
+                            x,
+                            y,
+                        });
                     } else {
                         actions.push(UiAction::Pointer {
                             session_id,
@@ -1410,10 +1544,48 @@ fn render_diagnostics(ctx: &egui::Context, state: &mut AppState, actions: &mut V
 #[cfg(test)]
 mod input_tests {
     use super::{
-        collect_keyboard_events, collect_pointer_events, release_owner_for_control_actions,
-        visible_console_rect, InputOwnership,
+        collect_keyboard_events, collect_pointer_events, framebuffer_paint_clip, paint_framebuffer,
+        prepare_actions, release_owner_for_control_actions, visible_console_rect, InputOwnership,
     };
-    use crate::{app::UiAction, session::SessionId};
+    use crate::{
+        app::{AppState, DispatchOutcome, UiAction},
+        config::AppConfig,
+        model::{NodeName, PveProfile, SshTarget, VmId},
+        session::{
+            AppEvent, PublicError, PublicErrorKind, ResizeStatus, SessionId, SessionPhase,
+            SessionSnapshot,
+        },
+    };
+
+    fn vmid(value: u32) -> VmId {
+        VmId::new(value).unwrap()
+    }
+
+    fn snapshot(session_id: SessionId, phase: SessionPhase, view_only: bool) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id,
+            profile_name: "Synthetic lab".to_owned(),
+            vmid: vmid(107),
+            phase,
+            view_only,
+            clipboard_enabled: false,
+            dynamic_resolution_enabled: true,
+            guest_size: None,
+            resize_status: ResizeStatus::Waiting,
+        }
+    }
+
+    fn state_with(snapshots: impl IntoIterator<Item = SessionSnapshot>) -> AppState {
+        let mut state = AppState::from_config(&AppConfig::new(PveProfile {
+            name: "Synthetic lab".to_owned(),
+            ssh_target: SshTarget::parse("root@pve.example.invalid").unwrap(),
+            node: NodeName::parse("pve2").unwrap(),
+        }));
+        for snapshot in snapshots {
+            state.apply(AppEvent::SessionChanged(snapshot)).unwrap();
+        }
+        state
+    }
 
     fn modifier(field: &str, enabled: bool) -> egui::Modifiers {
         let mut modifiers = egui::Modifiers::default();
@@ -1515,7 +1687,7 @@ mod input_tests {
     }
 
     #[test]
-    fn owner_cleanup_is_targeted_clears_all_local_state_and_precedes_close_or_reconnect() {
+    fn owner_cleanup_is_targeted_and_precedes_close_or_reconnect_until_acknowledged() {
         for control in [UiAction::Reconnect, UiAction::Close] {
             let outgoing = SessionId::new();
             let incoming = SessionId::new();
@@ -1523,28 +1695,28 @@ mod input_tests {
             ownership.set_test_state(0b1111, 0b1_1111, Some((123, 234)));
             let mut actions = vec![control];
 
-            release_owner_for_control_actions(&mut ownership, &mut actions);
+            release_owner_for_control_actions(&mut ownership, &actions);
+            prepare_actions(&ownership, &mut actions);
 
             assert!(matches!(
                 actions.first(),
-                Some(UiAction::ReleasePointer { session_id, x: 123, y: 234 })
-                    if *session_id == outgoing
+                Some(UiAction::ReleaseOwnedInput {
+                    session_id,
+                    pointer_position: Some((123, 234)),
+                }) if *session_id == outgoing
             ));
             assert!(matches!(
                 actions.get(1),
-                Some(UiAction::FocusLost { session_id }) if *session_id == outgoing
-            ));
-            assert!(matches!(
-                actions.get(2),
                 Some(UiAction::Reconnect | UiAction::Close)
             ));
-            assert!(ownership.is_clear());
+            assert!(!ownership.is_clear());
             assert!(actions.iter().all(|action| !matches!(
                 action,
-                UiAction::ReleasePointer { session_id, .. }
-                    | UiAction::FocusLost { session_id }
+                UiAction::ReleaseOwnedInput { session_id, .. }
                     if *session_id == incoming
             )));
+            ownership.acknowledge_cleanup(DispatchOutcome::Sent);
+            assert!(ownership.is_clear());
         }
     }
 
@@ -1561,18 +1733,15 @@ mod input_tests {
             ownership.set_test_state(0b0010, 1, Some((10, 20)));
             let mut actions = vec![control];
 
-            release_owner_for_control_actions(&mut ownership, &mut actions);
+            release_owner_for_control_actions(&mut ownership, &actions);
+            prepare_actions(&ownership, &mut actions);
 
             assert!(matches!(
                 actions.first(),
-                Some(UiAction::ReleasePointer { session_id, .. }) if *session_id == outgoing
+                Some(UiAction::ReleaseOwnedInput { session_id, .. }) if *session_id == outgoing
             ));
-            assert!(matches!(
-                actions.get(1),
-                Some(UiAction::FocusLost { session_id }) if *session_id == outgoing
-            ));
-            assert_eq!(actions.get(2), Some(&control));
-            assert!(ownership.is_clear());
+            assert_eq!(actions.get(1), Some(&control));
+            assert!(!ownership.is_clear());
         }
     }
 
@@ -1585,18 +1754,15 @@ mod input_tests {
             ownership.set_test_state(0b0011, 0b1_1111, Some((20, 30)));
             let mut actions = Vec::new();
 
-            ownership.release_if_not(next_owner, &mut actions);
+            ownership.release_if_not(next_owner);
+            prepare_actions(&ownership, &mut actions);
 
-            assert_eq!(actions.len(), 2);
+            assert_eq!(actions.len(), 1);
             assert!(matches!(
                 actions[0],
-                UiAction::ReleasePointer { session_id, .. } if session_id == outgoing
+                UiAction::ReleaseOwnedInput { session_id, .. } if session_id == outgoing
             ));
-            assert!(matches!(
-                actions[1],
-                UiAction::FocusLost { session_id } if session_id == outgoing
-            ));
-            assert!(ownership.is_clear());
+            assert!(!ownership.is_clear());
         }
     }
 
@@ -1655,8 +1821,9 @@ mod input_tests {
         ));
         assert!(matches!(
             actions[1],
-            UiAction::ReleasePointer {
+            UiAction::Pointer {
                 session_id: target,
+                buttons: 0,
                 x: 160,
                 y: 130,
             } if target == session_id
@@ -1711,7 +1878,7 @@ mod input_tests {
                     session_id,
                     buttons,
                     ..
-                } => Some((*session_id, *buttons)),
+                } if *buttons != 0 => Some((*session_id, *buttons)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1730,16 +1897,193 @@ mod input_tests {
                 .iter()
                 .filter(|action| matches!(
                     action,
-                    UiAction::ReleasePointer { session_id, .. } if *session_id == outgoing
+                    UiAction::Pointer {
+                        session_id,
+                        buttons: 0,
+                        ..
+                    } if *session_id == outgoing
                 ))
                 .count(),
             5
         );
         assert!(actions.iter().all(|action| !matches!(
             action,
-            UiAction::Pointer { session_id, .. } | UiAction::ReleasePointer { session_id, .. }
-                if *session_id == incoming
+            UiAction::Pointer { session_id, .. } if *session_id == incoming
         )));
         assert_eq!(ownership.pointer_buttons(), 0);
+    }
+
+    #[test]
+    fn owner_cleanup_is_one_retryable_semantic_command_and_clears_only_after_sent() {
+        let outgoing = SessionId::new();
+        let incoming = SessionId::new();
+        let mut ownership = InputOwnership::for_session(outgoing);
+        ownership.set_test_state(0b1111, 0b1_1111, Some((123, 234)));
+
+        ownership.schedule_cleanup();
+        ownership.schedule_cleanup();
+        assert_eq!(
+            ownership.pending_cleanup_action(),
+            Some(UiAction::ReleaseOwnedInput {
+                session_id: outgoing,
+                pointer_position: Some((123, 234)),
+            }),
+            "all pointer buttons and modifiers collapse into one bounded cleanup command"
+        );
+        ownership.claim(incoming, true);
+        assert_eq!(ownership.session_id, Some(outgoing));
+
+        ownership.acknowledge_cleanup(DispatchOutcome::Busy);
+        assert_eq!(ownership.modifier_bits, 0b1111);
+        assert_eq!(ownership.pointer_buttons, 0b1_1111);
+        assert_eq!(ownership.pointer_position, Some((123, 234)));
+        assert!(ownership.pending_cleanup_action().is_some());
+
+        ownership.acknowledge_cleanup(DispatchOutcome::Disconnected);
+        assert_eq!(
+            ownership.pending_cleanup_action(),
+            None,
+            "a disconnected sender retains ownership without spinning retry attempts"
+        );
+        assert_eq!(ownership.session_id, Some(outgoing));
+        assert_eq!(ownership.modifier_bits, 0b1111);
+        assert_eq!(ownership.pointer_buttons, 0b1_1111);
+        let mut blocked_actions = vec![UiAction::RefreshInventory];
+        prepare_actions(&ownership, &mut blocked_actions);
+        assert!(
+            blocked_actions.is_empty(),
+            "later controls remain blocked until manager completion"
+        );
+        ownership.manager_completed();
+        assert!(ownership.is_clear());
+
+        ownership = InputOwnership::for_session(outgoing);
+        ownership.set_test_state(0b1111, 0b1_1111, Some((123, 234)));
+        ownership.schedule_cleanup();
+        ownership.acknowledge_cleanup(DispatchOutcome::Sent);
+        assert!(ownership.is_clear());
+        assert_eq!(ownership.pending_cleanup_action(), None);
+
+        ownership.claim(incoming, true);
+        assert_eq!(ownership.session_id, Some(incoming));
+
+        let mut completion_before_render = InputOwnership::for_session(outgoing);
+        completion_before_render.set_test_state(0b0010, 1, Some((50, 60)));
+        completion_before_render.manager_completed();
+        assert!(
+            completion_before_render.is_clear(),
+            "worker completion must clear local ownership even before state validation schedules cleanup"
+        );
+    }
+
+    #[test]
+    fn worker_driven_non_writable_transitions_and_tab_changes_keep_cleanup_on_old_owner() {
+        let outgoing = SessionId::new();
+        let incoming = SessionId::new();
+
+        for mut state in [
+            state_with([snapshot(outgoing, SessionPhase::Disconnecting, false)]),
+            state_with([snapshot(outgoing, SessionPhase::Disconnected, false)]),
+            state_with([snapshot(outgoing, SessionPhase::Ready, true)]),
+            {
+                let mut state = state_with([snapshot(outgoing, SessionPhase::Ready, false)]);
+                state
+                    .apply(AppEvent::Error(
+                        PublicError::new(PublicErrorKind::RfbProtocol)
+                            .with_public_context(outgoing, vmid(107)),
+                    ))
+                    .unwrap();
+                state
+            },
+            state_with([snapshot(incoming, SessionPhase::Ready, false)]),
+        ] {
+            let mut ownership = InputOwnership::for_session(outgoing);
+            ownership.set_test_state(0b0010, 1, Some((10, 20)));
+            ownership.validate_against_state(&state);
+            assert_eq!(
+                ownership.pending_cleanup_action(),
+                Some(UiAction::ReleaseOwnedInput {
+                    session_id: outgoing,
+                    pointer_position: Some((10, 20)),
+                })
+            );
+            ownership.acknowledge_cleanup(DispatchOutcome::Busy);
+            assert_eq!(ownership.session_id, Some(outgoing));
+            state.select_session(Some(incoming));
+            ownership.claim(incoming, true);
+            assert_eq!(ownership.session_id, Some(outgoing));
+        }
+
+        let state = state_with([
+            snapshot(outgoing, SessionPhase::Ready, false),
+            snapshot(incoming, SessionPhase::Ready, false),
+        ]);
+        let mut ownership = InputOwnership::for_session(outgoing);
+        ownership.set_test_state(0b0010, 1, Some((30, 40)));
+        ownership.validate_against_state(&state);
+        ownership.release_if_not(state.selected_session_id());
+        assert_eq!(
+            ownership.pending_cleanup_action(),
+            Some(UiAction::ReleaseOwnedInput {
+                session_id: outgoing,
+                pointer_position: Some((30, 40)),
+            }),
+            "a simultaneous selection change cannot retarget cleanup to the incoming tab"
+        );
+    }
+
+    #[test]
+    fn oversized_one_to_one_paint_uses_bay_clip_while_pointer_mapping_uses_full_image() {
+        let image = egui::Rect::from_min_max(egui::pos2(-100.0, -50.0), egui::pos2(500.0, 350.0));
+        let inner = egui::Rect::from_min_max(egui::pos2(20.0, 30.0), egui::pos2(280.0, 220.0));
+        let ui_clip = egui::Rect::from_min_max(egui::pos2(40.0, 50.0), egui::pos2(260.0, 200.0));
+
+        assert_eq!(
+            framebuffer_paint_clip(inner, ui_clip),
+            inner.intersect(ui_clip)
+        );
+        assert_eq!(visible_console_rect(image, inner, ui_clip), ui_clip);
+        assert_eq!(
+            super::pointer_coordinates(egui::pos2(50.0, 75.0), image, (600, 400)),
+            Some((150, 125)),
+            "cropped pointer coordinates still map against the original full image"
+        );
+    }
+
+    #[test]
+    fn framebuffer_image_shape_carries_the_bay_clip_and_full_uncropped_geometry() {
+        let context = egui::Context::default();
+        let texture_id = egui::TextureId::Managed(42);
+        let image = egui::Rect::from_min_max(egui::pos2(-100.0, -50.0), egui::pos2(500.0, 350.0));
+        let inner = egui::Rect::from_min_max(egui::pos2(20.0, 30.0), egui::pos2(280.0, 220.0));
+        let ui_clip = egui::Rect::from_min_max(egui::pos2(40.0, 50.0), egui::pos2(260.0, 200.0));
+
+        let output = context.run(egui::RawInput::default(), |context| {
+            let painter = egui::Painter::new(
+                context.clone(),
+                egui::LayerId::new(egui::Order::Middle, egui::Id::new("paint-clip-test")),
+                ui_clip,
+            );
+            paint_framebuffer(&painter, texture_id, image, inner);
+        });
+        let clipped = output
+            .shapes
+            .iter()
+            .find(|clipped| {
+                matches!(
+                    &clipped.shape,
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id
+                )
+            })
+            .expect("framebuffer image shape must be painted");
+        assert_eq!(clipped.clip_rect, inner.intersect(ui_clip));
+        let egui::Shape::Mesh(mesh) = &clipped.shape else {
+            unreachable!();
+        };
+        let mut painted_bounds = egui::Rect::NOTHING;
+        for vertex in &mesh.vertices {
+            painted_bounds.extend_with(vertex.pos);
+        }
+        assert_eq!(painted_bounds, image);
     }
 }

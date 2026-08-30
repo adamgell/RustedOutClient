@@ -155,13 +155,9 @@ pub enum UiAction {
         x: u16,
         y: u16,
     },
-    ReleasePointer {
+    ReleaseOwnedInput {
         session_id: crate::session::SessionId,
-        x: u16,
-        y: u16,
-    },
-    FocusLost {
-        session_id: crate::session::SessionId,
+        pointer_position: Option<(u16, u16)>,
     },
 }
 
@@ -369,16 +365,16 @@ where
             session_accepts_fresh_input(state, session_id),
             InputAction::Pointer { buttons, x, y },
         ),
-        UiAction::ReleasePointer { session_id, x, y } => targeted_input(
+        UiAction::ReleaseOwnedInput {
+            session_id,
+            pointer_position,
+        } => targeted_input(
             state,
             sink,
             session_id,
             true,
-            InputAction::ReleasePointer { x, y },
+            InputAction::ReleaseOwnedInput { pointer_position },
         ),
-        UiAction::FocusLost { session_id } => {
-            targeted_input(state, sink, session_id, true, InputAction::FocusLost)
-        }
     }
 }
 

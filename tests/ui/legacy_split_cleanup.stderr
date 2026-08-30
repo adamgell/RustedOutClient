@@ -1,0 +1,23 @@
+error[E0599]: no variant named `ReleasePointer` found for enum `InputAction`
+ --> tests/ui/legacy_split_cleanup.rs:8:26
+  |
+8 |     let _ = InputAction::ReleasePointer { x: 1, y: 2 };
+  |                          ^^^^^^^^^^^^^^ variant not found in `InputAction`
+
+error[E0599]: no variant or associated item named `FocusLost` found for enum `InputAction` in the current scope
+ --> tests/ui/legacy_split_cleanup.rs:9:26
+  |
+9 |     let _ = InputAction::FocusLost;
+  |                          ^^^^^^^^^ variant or associated item not found in `InputAction`
+
+error[E0599]: no variant named `ReleasePointer` found for enum `UiAction`
+  --> tests/ui/legacy_split_cleanup.rs:10:23
+   |
+10 |     let _ = UiAction::ReleasePointer {
+   |                       ^^^^^^^^^^^^^^ variant not found in `UiAction`
+
+error[E0599]: no variant named `FocusLost` found for enum `UiAction`
+  --> tests/ui/legacy_split_cleanup.rs:15:23
+   |
+15 |     let _ = UiAction::FocusLost { session_id };
+   |                       ^^^^^^^^^ variant not found in `UiAction`

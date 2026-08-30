@@ -151,10 +151,12 @@ impl ManagedSession for FakeSession {
             InputAction::Pointer { buttons, x, y } => {
                 self.input.pointer(buttons, x, y).map(|()| None)
             }
-            InputAction::ReleasePointer { x, y } => self.input.release_pointer(x, y).map(|()| None),
+            InputAction::ReleaseOwnedInput { pointer_position } => self
+                .input
+                .release_owned_input(pointer_position)
+                .map(|()| None),
             InputAction::CtrlAltDelete => self.input.ctrl_alt_delete().map(|()| None),
             InputAction::ReleaseAllKeys => self.input.release_all_keys().map(|()| None),
-            InputAction::FocusLost => self.input.focus_lost().map(|()| None),
             InputAction::SetViewOnly(enabled) => self.input.set_view_only(enabled).map(|()| None),
             InputAction::SendClipboard(text) => self.input.send_clipboard(text).map(|()| None),
             InputAction::ReceiveClipboard => self.input.receive_clipboard(),

@@ -643,8 +643,7 @@ struct DelayedFakeSink {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TargetedInput {
-    ReleasePointer(SessionId, u16, u16),
-    FocusLost(SessionId),
+    ReleaseOwnedInput(SessionId, Option<(u16, u16)>),
     Key(SessionId, bool, u32),
 }
 
@@ -657,11 +656,11 @@ impl AppCommandSink for TargetedInputSink {
     fn try_send(&self, command: AppCommand) -> Result<(), CommandQueueError> {
         if let AppCommand::SendInput { session_id, action } = command {
             let recorded = match action {
-                rustedoutclient::session::InputAction::ReleasePointer { x, y } => {
-                    Some(TargetedInput::ReleasePointer(session_id, x, y))
-                }
-                rustedoutclient::session::InputAction::FocusLost => {
-                    Some(TargetedInput::FocusLost(session_id))
+                rustedoutclient::session::InputAction::ReleaseOwnedInput { pointer_position } => {
+                    Some(TargetedInput::ReleaseOwnedInput(
+                        session_id,
+                        pointer_position,
+                    ))
                 }
                 rustedoutclient::session::InputAction::Key { down, keysym } => {
                     Some(TargetedInput::Key(session_id, down, keysym))
@@ -843,7 +842,7 @@ fn explicit_clipboard_and_bounded_command_dispatch_never_wait_for_a_worker() {
 }
 
 #[test]
-fn targeted_cleanup_never_follows_the_newly_selected_session() {
+fn one_semantic_targeted_cleanup_never_follows_the_newly_selected_session() {
     let mut state = configured_state();
     let outgoing = SessionId::new();
     let incoming = SessionId::new();
@@ -880,21 +879,9 @@ fn targeted_cleanup_never_follows_the_newly_selected_session() {
             &mut state,
             &sink,
             &mut clipboard,
-            UiAction::ReleasePointer {
+            UiAction::ReleaseOwnedInput {
                 session_id: outgoing,
-                x: 120,
-                y: 220,
-            },
-        ),
-        DispatchOutcome::Sent
-    );
-    assert_eq!(
-        dispatch_action(
-            &mut state,
-            &sink,
-            &mut clipboard,
-            UiAction::FocusLost {
-                session_id: outgoing,
+                pointer_position: Some((120, 220)),
             },
         ),
         DispatchOutcome::Sent
@@ -929,8 +916,7 @@ fn targeted_cleanup_never_follows_the_newly_selected_session() {
     assert_eq!(
         sink.inputs.borrow().as_slice(),
         [
-            TargetedInput::ReleasePointer(outgoing, 120, 220),
-            TargetedInput::FocusLost(outgoing),
+            TargetedInput::ReleaseOwnedInput(outgoing, Some((120, 220))),
             TargetedInput::Key(incoming, true, 0x42),
         ]
     );

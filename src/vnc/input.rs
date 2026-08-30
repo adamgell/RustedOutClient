@@ -166,8 +166,20 @@ where
         self.sink.pointer(buttons, x, y)
     }
 
-    pub fn release_pointer(&mut self, x: u16, y: u16) -> Result<(), InputError> {
-        self.sink.pointer(0, x, y)
+    pub fn release_owned_input(
+        &mut self,
+        pointer_position: Option<(u16, u16)>,
+    ) -> Result<(), InputError> {
+        let mut first_error = None;
+        if let Some((x, y)) = pointer_position {
+            if let Err(error) = self.sink.pointer(0, x, y) {
+                first_error = Some(error);
+            }
+        }
+        if let Err(error) = self.release_all_keys() {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn ctrl_alt_delete(&mut self) -> Result<(), InputError> {
@@ -198,10 +210,6 @@ where
         }
         self.pressed.clear();
         first_error.map_or(Ok(()), Err)
-    }
-
-    pub fn focus_lost(&mut self) -> Result<(), InputError> {
-        self.release_all_keys()
     }
 
     pub fn set_view_only(&mut self, enabled: bool) -> Result<(), InputError> {

@@ -199,6 +199,15 @@ struct InFlightResize {
     actual_observed: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ResizeOutcomeState {
+    Waiting,
+    Applied(DesktopSize),
+    Rejected,
+    Unsupported,
+    TimedOut,
+}
+
 struct ResizePolicy {
     desired: Option<DesktopSize>,
     debounce_deadline: Option<Instant>,
@@ -206,6 +215,8 @@ struct ResizePolicy {
     pending_replacement: Option<DesktopSize>,
     automatic_allowed: bool,
     explicit_retry_armed: bool,
+    outcome: ResizeOutcomeState,
+    server_layout_unsupported: bool,
 }
 
 impl ResizePolicy {
@@ -217,6 +228,8 @@ impl ResizePolicy {
             pending_replacement: None,
             automatic_allowed: enabled,
             explicit_retry_armed: false,
+            outcome: ResizeOutcomeState::Waiting,
+            server_layout_unsupported: false,
         }
     }
 
@@ -250,6 +263,25 @@ impl ResizePolicy {
                 ResizeStatus::Requested(request.requested)
             }
         })
+    }
+
+    fn published_status(&self, enabled: bool) -> ResizeStatus {
+        if !enabled {
+            return ResizeStatus::Disabled;
+        }
+        if self.server_layout_unsupported {
+            return ResizeStatus::Unsupported;
+        }
+        if let Some(status) = self.active_status() {
+            return status;
+        }
+        match self.outcome {
+            ResizeOutcomeState::Waiting => ResizeStatus::Waiting,
+            ResizeOutcomeState::Applied(size) => ResizeStatus::Applied(size),
+            ResizeOutcomeState::Rejected => ResizeStatus::Rejected,
+            ResizeOutcomeState::Unsupported => ResizeStatus::Unsupported,
+            ResizeOutcomeState::TimedOut => ResizeStatus::TimedOut,
+        }
     }
 }
 
@@ -485,7 +517,9 @@ where
         };
         let limits = self.sessions[index].options.vnc.limits;
         let requested = normalize_resize_request(backing_width, backing_height, limits).ok();
-        let previous_status = self.sessions[index].snapshot.resize_status;
+        let previous_status = self.sessions[index]
+            .resize
+            .published_status(self.sessions[index].options.dynamic_resolution);
         self.sessions[index].resize.desired = requested;
         self.sessions[index].resize.pending_replacement = None;
         self.sessions[index].resize.debounce_deadline = None;
@@ -496,20 +530,18 @@ where
         {
             self.sessions[index].resize.debounce_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
             if self.sessions[index].resize.in_flight.is_none() {
-                self.sessions[index].snapshot.resize_status = ResizeStatus::Waiting;
+                self.sessions[index].resize.outcome = ResizeOutcomeState::Waiting;
             }
         } else if requested.is_none()
             && self.sessions[index].resize.in_flight.is_none()
             && self.sessions[index].resize.automatic_allowed
         {
-            self.sessions[index].snapshot.resize_status =
-                if self.sessions[index].options.dynamic_resolution {
-                    ResizeStatus::Waiting
-                } else {
-                    ResizeStatus::Disabled
-                };
+            self.sessions[index].resize.outcome = ResizeOutcomeState::Waiting;
         }
-        if self.sessions[index].snapshot.resize_status != previous_status {
+        let current_status = self.sessions[index]
+            .resize
+            .published_status(self.sessions[index].options.dynamic_resolution);
+        if current_status != previous_status {
             self.emit_session_snapshot(index).await;
         }
     }
@@ -529,13 +561,6 @@ where
         if enabled {
             self.sessions[index].resize.explicit_retry_armed = true;
         }
-        self.sessions[index].snapshot.resize_status = if !enabled {
-            ResizeStatus::Disabled
-        } else if let Some(status) = self.sessions[index].resize.active_status() {
-            status
-        } else {
-            ResizeStatus::Waiting
-        };
         if enabled
             && self.sessions[index].resize.desired.is_some()
             && self.sessions[index].snapshot.phase == SessionPhase::Ready
@@ -559,10 +584,6 @@ where
         self.sessions[index].resize.automatic_allowed = true;
         self.sessions[index].resize.pending_replacement = None;
         self.sessions[index].resize.explicit_retry_armed = true;
-        self.sessions[index].snapshot.resize_status = self.sessions[index]
-            .resize
-            .active_status()
-            .unwrap_or(ResizeStatus::Waiting);
         self.sessions[index].resize.debounce_deadline = self.sessions[index]
             .resize
             .desired
@@ -625,7 +646,9 @@ where
             && record.resize.desired.is_some()
         {
             record.resize.debounce_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
-            record.snapshot.resize_status = ResizeStatus::Waiting;
+            if record.resize.in_flight.is_none() {
+                record.resize.outcome = ResizeOutcomeState::Waiting;
+            }
         }
     }
 
@@ -645,12 +668,7 @@ where
                     ..request
                 })
             };
-            self.sessions[index].snapshot.resize_status =
-                if self.sessions[index].options.dynamic_resolution {
-                    ResizeStatus::Applied(size)
-                } else {
-                    ResizeStatus::Disabled
-                };
+            self.sessions[index].resize.outcome = ResizeOutcomeState::Applied(size);
             let follow_up = protocol_resolved
                 .then(|| self.sessions[index].resize.pending_replacement.take())
                 .flatten();
@@ -670,10 +688,9 @@ where
 
     async fn handle_resize_outcome(&mut self, index: usize, outcome: ResizeProtocolOutcome) {
         if outcome == ResizeProtocolOutcome::ServerUnsupported {
-            self.sessions[index].resize.in_flight = None;
             self.sessions[index].resize.cancel_unsent_work();
             self.sessions[index].resize.automatic_allowed = false;
-            self.sessions[index].snapshot.resize_status = ResizeStatus::Unsupported;
+            self.sessions[index].resize.server_layout_unsupported = true;
             self.emit_session_snapshot(index).await;
             return;
         }
@@ -688,35 +705,29 @@ where
             ResizeProtocolOutcome::Forwarded(size) if size == in_flight.requested => {
                 if in_flight.actual_observed {
                     self.sessions[index].resize.in_flight = None;
-                    self.sessions[index].snapshot.resize_status =
-                        if self.sessions[index].options.dynamic_resolution {
-                            ResizeStatus::Applied(size)
-                        } else {
-                            ResizeStatus::Disabled
-                        };
+                    self.sessions[index].resize.outcome = ResizeOutcomeState::Applied(size);
                     release_replacement = true;
                 } else if in_flight.timed_out {
                     self.sessions[index].resize.in_flight = None;
-                    self.sessions[index].snapshot.resize_status = ResizeStatus::TimedOut;
+                    self.sessions[index].resize.outcome = ResizeOutcomeState::TimedOut;
                     release_replacement = true;
                 } else {
                     self.sessions[index].resize.in_flight = Some(InFlightResize {
                         protocol: ResizeProtocolState::Forwarded,
                         ..in_flight
                     });
-                    self.sessions[index].snapshot.resize_status = ResizeStatus::Pending(size);
                 }
             }
             ResizeProtocolOutcome::Forwarded(_) | ResizeProtocolOutcome::Unsupported => {
                 self.sessions[index].resize.in_flight = None;
                 self.sessions[index].resize.stop_automatic_retries();
-                self.sessions[index].snapshot.resize_status = ResizeStatus::Unsupported;
+                self.sessions[index].resize.outcome = ResizeOutcomeState::Unsupported;
                 release_replacement = true;
             }
             ResizeProtocolOutcome::Rejected => {
                 self.sessions[index].resize.in_flight = None;
                 self.sessions[index].resize.stop_automatic_retries();
-                self.sessions[index].snapshot.resize_status = ResizeStatus::Rejected;
+                self.sessions[index].resize.outcome = ResizeOutcomeState::Rejected;
                 release_replacement = true;
             }
             ResizeProtocolOutcome::ServerUnsupported => unreachable!("handled above"),
@@ -757,11 +768,18 @@ where
                         record.resize.in_flight = None;
                     }
                     record.resize.stop_automatic_retries();
-                    record.snapshot.resize_status = if request.actual_observed {
-                        ResizeStatus::Applied(request.requested)
+                    record.resize.outcome = if request.actual_observed {
+                        ResizeOutcomeState::Applied(request.requested)
                     } else {
-                        ResizeStatus::TimedOut
+                        ResizeOutcomeState::TimedOut
                     };
+                    if request.protocol == ResizeProtocolState::Forwarded {
+                        issue = record.resize.pending_replacement.take().filter(|_| {
+                            record.options.dynamic_resolution
+                                && record.resize.can_issue()
+                                && record.snapshot.phase == SessionPhase::Ready
+                        });
+                    }
                     emit_snapshot = true;
                 } else if record
                     .resize
@@ -808,6 +826,8 @@ where
                 }
                 self.sessions[index].resize.explicit_retry_armed = false;
                 self.sessions[index].resize.pending_replacement = None;
+                self.sessions[index].resize.outcome = ResizeOutcomeState::Waiting;
+                self.sessions[index].resize.server_layout_unsupported = false;
                 self.sessions[index].resize.in_flight = Some(InFlightResize {
                     requested,
                     deadline: Instant::now() + RESIZE_OUTCOME_DEADLINE,
@@ -815,12 +835,11 @@ where
                     timed_out: false,
                     actual_observed: false,
                 });
-                self.sessions[index].snapshot.resize_status = ResizeStatus::Requested(requested);
                 self.emit_session_snapshot(index).await;
             }
             Err(error) => {
                 self.sessions[index].resize.automatic_allowed = false;
-                self.sessions[index].snapshot.resize_status = ResizeStatus::Waiting;
+                self.sessions[index].resize.outcome = ResizeOutcomeState::Waiting;
                 let snapshot = &self.sessions[index].snapshot;
                 let contextual = error.for_session(snapshot.session_id, snapshot.vmid);
                 self.emit_session_snapshot(index).await;
@@ -830,6 +849,9 @@ where
     }
 
     async fn emit_session_snapshot(&mut self, index: usize) {
+        self.sessions[index].snapshot.resize_status = self.sessions[index]
+            .resize
+            .published_status(self.sessions[index].options.dynamic_resolution);
         let snapshot = self.sessions[index].snapshot.clone();
         self.emit_critical(AppEvent::SessionChanged(snapshot)).await;
     }
@@ -1137,10 +1159,12 @@ impl ManagedSession for ProductionSession {
             InputAction::Pointer { buttons, x, y } => {
                 self.input.pointer(buttons, x, y).map(|()| None)
             }
-            InputAction::ReleasePointer { x, y } => self.input.release_pointer(x, y).map(|()| None),
+            InputAction::ReleaseOwnedInput { pointer_position } => self
+                .input
+                .release_owned_input(pointer_position)
+                .map(|()| None),
             InputAction::CtrlAltDelete => self.input.ctrl_alt_delete().map(|()| None),
             InputAction::ReleaseAllKeys => self.input.release_all_keys().map(|()| None),
-            InputAction::FocusLost => self.input.focus_lost().map(|()| None),
             InputAction::SetViewOnly(enabled) => self.input.set_view_only(enabled).map(|()| None),
             InputAction::SendClipboard(text) => self.input.send_clipboard(text).map(|()| None),
             InputAction::ReceiveClipboard => self.input.receive_clipboard(),
