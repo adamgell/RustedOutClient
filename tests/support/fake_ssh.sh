@@ -41,6 +41,11 @@ if [ "$master" = true ]; then
 fi
 
 if [ "$operation" = "check" ]; then
+    if [ -f "${socket}.hang_check" ]; then
+        while :; do
+            sleep 0.05
+        done
+    fi
     if [ -f "$state" ]; then
         exit 0
     fi
@@ -49,6 +54,11 @@ if [ "$operation" = "check" ]; then
 fi
 
 if [ "$operation" = "exit" ]; then
+    if [ -f "${socket}.hang_exit" ]; then
+        while :; do
+            sleep 0.05
+        done
+    fi
     if [ -f "${socket}.ignore_exit" ]; then
         exit 0
     fi
@@ -57,6 +67,35 @@ if [ "$operation" = "exit" ]; then
         kill -TERM "$pid" 2>/dev/null || true
     fi
     exit 0
+fi
+
+if [ -f "${socket}.hang_inventory" ]; then
+    while :; do
+        sleep 0.05
+    done
+fi
+
+if [ -f "${socket}.exact_limit" ] || [ -f "${socket}.over_limit" ]; then
+    output_size=4194304
+    if [ -f "${socket}.over_limit" ]; then
+        output_size=4194305
+    fi
+    exec awk -v target="$output_size" 'BEGIN {
+        prefix="[{\"vmid\":107,\"name\":\"LABZ1-CM01\",\"status\":\"running\",\"template\":0,\"padding\":\"";
+        suffix="\"}]";
+        remaining=target-length(prefix)-length(suffix);
+        block=sprintf("%01024d", 0);
+        printf "%s", prefix;
+        while (remaining >= 1024) { printf "%s", block; remaining-=1024; }
+        while (remaining > 0) { printf "x"; remaining--; }
+        printf "%s", suffix;
+    }'
+fi
+
+if [ -f "${socket}.large_stderr" ]; then
+    : > "${socket}.inventory_running"
+    awk 'BEGIN { for (i = 0; i < 100; i++) printf "%01024d", 0 }' >&2
+    rm -f "${socket}.inventory_running"
 fi
 
 if [ -f "${socket}.oversized" ]; then
@@ -68,4 +107,14 @@ if [ -f "${socket}.malformed" ]; then
     exit 0
 fi
 
-printf '%s\n' '[{"vmid":205,"name":"LabZ1-APP01","node":"pve2","status":"stopped","template":0},{"vmid":301,"name":"template-base","node":"pve2","status":"stopped","template":1},{"vmid":107,"name":"LABZ1-CM01","node":"pve2","status":"running","template":0}]'
+if [ -f "${socket}.matching_node" ]; then
+    printf '%s\n' '[{"vmid":107,"name":"LABZ1-CM01","node":"pve2","status":"running","template":0}]'
+    exit 0
+fi
+
+if [ -f "${socket}.mismatched_node" ]; then
+    printf '%s\n' '[{"vmid":107,"name":"LABZ1-CM01","node":"pve1","status":"running","template":0}]'
+    exit 0
+fi
+
+printf '%s\n' '[{"vmid":205,"name":"LabZ1-APP01","status":"stopped","template":0},{"vmid":301,"name":"template-base","status":"stopped","template":1},{"vmid":107,"name":"LABZ1-CM01","status":"running","template":0}]'

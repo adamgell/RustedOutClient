@@ -2,7 +2,12 @@ use std::{io, process::Stdio, time::SystemTime};
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Child,
+    task::JoinHandle,
+    time::{sleep_until, timeout, timeout_at, Duration, Instant},
+};
 
 use crate::{
     model::{NodeName, PveProfile, VmId},
@@ -13,6 +18,12 @@ use super::classify_stderr;
 
 const MAX_INVENTORY_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CAPTURED_STDERR_BYTES: usize = 65_536;
+#[cfg(not(test))]
+const INVENTORY_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const INVENTORY_PROCESS_TIMEOUT: Duration = Duration::from_secs(2);
+const REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -22,6 +33,7 @@ pub enum VmStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VmInventoryItem {
     pub vmid: VmId,
     pub name: String,
@@ -31,6 +43,7 @@ pub struct VmInventoryItem {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InventorySnapshot {
     pub observed_at_unix_ms: u64,
     pub stale: bool,
@@ -57,6 +70,10 @@ pub enum InventoryError {
     MalformedInventory,
     #[error("system time is before the Unix epoch")]
     InvalidSystemTime,
+    #[error("SSH inventory process timed out")]
+    ProcessTimedOut,
+    #[error("owned SSH inventory child cleanup failed (operation failed: {operation_failed})")]
+    OwnedChildCleanupFailed { operation_failed: bool },
 }
 
 pub struct InventoryClient;
@@ -71,7 +88,7 @@ impl InventoryClient {
         command.stdout(Stdio::piped());
         command.kill_on_drop(true);
         let mut child = command.spawn()?;
-        let mut stdout = child
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("SSH inventory stdout pipe was not available"))?;
@@ -79,21 +96,78 @@ impl InventoryClient {
             .stderr
             .take()
             .map(|stderr| tokio::spawn(capture_bounded(stderr, MAX_CAPTURED_STDERR_BYTES)));
+        let mut stdout_task = tokio::spawn(read_capped(stdout, MAX_INVENTORY_STDOUT_BYTES));
+        let deadline = Instant::now() + INVENTORY_PROCESS_TIMEOUT;
 
-        let stdout_result = read_capped(&mut stdout, MAX_INVENTORY_STDOUT_BYTES).await;
-        drop(stdout);
-        let stdout = match stdout_result {
-            Ok(stdout) => stdout,
-            Err(error) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                let _ = join_capture(stderr_task).await;
-                return Err(error);
-            }
+        enum FirstCompletion {
+            Stdout(Result<Result<Vec<u8>, InventoryError>, tokio::task::JoinError>),
+            Status(io::Result<std::process::ExitStatus>),
+            TimedOut,
+        }
+
+        let first = tokio::select! {
+            stdout = &mut stdout_task => FirstCompletion::Stdout(stdout),
+            status = child.wait() => FirstCompletion::Status(status),
+            _ = sleep_until(deadline) => FirstCompletion::TimedOut,
         };
 
-        let status = child.wait().await?;
-        let stderr = join_capture(stderr_task).await?;
+        let (status, stdout, stderr) = match first {
+            FirstCompletion::Stdout(stdout) => {
+                let stdout = match flatten_stdout(stdout) {
+                    Ok(stdout) => stdout,
+                    Err(error) => {
+                        let cleanup = cleanup_inventory_child(&mut child, stderr_task).await;
+                        return compose_process_result(Err(error), cleanup);
+                    }
+                };
+                let status = match timeout_at(deadline, child.wait()).await {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(error)) => {
+                        let cleanup = cleanup_inventory_child(&mut child, stderr_task).await;
+                        return compose_process_result(Err(InventoryError::Io(error)), cleanup);
+                    }
+                    Err(_) => {
+                        let cleanup = cleanup_inventory_child(&mut child, stderr_task).await;
+                        return compose_process_result(
+                            Err(InventoryError::ProcessTimedOut),
+                            cleanup,
+                        );
+                    }
+                };
+                let stderr = finish_stderr(stderr_task).await?;
+                (status, stdout, stderr)
+            }
+            FirstCompletion::Status(status) => {
+                let status = match status {
+                    Ok(status) => status,
+                    Err(error) => {
+                        let cleanup = cleanup_inventory_child(&mut child, stderr_task).await;
+                        stdout_task.abort();
+                        return compose_process_result(Err(InventoryError::Io(error)), cleanup);
+                    }
+                };
+                let stdout_result = finish_stdout(&mut stdout_task).await;
+                let stderr_result = finish_stderr(stderr_task).await;
+                let stderr = match stderr_result {
+                    Ok(stderr) => stderr,
+                    Err(cleanup) => {
+                        return match stdout_result {
+                            Ok(_) => Err(cleanup),
+                            Err(operation) => compose_process_result::<InventorySnapshot>(
+                                Err(operation),
+                                Err(cleanup),
+                            ),
+                        };
+                    }
+                };
+                (status, stdout_result?, stderr)
+            }
+            FirstCompletion::TimedOut => {
+                let cleanup = cleanup_inventory_child(&mut child, stderr_task).await;
+                stdout_task.abort();
+                return compose_process_result(Err(InventoryError::ProcessTimedOut), cleanup);
+            }
+        };
         if !status.success() {
             return Err(classify_stderr(&stderr).into());
         }
@@ -104,7 +178,7 @@ impl InventoryClient {
             .as_millis()
             .try_into()
             .map_err(|_| InventoryError::InvalidSystemTime)?;
-        parse_inventory(&stdout, observed_at_unix_ms)
+        parse_inventory(&stdout, observed_at_unix_ms, &profile.node)
     }
 }
 
@@ -141,11 +215,35 @@ impl InventorySnapshot {
     }
 }
 
+pub(crate) fn normalize_inventory_snapshot(
+    mut snapshot: InventorySnapshot,
+    stale: bool,
+) -> Result<InventorySnapshot, InventoryError> {
+    if snapshot
+        .vms
+        .iter()
+        .any(|item| item.name.is_empty() || item.name.chars().any(char::is_control))
+    {
+        return Err(InventoryError::MalformedInventory);
+    }
+    snapshot.vms.sort_by_key(|item| item.vmid);
+    if snapshot
+        .vms
+        .windows(2)
+        .any(|items| items[0].vmid == items[1].vmid)
+    {
+        return Err(InventoryError::MalformedInventory);
+    }
+    snapshot.vms.retain(|item| !item.template);
+    snapshot.stale = stale;
+    Ok(snapshot)
+}
+
 #[derive(Deserialize)]
 struct RawVmInventoryItem {
     vmid: u32,
     name: String,
-    node: String,
+    node: Option<String>,
     status: VmStatus,
     #[serde(default, deserialize_with = "deserialize_template")]
     template: bool,
@@ -173,6 +271,7 @@ where
 fn parse_inventory(
     json: &[u8],
     observed_at_unix_ms: u64,
+    endpoint_node: &NodeName,
 ) -> Result<InventorySnapshot, InventoryError> {
     let records: Vec<RawVmInventoryItem> =
         serde_json::from_slice(json).map_err(|_| InventoryError::MalformedInventory)?;
@@ -182,11 +281,17 @@ fn parse_inventory(
             return Err(InventoryError::MalformedInventory);
         }
         let vmid = VmId::new(record.vmid).map_err(|_| InventoryError::MalformedInventory)?;
-        let node = NodeName::parse(record.node).map_err(|_| InventoryError::MalformedInventory)?;
+        if record
+            .node
+            .as_deref()
+            .is_some_and(|node| node != endpoint_node.as_str())
+        {
+            return Err(InventoryError::MalformedInventory);
+        }
         vms.push(VmInventoryItem {
             vmid,
             name: record.name,
-            node,
+            node: endpoint_node.clone(),
             status: record.status,
             template: record.template,
         });
@@ -216,14 +321,72 @@ where
     }
 }
 
-async fn join_capture(
-    task: Option<tokio::task::JoinHandle<io::Result<Vec<u8>>>>,
-) -> Result<Vec<u8>, io::Error> {
+fn flatten_stdout(
+    result: Result<Result<Vec<u8>, InventoryError>, tokio::task::JoinError>,
+) -> Result<Vec<u8>, InventoryError> {
+    result.unwrap_or(Err(InventoryError::OwnedChildCleanupFailed {
+        operation_failed: true,
+    }))
+}
+
+async fn finish_stdout(
+    task: &mut JoinHandle<Result<Vec<u8>, InventoryError>>,
+) -> Result<Vec<u8>, InventoryError> {
+    match timeout(PIPE_DRAIN_TIMEOUT, &mut *task).await {
+        Ok(result) => flatten_stdout(result),
+        Err(_) => {
+            task.abort();
+            Err(InventoryError::OwnedChildCleanupFailed {
+                operation_failed: false,
+            })
+        }
+    }
+}
+
+async fn finish_stderr(
+    mut task: Option<JoinHandle<io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>, InventoryError> {
     match task {
-        Some(task) => task
-            .await
-            .map_err(|error| io::Error::other(format!("SSH capture task failed: {error}")))?,
+        Some(ref mut task) => match timeout(PIPE_DRAIN_TIMEOUT, &mut *task).await {
+            Ok(Ok(Ok(stderr))) => Ok(stderr),
+            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
+                task.abort();
+                Err(InventoryError::OwnedChildCleanupFailed {
+                    operation_failed: false,
+                })
+            }
+        },
         None => Ok(Vec::new()),
+    }
+}
+
+async fn cleanup_inventory_child(
+    child: &mut Child,
+    stderr_task: Option<JoinHandle<io::Result<Vec<u8>>>>,
+) -> Result<(), InventoryError> {
+    let kill_failed = child.start_kill().is_err();
+    let reap_failed = !matches!(timeout(REAP_TIMEOUT, child.wait()).await, Ok(Ok(_)));
+    let drain_failed = finish_stderr(stderr_task).await.is_err();
+    if kill_failed || reap_failed || drain_failed {
+        Err(InventoryError::OwnedChildCleanupFailed {
+            operation_failed: false,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn compose_process_result<T>(
+    operation: Result<T, InventoryError>,
+    cleanup: Result<(), InventoryError>,
+) -> Result<T, InventoryError> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(_), Err(_)) => Err(InventoryError::OwnedChildCleanupFailed {
+            operation_failed: true,
+        }),
     }
 }
 
@@ -241,7 +404,9 @@ mod tests {
     use tempfile::{tempdir, TempDir};
     use tokio::time::{sleep, timeout};
 
-    use super::{parse_inventory, InventoryClient, InventoryError, VmStatus};
+    use super::{
+        compose_process_result, parse_inventory, InventoryClient, InventoryError, VmStatus,
+    };
     use crate::{
         model::{NodeName, PveProfile, SshTarget},
         runtime::RuntimeDir,
@@ -319,6 +484,31 @@ mod tests {
         assert!(argv.contains("pvesh get /nodes/pve2/qemu --output-format json"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn optional_live_node_must_match_the_validated_endpoint_node() {
+        for (marker, should_succeed) in [("matching_node", true), ("mismatched_node", false)] {
+            let runtime = RuntimeDir::create().unwrap();
+            let (_fixture_directory, executable) = fake_ssh();
+            fs::write(
+                runtime.control_socket().with_extension(marker),
+                b"synthetic fixture control\n",
+            )
+            .unwrap();
+            let factory =
+                SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+
+            let result = InventoryClient::fetch(&factory, &fixture_profile()).await;
+
+            if should_succeed {
+                let snapshot = result.unwrap();
+                assert_eq!(snapshot.vms[0].node.as_str(), "pve2");
+            } else {
+                assert!(matches!(result, Err(InventoryError::MalformedInventory)));
+            }
+        }
+    }
+
     #[test]
     fn parser_rejects_missing_or_invalid_vmids_and_statuses() {
         for json in [
@@ -328,7 +518,7 @@ mod tests {
             br#"[{"vmid":107,"name":"unknown-status","node":"pve2","status":"paused"}]"#.as_slice(),
         ] {
             assert!(matches!(
-                parse_inventory(json, 1),
+                parse_inventory(json, 1, &NodeName::parse("pve2").unwrap()),
                 Err(InventoryError::MalformedInventory)
             ));
         }
@@ -359,5 +549,98 @@ mod tests {
         let result = InventoryClient::fetch(&factory, &fixture_profile()).await;
 
         assert!(matches!(result, Err(InventoryError::StdoutTooLarge)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_accepts_exactly_four_mib_and_rejects_four_mib_plus_one() {
+        for (marker, should_succeed) in [("exact_limit", true), ("over_limit", false)] {
+            let runtime = RuntimeDir::create().unwrap();
+            let (_fixture_directory, executable) = fake_ssh();
+            fs::write(
+                runtime.control_socket().with_extension(marker),
+                b"synthetic fixture control\n",
+            )
+            .unwrap();
+            let factory =
+                SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+
+            let result = InventoryClient::fetch(&factory, &fixture_profile()).await;
+
+            if should_succeed {
+                assert_eq!(result.unwrap().vms[0].vmid.get(), 107);
+            } else {
+                assert!(matches!(result, Err(InventoryError::StdoutTooLarge)));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_process_stderr_above_capture_limit_is_drained_and_reaped() {
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("large_stderr"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+
+        let result = timeout(
+            Duration::from_secs(4),
+            InventoryClient::fetch(&factory, &fixture_profile()),
+        )
+        .await;
+
+        assert_eq!(result.unwrap().unwrap().vms[0].vmid.get(), 107);
+        assert!(!runtime
+            .control_socket()
+            .with_extension("inventory_running")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hanging_inventory_child_is_bounded_killed_and_reaped() {
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("hang_inventory"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+
+        let result = timeout(
+            Duration::from_secs(4),
+            InventoryClient::fetch(&factory, &fixture_profile()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "inventory exceeded its owned-child deadline"
+        );
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn inventory_error_composition_preserves_operation_and_cleanup_failure() {
+        let result: Result<(), InventoryError> = compose_process_result(
+            Err(InventoryError::StdoutTooLarge),
+            Err(InventoryError::OwnedChildCleanupFailed {
+                operation_failed: false,
+            }),
+        );
+
+        assert!(matches!(
+            result,
+            Err(InventoryError::OwnedChildCleanupFailed {
+                operation_failed: true,
+            })
+        ));
     }
 }

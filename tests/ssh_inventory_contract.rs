@@ -191,3 +191,84 @@ fn cache_rejects_non_private_existing_storage() {
     assert!(cache.load().is_err());
     assert!(cache.save(&snapshot).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn cache_rejects_symlink_parent_and_destination_without_touching_targets() {
+    use std::os::unix::fs::symlink;
+
+    let root = private_tempdir();
+    let real_directory = root.path().join("real-cache");
+    fs::create_dir(&real_directory).unwrap();
+    fs::set_permissions(&real_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let linked_directory = root.path().join("linked-cache");
+    symlink(&real_directory, &linked_directory).unwrap();
+    let snapshot = InventorySnapshot::new(
+        1,
+        false,
+        vec![vm(107, "LABZ1-CM01", VmStatus::Running, false)],
+    );
+
+    let parent_link_cache = InventoryCache::new(linked_directory.join("inventory-v1.json"));
+    assert!(parent_link_cache.save(&snapshot).is_err());
+    assert!(!real_directory.join("inventory-v1.json").exists());
+
+    let outside = root.path().join("outside.json");
+    fs::write(&outside, b"outside must remain unchanged\n").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+    let destination = real_directory.join("inventory-v1.json");
+    symlink(&outside, &destination).unwrap();
+    let destination_link_cache = InventoryCache::new(destination);
+
+    assert!(destination_link_cache.load().is_err());
+    assert!(destination_link_cache.save(&snapshot).is_err());
+    assert_eq!(
+        fs::read(&outside).unwrap(),
+        b"outside must remain unchanged\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_rejects_unknown_fields_duplicate_vmids_and_invalid_names() {
+    let directory = private_tempdir();
+    let path = directory.path().join("inventory-v1.json");
+    let cache = InventoryCache::new(path.clone());
+    let snapshot = InventorySnapshot::new(
+        1,
+        false,
+        vec![vm(107, "LABZ1-CM01", VmStatus::Running, false)],
+    );
+    cache.save(&snapshot).unwrap();
+    let valid: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+    let mut cases = Vec::new();
+    let mut unknown_top_level = valid.clone();
+    unknown_top_level["unexpected"] = serde_json::json!(true);
+    cases.push(unknown_top_level);
+
+    let mut unknown_vm_field = valid.clone();
+    unknown_vm_field["vms"][0]["unexpected"] = serde_json::json!(true);
+    cases.push(unknown_vm_field);
+
+    let mut duplicate = valid.clone();
+    let duplicated_item = duplicate["vms"][0].clone();
+    duplicate["vms"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicated_item);
+    cases.push(duplicate);
+
+    let mut empty_name = valid.clone();
+    empty_name["vms"][0]["name"] = serde_json::json!("");
+    cases.push(empty_name);
+
+    let mut control_name = valid;
+    control_name["vms"][0]["name"] = serde_json::json!("bad\nname");
+    cases.push(control_name);
+
+    for invalid in cases {
+        fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(cache.load().is_err(), "accepted invalid cache: {invalid}");
+    }
+}
