@@ -1,8 +1,8 @@
 use crate::{
-    connection::{FbRect, VncCommand},
+    connection::FbRect,
     model::VmId,
     ssh::InventorySnapshot,
-    vnc::VncOptions,
+    vnc::{ClipboardText, InputError, VncOptions},
 };
 
 use super::{PublicError, SessionId, SessionSnapshot};
@@ -10,10 +10,19 @@ use super::{PublicError, SessionId, SessionSnapshot};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OpenOptions {
     pub vnc: VncOptions,
+    pub view_only: bool,
+    pub clipboard_enabled: bool,
 }
 
 pub enum InputAction {
-    Forward(VncCommand),
+    Key { down: bool, keysym: u32 },
+    Pointer { buttons: u8, x: u16, y: u16 },
+    CtrlAltDelete,
+    ReleaseAllKeys,
+    FocusLost,
+    SetViewOnly(bool),
+    SendClipboard(String),
+    ReceiveClipboard,
 }
 
 pub enum AppCommand {
@@ -45,6 +54,14 @@ pub enum AppEvent {
     Framebuffer {
         session_id: SessionId,
         rects: Vec<FbRect>,
+    },
+    ClipboardReceived {
+        session_id: SessionId,
+        text: ClipboardText,
+    },
+    InputRejected {
+        session_id: SessionId,
+        reason: InputError,
     },
     Error(PublicError),
 }

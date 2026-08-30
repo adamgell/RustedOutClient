@@ -14,6 +14,7 @@ use rustedoutclient::{
         SessionTransportEvent, APP_QUEUE_CAPACITY,
     },
     ssh::{InventorySnapshot, VmInventoryItem, VmStatus},
+    vnc::{ClipboardText, InputController, InputError, InputSink},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +26,9 @@ enum Operation {
     Open(VmId),
     CleanupFailedOpen(VmId),
     ReleaseKeys(VmId),
+    Key(VmId, bool, u32),
+    Pointer(VmId, u8, u16, u16),
+    Clipboard(VmId, usize),
     CloseSession(VmId),
     CloseMaster,
 }
@@ -79,6 +83,44 @@ struct FakeBackend {
 struct FakeSession {
     vmid: VmId,
     control: FakeControl,
+    input: InputController<FakeInputSink>,
+}
+
+struct FakeInputSink {
+    vmid: VmId,
+    control: FakeControl,
+}
+
+impl InputSink for FakeInputSink {
+    fn key(&mut self, down: bool, keysym: u32) -> Result<(), InputError> {
+        self.control
+            .0
+            .lock()
+            .unwrap()
+            .operations
+            .push(Operation::Key(self.vmid, down, keysym));
+        Ok(())
+    }
+
+    fn pointer(&mut self, buttons: u8, x: u16, y: u16) -> Result<(), InputError> {
+        self.control
+            .0
+            .lock()
+            .unwrap()
+            .operations
+            .push(Operation::Pointer(self.vmid, buttons, x, y));
+        Ok(())
+    }
+
+    fn send_clipboard(&mut self, text: String) -> Result<(), InputError> {
+        self.control
+            .0
+            .lock()
+            .unwrap()
+            .operations
+            .push(Operation::Clipboard(self.vmid, text.len()));
+        Ok(())
+    }
 }
 
 impl ManagedSession for FakeSession {
@@ -86,23 +128,49 @@ impl ManagedSession for FakeSession {
         Ok(self.control.0.lock().unwrap().session_events.pop_front())
     }
 
-    fn send_input(&mut self, _action: InputAction) -> Result<(), PublicError> {
-        Ok(())
+    fn mark_ready(&mut self) {
+        self.input.mark_ready();
+    }
+
+    fn send_input(&mut self, action: InputAction) -> Result<Option<ClipboardText>, InputError> {
+        match action {
+            InputAction::Key { down, keysym } => self.input.key(down, keysym).map(|()| None),
+            InputAction::Pointer { buttons, x, y } => {
+                self.input.pointer(buttons, x, y).map(|()| None)
+            }
+            InputAction::CtrlAltDelete => self.input.ctrl_alt_delete().map(|()| None),
+            InputAction::ReleaseAllKeys => self.input.release_all_keys().map(|()| None),
+            InputAction::FocusLost => self.input.focus_lost().map(|()| None),
+            InputAction::SetViewOnly(enabled) => self.input.set_view_only(enabled).map(|()| None),
+            InputAction::SendClipboard(text) => self.input.send_clipboard(text).map(|()| None),
+            InputAction::ReceiveClipboard => self.input.receive_clipboard(),
+        }
     }
 
     fn release_all_keys(&mut self) -> Result<(), PublicError> {
         let mut state = self.control.0.lock().unwrap();
         state.operations.push(Operation::ReleaseKeys(self.vmid));
-        state.release_results.pop_front().unwrap_or(Ok(()))
+        let configured = state.release_results.pop_front().unwrap_or(Ok(()));
+        drop(state);
+        let release = self
+            .input
+            .release_all_keys()
+            .map_err(|_| PublicError::new(PublicErrorKind::Queue));
+        configured.and(release)
     }
 
     fn close(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
         let vmid = self.vmid;
         let control = self.control.clone();
         Box::pin(async move {
+            let input_cleanup = self
+                .input
+                .clear_session()
+                .map_err(|_| PublicError::new(PublicErrorKind::Queue));
             let mut state = control.0.lock().unwrap();
             state.operations.push(Operation::CloseSession(vmid));
-            state.close_results.pop_front().unwrap_or(Ok(()))
+            let close = state.close_results.pop_front().unwrap_or(Ok(()));
+            input_cleanup.and(close)
         })
     }
 }
@@ -162,7 +230,7 @@ impl SessionBackend for FakeBackend {
     fn open_session(
         &mut self,
         vmid: VmId,
-        _options: OpenOptions,
+        options: OpenOptions,
     ) -> BackendFuture<'_, Result<Self::Session, PublicError>> {
         let control = self.control.clone();
         Box::pin(async move {
@@ -185,9 +253,14 @@ impl SessionBackend for FakeBackend {
                 Some(_) => {}
             }
             state.tickets_generated += 1;
+            let sink = FakeInputSink {
+                vmid,
+                control: control.clone(),
+            };
             Ok(FakeSession {
                 vmid,
                 control: control.clone(),
+                input: InputController::new(sink, options.view_only, options.clipboard_enabled),
             })
         })
     }
@@ -282,6 +355,64 @@ async fn open_to_negotiation(manager: &mut SessionManager) -> SessionId {
         AppEvent::SessionChanged(snapshot) => snapshot.session_id,
         _ => unreachable!(),
     }
+}
+
+async fn press_ready_key(
+    manager: &mut SessionManager,
+    control: &FakeControl,
+    session_id: SessionId,
+    keysym: u32,
+) {
+    control.push_session_event(SessionTransportEvent::Framebuffer(vec![FbRect {
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+        rgba: vec![0, 0, 0, 255],
+    }]));
+    recv_matching(manager, |event| {
+        matches!(event, AppEvent::SessionChanged(snapshot)
+            if snapshot.session_id == session_id && snapshot.phase == SessionPhase::Ready)
+    })
+    .await;
+    send_key_and_wait(manager, control, session_id, keysym).await;
+}
+
+async fn send_key_and_wait(
+    manager: &SessionManager,
+    control: &FakeControl,
+    session_id: SessionId,
+    keysym: u32,
+) {
+    manager
+        .send(AppCommand::SendInput {
+            session_id,
+            action: InputAction::Key { down: true, keysym },
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while operation_count(
+            control,
+            Operation::Key(VmId::new(100).unwrap(), true, keysym),
+        ) == 0
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("semantic key-down did not reach the real input controller");
+}
+
+fn assert_one_key_release(control: &FakeControl, keysym: u32) {
+    assert_eq!(
+        operation_count(
+            control,
+            Operation::Key(VmId::new(100).unwrap(), false, keysym),
+        ),
+        1,
+        "lifecycle cleanup must release the tracked key exactly once in effect"
+    );
 }
 
 async fn assert_one_error_then_disconnected(
@@ -418,6 +549,7 @@ async fn state_machine_reaches_ready_only_after_first_non_empty_frame_and_closes
         AppEvent::SessionChanged(snapshot) => snapshot.session_id,
         _ => unreachable!(),
     };
+    send_key_and_wait(&manager, &control, session_id, 0x41).await;
 
     manager
         .send(AppCommand::Close { session_id })
@@ -439,7 +571,109 @@ async fn state_machine_reaches_ready_only_after_first_non_empty_frame_and_closes
         .position(|operation| *operation == Operation::CloseSession(VmId::new(100).unwrap()))
         .unwrap();
     assert!(release_index < close_index);
+    assert_one_key_release(&control, 0x41);
     manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn manager_keeps_semantic_rejections_non_terminal_and_marks_controller_ready_from_frame() {
+    let live = inventory(2, vec![vm(100, VmStatus::Running)]);
+    let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+    let mut manager = SessionManager::spawn(config(), backend(&control));
+    wait_for_live_inventory(&mut manager).await;
+    let session_id = open_to_negotiation(&mut manager).await;
+
+    manager
+        .send(AppCommand::SendInput {
+            session_id,
+            action: InputAction::Key {
+                down: true,
+                keysym: 0x43,
+            },
+        })
+        .await
+        .unwrap();
+    recv_matching(&mut manager, |event| {
+        matches!(event, AppEvent::InputRejected { session_id: rejected, reason: InputError::NotReady }
+            if *rejected == session_id)
+    })
+    .await;
+    assert_eq!(
+        operation_count(
+            &control,
+            Operation::Key(VmId::new(100).unwrap(), true, 0x43),
+        ),
+        0
+    );
+
+    press_ready_key(&mut manager, &control, session_id, 0x43).await;
+    manager
+        .send(AppCommand::SendInput {
+            session_id,
+            action: InputAction::SetViewOnly(true),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while operation_count(
+            &control,
+            Operation::Key(VmId::new(100).unwrap(), false, 0x43),
+        ) == 0
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("view-only activation did not release the tracked key");
+    manager
+        .send(AppCommand::SendInput {
+            session_id,
+            action: InputAction::Pointer {
+                buttons: 1,
+                x: 10,
+                y: 20,
+            },
+        })
+        .await
+        .unwrap();
+    recv_matching(&mut manager, |event| {
+        matches!(event, AppEvent::InputRejected { session_id: rejected, reason: InputError::ViewOnly }
+            if *rejected == session_id)
+    })
+    .await;
+    assert_eq!(
+        operation_count(&control, Operation::CloseSession(VmId::new(100).unwrap())),
+        0
+    );
+
+    manager.shutdown().await.unwrap();
+    assert_one_key_release(&control, 0x43);
+}
+
+#[tokio::test]
+async fn disconnect_and_terminal_error_each_release_a_real_controller_key_once() {
+    for terminal in [
+        SessionTransportEvent::Disconnected,
+        SessionTransportEvent::Error(PublicError::new(PublicErrorKind::RfbProtocol)),
+    ] {
+        let live = inventory(2, vec![vm(100, VmStatus::Running)]);
+        let control = FakeControl::with_cached_and_inventories(None, [live.clone(), live]);
+        let mut manager = SessionManager::spawn(config(), backend(&control));
+        wait_for_live_inventory(&mut manager).await;
+        let session_id = open_to_negotiation(&mut manager).await;
+        press_ready_key(&mut manager, &control, session_id, 0x44).await;
+
+        control.push_session_event(terminal);
+        recv_matching(&mut manager, |event| {
+            matches!(event, AppEvent::SessionChanged(snapshot)
+                if snapshot.session_id == session_id
+                    && snapshot.phase == SessionPhase::Disconnected)
+        })
+        .await;
+        assert_one_key_release(&control, 0x44);
+        manager.shutdown().await.unwrap();
+        assert_one_key_release(&control, 0x44);
+    }
 }
 
 #[test]
@@ -603,6 +837,7 @@ async fn reconnect_closes_old_session_before_fresh_validation_and_proxy_open() {
         AppEvent::SessionChanged(snapshot) => snapshot.session_id,
         _ => unreachable!(),
     };
+    press_ready_key(&mut manager, &control, old_id, 0x42).await;
 
     manager
         .send(AppCommand::Reconnect { session_id: old_id })
@@ -632,6 +867,7 @@ async fn reconnect_closes_old_session_before_fresh_validation_and_proxy_open() {
         .rposition(|operation| *operation == Operation::Open(VmId::new(100).unwrap()))
         .unwrap();
     assert!(close_index < reopen_index);
+    assert_one_key_release(&control, 0x42);
     manager.shutdown().await.unwrap();
 }
 
@@ -929,17 +1165,8 @@ async fn shutdown_drains_a_full_app_queue_and_completes_owned_cleanup() {
         FakeControl::with_cached_and_inventories(None, [live.clone(), live.clone(), live]);
     let mut manager = SessionManager::spawn(config(), backend(&control));
     wait_for_live_inventory(&mut manager).await;
-    manager
-        .send(AppCommand::Open {
-            vmid: VmId::new(100).unwrap(),
-            options: OpenOptions::default(),
-        })
-        .await
-        .unwrap();
-    recv_matching(&mut manager, |event| {
-        matches!(event, AppEvent::SessionChanged(snapshot) if snapshot.phase == SessionPhase::NegotiatingRfb)
-    })
-    .await;
+    let session_id = open_to_negotiation(&mut manager).await;
+    press_ready_key(&mut manager, &control, session_id, 0x45).await;
 
     for _ in 0..(APP_QUEUE_CAPACITY * 2) {
         control.push_session_event(SessionTransportEvent::Framebuffer(vec![FbRect {
@@ -978,4 +1205,5 @@ async fn shutdown_drains_a_full_app_queue_and_completes_owned_cleanup() {
             .count(),
         1
     );
+    assert_one_key_release(&control, 0x45);
 }

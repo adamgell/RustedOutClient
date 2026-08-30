@@ -1,6 +1,6 @@
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
-use crate::vnc::RfbError;
+use crate::vnc::{ClipboardText, RfbError};
 
 pub const VNC_QUEUE_CAPACITY: usize = 256;
 
@@ -18,7 +18,7 @@ pub enum VncEvent {
     DesktopSize(u32, u32),
     FramebufferRects(Vec<FbRect>),
     DesktopName(String),
-    ClipboardText(String),
+    ClipboardText(ClipboardText),
     Error(RfbError),
     Disconnected,
 }

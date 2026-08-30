@@ -21,7 +21,7 @@ use super::{
     negotiate_version,
     security::negotiate_security,
     wire::{allocate_zeroed, sanitize_remote_text},
-    ProtocolLimits, RfbError, RfbErrorKind, RfbPhase, RfbReader,
+    ClipboardText, ProtocolLimits, RfbError, RfbErrorKind, RfbPhase, RfbReader,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -683,7 +683,13 @@ where
                         RfbPhase::Session,
                     )
                     .await?;
-                let text = sanitize_remote_text(&text, RfbPhase::Session, "server clipboard")?;
+                let text = ClipboardText::try_from(text).map_err(|_| {
+                    RfbError::new(
+                        RfbPhase::Session,
+                        RfbErrorKind::Protocol,
+                        "server clipboard UTF-8",
+                    )
+                })?;
                 events.send_lossless(VncEvent::ClipboardText(text))?;
             }
             _ => {
@@ -1081,6 +1087,36 @@ mod tests {
         assert_eq!(returned.phase(), RfbPhase::Authentication);
         assert_eq!(returned.kind(), RfbErrorKind::SecurityFailure);
         assert!(returned.has_cleanup_failure());
+    }
+
+    #[tokio::test]
+    async fn malformed_remote_clipboard_utf8_fails_closed_before_event_delivery() {
+        let mut message = vec![server_msg::SERVER_CUT_TEXT, 0, 0, 0];
+        message.extend_from_slice(&2_u32.to_be_bytes());
+        message.extend_from_slice(&[0x66, 0x80]);
+
+        let (client, mut peer) = duplex(64);
+        peer.write_all(&message).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let limits = ProtocolLimits::default();
+        let mut reader = RfbReader::new(client, limits);
+        let mut framebuffer = Framebuffer::new(1, 1, limits).unwrap();
+        let (event_tx, event_rx) = bounded(8);
+        let mut events = EventQueue::new(event_tx, limits);
+        let (_command_tx, command_rx) = bounded::<VncCommand>(1);
+
+        let error = run_session(
+            &mut reader,
+            &mut framebuffer,
+            &mut events,
+            &command_rx,
+            limits,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.phase(), RfbPhase::Session);
+        assert_eq!(error.kind(), RfbErrorKind::Protocol);
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]

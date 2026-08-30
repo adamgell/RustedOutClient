@@ -22,7 +22,9 @@ use crate::{
         InventoryError, InventorySnapshot, ProxyOpenError, SshCommandFactory, SshFailureKind,
         SshMaster, SshMasterError, TrustedSshProxy,
     },
-    vnc::{RfbError, RfbErrorKind, RfbPhase, VncClient},
+    vnc::{
+        ClipboardText, InputController, InputError, RfbError, RfbErrorKind, RfbPhase, VncClient,
+    },
 };
 
 use super::{
@@ -38,7 +40,8 @@ pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait ManagedSession: Send + 'static {
     fn try_recv(&mut self) -> Result<Option<SessionTransportEvent>, PublicError>;
-    fn send_input(&mut self, action: InputAction) -> Result<(), PublicError>;
+    fn mark_ready(&mut self);
+    fn send_input(&mut self, action: InputAction) -> Result<Option<ClipboardText>, InputError>;
     fn release_all_keys(&mut self) -> Result<(), PublicError>;
     fn close(&mut self) -> BackendFuture<'_, Result<(), PublicError>>;
 }
@@ -322,11 +325,23 @@ where
         let result = self.sessions[index]
             .session
             .as_mut()
-            .ok_or_else(|| PublicError::new(PublicErrorKind::Queue))
-            .and_then(|session| session.send_input(action));
-        if let Err(error) = result {
-            let contextual = error.for_session(session_id, vmid);
-            let _ = self.close_session(index, Some(contextual)).await;
+            .map(|session| session.send_input(action));
+        match result {
+            Some(Ok(Some(text))) => {
+                self.emit_critical(AppEvent::ClipboardReceived { session_id, text })
+                    .await;
+            }
+            Some(Ok(None)) => {}
+            Some(Err(reason)) => {
+                self.emit_critical(AppEvent::InputRejected { session_id, reason })
+                    .await;
+            }
+            None => {
+                self.emit_critical(AppEvent::Error(
+                    PublicError::new(PublicErrorKind::Queue).for_session(session_id, vmid),
+                ))
+                .await;
+            }
         }
     }
 
@@ -349,6 +364,9 @@ where
                         continue;
                     }
                     if self.sessions[index].snapshot.phase == SessionPhase::NegotiatingRfb {
+                        if let Some(session) = self.sessions[index].session.as_mut() {
+                            session.mark_ready();
+                        }
                         self.transition(index, SessionPhase::Ready).await;
                     }
                     let session_id = self.sessions[index].snapshot.session_id;
@@ -550,7 +568,7 @@ impl SessionBackend for ProductionBackend {
 }
 
 pub struct ProductionSession {
-    connection: VncConnection,
+    input: InputController<VncConnection>,
     task: Option<JoinHandle<()>>,
     terminal: Arc<Mutex<Option<Result<(), PublicError>>>>,
     terminal_reported: bool,
@@ -580,7 +598,7 @@ impl ProductionSession {
             drop(terminal_sender);
         });
         Self {
-            connection,
+            input: InputController::new(connection, options.view_only, options.clipboard_enabled),
             task: Some(task),
             terminal,
             terminal_reported: false,
@@ -609,7 +627,7 @@ impl ProductionSession {
 impl ManagedSession for ProductionSession {
     fn try_recv(&mut self) -> Result<Option<SessionTransportEvent>, PublicError> {
         loop {
-            match self.connection.event_rx.try_recv() {
+            match self.input.connection().event_rx.try_recv() {
                 Ok(VncEvent::FramebufferRects(rects)) => {
                     return Ok(Some(SessionTransportEvent::Framebuffer(rects)));
                 }
@@ -621,11 +639,8 @@ impl ManagedSession for ProductionSession {
                     self.terminal_reported = true;
                     return Ok(Some(SessionTransportEvent::Disconnected));
                 }
-                Ok(
-                    VncEvent::DesktopSize(_, _)
-                    | VncEvent::DesktopName(_)
-                    | VncEvent::ClipboardText(_),
-                ) => {}
+                Ok(VncEvent::ClipboardText(text)) => self.input.buffer_remote_clipboard(text),
+                Ok(VncEvent::DesktopSize(_, _) | VncEvent::DesktopName(_)) => {}
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     return Ok(self.take_terminal_event());
                 }
@@ -645,21 +660,37 @@ impl ManagedSession for ProductionSession {
         }
     }
 
-    fn send_input(&mut self, action: InputAction) -> Result<(), PublicError> {
-        let InputAction::Forward(command) = action;
-        self.connection
-            .command_tx
-            .try_send(command)
-            .map_err(|_| PublicError::new(PublicErrorKind::Queue))
+    fn mark_ready(&mut self) {
+        self.input.mark_ready();
+    }
+
+    fn send_input(&mut self, action: InputAction) -> Result<Option<ClipboardText>, InputError> {
+        match action {
+            InputAction::Key { down, keysym } => self.input.key(down, keysym).map(|()| None),
+            InputAction::Pointer { buttons, x, y } => {
+                self.input.pointer(buttons, x, y).map(|()| None)
+            }
+            InputAction::CtrlAltDelete => self.input.ctrl_alt_delete().map(|()| None),
+            InputAction::ReleaseAllKeys => self.input.release_all_keys().map(|()| None),
+            InputAction::FocusLost => self.input.focus_lost().map(|()| None),
+            InputAction::SetViewOnly(enabled) => self.input.set_view_only(enabled).map(|()| None),
+            InputAction::SendClipboard(text) => self.input.send_clipboard(text).map(|()| None),
+            InputAction::ReceiveClipboard => self.input.receive_clipboard(),
+        }
     }
 
     fn release_all_keys(&mut self) -> Result<(), PublicError> {
-        // Task 10 replaces this compile-safe lifecycle seam with tracked-key release.
-        Ok(())
+        self.input
+            .release_all_keys()
+            .map_err(|_| PublicError::new(PublicErrorKind::Queue))
     }
 
     fn close(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
         Box::pin(async move {
+            let input_cleanup = self
+                .input
+                .clear_session()
+                .map_err(|_| PublicError::new(PublicErrorKind::Queue));
             if let Some(cancel) = self.cancel.take() {
                 let _ = cancel.send(());
             }
@@ -672,14 +703,15 @@ impl ManagedSession for ProductionSession {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .unwrap_or(Ok(()));
-            match terminal_result {
+            let terminal_result = match terminal_result {
                 Err(error) if error.kind() == PublicErrorKind::Cleanup => Err(error),
                 Err(error) if !self.terminal_reported => {
                     self.terminal_reported = true;
                     Err(error)
                 }
                 Ok(()) | Err(_) => Ok(()),
-            }
+            };
+            input_cleanup.and(terminal_result)
         })
     }
 }
@@ -794,17 +826,18 @@ mod tests {
     };
     use crate::{
         config::AppConfig,
-        connection::{bounded_vnc_channels, FbRect, VncEvent, VNC_QUEUE_CAPACITY},
+        connection::{bounded_vnc_channels, FbRect, VncCommand, VncEvent, VNC_QUEUE_CAPACITY},
         model::{NodeName, PveProfile, SshTarget, VmId},
         runtime::RuntimeDir,
         session::{
-            AppCommand, AppEvent, PublicError, PublicErrorKind, SessionPhase, SessionTransportEvent,
+            AppCommand, AppEvent, InputAction, PublicError, PublicErrorKind, SessionPhase,
+            SessionTransportEvent,
         },
         ssh::{
             InventorySnapshot, SshCommandFactory, SshMaster, TrustedSshProxy, VmInventoryItem,
             VmStatus,
         },
-        vnc::{RfbError, RfbErrorKind, RfbPhase},
+        vnc::{ClipboardText, InputController, RfbError, RfbErrorKind, RfbPhase},
     };
 
     fn production_session(
@@ -814,7 +847,7 @@ mod tests {
         let (connection, channels) = bounded_vnc_channels();
         (
             ProductionSession {
-                connection,
+                input: InputController::new(connection, false, false),
                 task: None,
                 terminal: Arc::new(Mutex::new(terminal)),
                 terminal_reported,
@@ -840,7 +873,7 @@ mod tests {
                 .unwrap();
         }
         let mut session = ProductionSession {
-            connection,
+            input: InputController::new(connection, false, false),
             task: None,
             terminal: Arc::new(Mutex::new(Some(Err(PublicError::new(
                 PublicErrorKind::RfbProtocol,
@@ -888,6 +921,86 @@ mod tests {
         let error = session.close().await.unwrap_err();
         assert_eq!(error.kind(), PublicErrorKind::Decoder);
         assert!(session.close().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn production_session_buffers_remote_clipboard_until_one_explicit_receive_and_close() {
+        let (connection, channels) = bounded_vnc_channels();
+        let mut session = ProductionSession {
+            input: InputController::new(connection, false, true),
+            task: None,
+            terminal: Arc::new(Mutex::new(None)),
+            terminal_reported: false,
+            cancel: None,
+        };
+        session.mark_ready();
+        channels
+            .event_tx
+            .try_send(VncEvent::ClipboardText(
+                ClipboardText::try_from(b"first".to_vec()).unwrap(),
+            ))
+            .unwrap();
+        channels
+            .event_tx
+            .try_send(VncEvent::ClipboardText(
+                ClipboardText::try_from(b"second".to_vec()).unwrap(),
+            ))
+            .unwrap();
+        assert!(session.try_recv().unwrap().is_none());
+
+        let received = session
+            .send_input(InputAction::ReceiveClipboard)
+            .unwrap()
+            .expect("explicit receive must surface the pending text");
+        assert_eq!(received.as_str(), "second");
+        assert!(session
+            .send_input(InputAction::ReceiveClipboard)
+            .unwrap()
+            .is_none());
+
+        channels
+            .event_tx
+            .try_send(VncEvent::ClipboardText(
+                ClipboardText::try_from(b"clear on close".to_vec()).unwrap(),
+            ))
+            .unwrap();
+        assert!(session.try_recv().unwrap().is_none());
+        session.close().await.unwrap();
+        session.mark_ready();
+        assert!(session
+            .send_input(InputAction::ReceiveClipboard)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn production_session_release_then_close_has_one_effective_key_up() {
+        let (mut session, channels) = production_session(None, false);
+        session.mark_ready();
+        session
+            .send_input(InputAction::Key {
+                down: true,
+                keysym: 0x41,
+            })
+            .unwrap();
+        assert!(matches!(
+            channels.command_rx.try_recv(),
+            Ok(VncCommand::KeyEvent {
+                down: true,
+                keysym: 0x41,
+            })
+        ));
+
+        session.release_all_keys().unwrap();
+        assert!(matches!(
+            channels.command_rx.try_recv(),
+            Ok(VncCommand::KeyEvent {
+                down: false,
+                keysym: 0x41,
+            })
+        ));
+        session.close().await.unwrap();
+        assert!(channels.command_rx.try_recv().is_err());
     }
 
     #[test]

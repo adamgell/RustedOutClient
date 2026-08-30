@@ -1,0 +1,5 @@
+error[E0599]: no variant or associated item named `Forward` found for enum `InputAction` in the current scope
+ --> tests/ui/raw_input_forward.rs:7:26
+  |
+7 |     let _ = InputAction::Forward(VncCommand::Disconnect);
+  |                          ^^^^^^^ variant or associated item not found in `InputAction`
