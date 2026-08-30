@@ -46,24 +46,73 @@ pub struct ServerInit {
     pub framebuffer: Vec<u8>,
 }
 
+const CANONICAL_DECODER_FORMAT: PixelFormat = PixelFormat {
+    bits_per_pixel: 32,
+    depth: 24,
+    big_endian: false,
+    true_colour: true,
+    red_max: 255,
+    green_max: 255,
+    blue_max: 255,
+    red_shift: 16,
+    green_shift: 8,
+    blue_shift: 0,
+};
+
+fn pixel_format_error() -> RfbError {
+    RfbError::new(
+        RfbPhase::ServerInit,
+        RfbErrorKind::ServerInit,
+        "pixel format",
+    )
+}
+
+fn checked_channel_mask(maximum: u16, shift: u8, bits_per_pixel: u8) -> Option<(u64, u32)> {
+    if maximum == 0 {
+        return None;
+    }
+    let levels = u32::from(maximum).checked_add(1)?;
+    if !levels.is_power_of_two() {
+        return None;
+    }
+    let channel_bits = levels.trailing_zeros();
+    let mask = u64::from(maximum).checked_shl(u32::from(shift))?;
+    let pixel_mask = (1_u64.checked_shl(u32::from(bits_per_pixel))?).checked_sub(1)?;
+    if mask & !pixel_mask != 0 {
+        return None;
+    }
+    Some((mask, channel_bits))
+}
+
 fn validate_pixel_format(pixel_format: &PixelFormat) -> Result<(), RfbError> {
     let bits = pixel_format.bits_per_pixel;
     if !matches!(bits, 8 | 16 | 32)
         || pixel_format.depth == 0
         || pixel_format.depth > bits
         || !pixel_format.true_colour
-        || pixel_format.red_max == 0
-        || pixel_format.green_max == 0
-        || pixel_format.blue_max == 0
-        || pixel_format.red_shift >= bits
-        || pixel_format.green_shift >= bits
-        || pixel_format.blue_shift >= bits
     {
-        return Err(RfbError::new(
-            RfbPhase::ServerInit,
-            RfbErrorKind::ServerInit,
-            "pixel format",
-        ));
+        return Err(pixel_format_error());
+    }
+
+    let (red_mask, red_bits) =
+        checked_channel_mask(pixel_format.red_max, pixel_format.red_shift, bits)
+            .ok_or_else(pixel_format_error)?;
+    let (green_mask, green_bits) =
+        checked_channel_mask(pixel_format.green_max, pixel_format.green_shift, bits)
+            .ok_or_else(pixel_format_error)?;
+    let (blue_mask, blue_bits) =
+        checked_channel_mask(pixel_format.blue_max, pixel_format.blue_shift, bits)
+            .ok_or_else(pixel_format_error)?;
+    let useful_bits = red_bits
+        .checked_add(green_bits)
+        .and_then(|count| count.checked_add(blue_bits))
+        .ok_or_else(pixel_format_error)?;
+    if red_mask & green_mask != 0
+        || red_mask & blue_mask != 0
+        || green_mask & blue_mask != 0
+        || useful_bits != u32::from(pixel_format.depth)
+    {
+        return Err(pixel_format_error());
     }
     Ok(())
 }
@@ -175,6 +224,20 @@ where
         desktop_name,
         framebuffer,
     })
+}
+
+fn decoder_pixel_format() -> &'static PixelFormat {
+    &CANONICAL_DECODER_FORMAT
+}
+
+async fn configure_server<S>(reader: &mut RfbReader<S>) -> Result<ServerInit, RfbError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let init = read_server_init(reader).await?;
+    send_set_pixel_format(reader).await?;
+    send_set_encodings(reader).await?;
+    Ok(init)
 }
 
 #[derive(Clone, Copy)]
@@ -358,30 +421,34 @@ impl VncClient {
             .write_u8(u8::from(options.shared))
             .await
             .map_err(|source| RfbError::io(RfbPhase::ServerInit, source))?;
-        let init = read_server_init(&mut reader).await?;
+        let init = configure_server(&mut reader).await?;
         debug!(
             width = init.width,
             height = init.height,
             "RFB ServerInit accepted"
         );
 
+        let ServerInit {
+            width,
+            height,
+            pixel_format: _,
+            desktop_name,
+            framebuffer: pixels,
+        } = init;
         let mut framebuffer = Framebuffer {
-            width: u32::from(init.width),
-            height: u32::from(init.height),
-            pixels: init.framebuffer,
+            width: u32::from(width),
+            height: u32::from(height),
+            pixels,
         };
-        let pixel_format = init.pixel_format;
         let mut events = EventQueue::new(event_tx, limits);
         events.send_lossless(VncEvent::DesktopSize(framebuffer.width, framebuffer.height))?;
-        events.send_lossless(VncEvent::DesktopName(init.desktop_name))?;
+        events.send_lossless(VncEvent::DesktopName(desktop_name))?;
 
-        send_set_encodings(&mut reader).await?;
-        send_fb_update_request(&mut reader, false, 0, 0, init.width, init.height).await?;
+        send_fb_update_request(&mut reader, false, 0, 0, width, height).await?;
 
         run_session(
             &mut reader,
             &mut framebuffer,
-            &pixel_format,
             &mut events,
             &command_rx,
             limits,
@@ -393,7 +460,6 @@ impl VncClient {
 async fn run_session<S>(
     reader: &mut RfbReader<S>,
     framebuffer: &mut Framebuffer,
-    pixel_format: &PixelFormat,
     events: &mut EventQueue,
     command_rx: &Receiver<VncCommand>,
     limits: ProtocolLimits,
@@ -401,6 +467,7 @@ async fn run_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let pixel_format = decoder_pixel_format();
     let mut zrle_decompressor = Decompress::new(true);
     let mut tight_state = TightState::new();
 
@@ -811,6 +878,29 @@ where
     Ok(())
 }
 
+async fn send_set_pixel_format<S>(reader: &mut RfbReader<S>) -> Result<(), RfbError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let pixel_format = decoder_pixel_format();
+    let mut message = [0_u8; 20];
+    message[0] = client_msg::SET_PIXEL_FORMAT;
+    message[4] = pixel_format.bits_per_pixel;
+    message[5] = pixel_format.depth;
+    message[6] = u8::from(pixel_format.big_endian);
+    message[7] = u8::from(pixel_format.true_colour);
+    message[8..10].copy_from_slice(&pixel_format.red_max.to_be_bytes());
+    message[10..12].copy_from_slice(&pixel_format.green_max.to_be_bytes());
+    message[12..14].copy_from_slice(&pixel_format.blue_max.to_be_bytes());
+    message[14] = pixel_format.red_shift;
+    message[15] = pixel_format.green_shift;
+    message[16] = pixel_format.blue_shift;
+    reader
+        .write_all(&message)
+        .await
+        .map_err(|source| RfbError::io(RfbPhase::ServerInit, source))
+}
+
 async fn send_set_encodings<S>(reader: &mut RfbReader<S>) -> Result<(), RfbError>
 where
     S: AsyncWrite + Unpin,
@@ -927,13 +1017,47 @@ where
 #[cfg(test)]
 mod tests {
     use crossbeam_channel::bounded;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
-    use super::{framebuffer_rects, EventQueue};
+    use super::{
+        configure_server, decoder_pixel_format, framebuffer_rects, tight, EventQueue, TightState,
+    };
     use crate::{
         connection::{FbRect, VncEvent},
         framebuffer::Framebuffer,
-        vnc::{ProtocolLimits, RfbError, RfbErrorKind, RfbPhase},
+        vnc::{ProtocolLimits, RfbError, RfbErrorKind, RfbPhase, RfbReader},
     };
+
+    const CANONICAL_FORMAT: [u8; 16] = [32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0];
+    const RGB565_16_FORMAT: [u8; 16] = [16, 16, 0, 1, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0];
+    const RGB565_32_FORMAT: [u8; 16] = [32, 16, 0, 1, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0];
+    const CANONICAL_SET_PIXEL_FORMAT: [u8; 20] = [
+        0, 0, 0, 0, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0,
+    ];
+    const SET_ENCODINGS: [u8; 28] = [
+        2, 0, 0, 6, 0, 0, 0, 16, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, 255, 255, 255, 33, 0, 0, 0, 7,
+    ];
+
+    fn server_init_bytes(pixel_format: [u8; 16]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&pixel_format);
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes
+    }
+
+    async fn configure_fixture(pixel_format: [u8; 16]) -> ([u8; 48], super::ServerInit) {
+        let (client, mut peer) = duplex(256);
+        peer.write_all(&server_init_bytes(pixel_format))
+            .await
+            .unwrap();
+        let mut reader = RfbReader::new(client, ProtocolLimits::default());
+        let init = configure_server(&mut reader).await.unwrap();
+        let mut outbound = [0_u8; 48];
+        peer.read_exact(&mut outbound).await.unwrap();
+        (outbound, init)
+    }
 
     fn one_pixel_rect(x: u32, y: u32, rgba: [u8; 4]) -> FbRect {
         FbRect {
@@ -943,6 +1067,45 @@ mod tests {
             h: 1,
             rgba: rgba.to_vec(),
         }
+    }
+
+    #[tokio::test]
+    async fn valid_native_formats_emit_canonical_pixel_format_before_encodings() {
+        for format in [CANONICAL_FORMAT, RGB565_16_FORMAT, RGB565_32_FORMAT] {
+            let (outbound, init) = configure_fixture(format).await;
+            assert_eq!(&outbound[..20], &CANONICAL_SET_PIXEL_FORMAT);
+            assert_eq!(&outbound[20..], &SET_ENCODINGS);
+            assert_eq!(init.pixel_format.bits_per_pixel, format[0]);
+            assert_eq!(init.pixel_format.depth, format[1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn rgb565_native_format_cannot_select_four_byte_tight_framing() {
+        let (_outbound, init) = configure_fixture(RGB565_32_FORMAT).await;
+        assert_eq!(init.pixel_format.depth, 16);
+
+        let (mut peer, mut client) = duplex(16);
+        peer.write_all(&[0x08, 0x33, 0x22, 0x11]).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut framebuffer = Framebuffer {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 4],
+        };
+        tight::decode(
+            &mut client,
+            &mut framebuffer,
+            decoder_pixel_format(),
+            0,
+            0,
+            1,
+            1,
+            &mut TightState::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(framebuffer.pixels, [0x11, 0x22, 0x33, 0xff]);
     }
 
     #[test]

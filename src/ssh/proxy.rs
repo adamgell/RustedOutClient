@@ -22,7 +22,24 @@ static PROXY_TICKET_GENERATIONS: AtomicUsize = AtomicUsize::new(0);
 /// An eight-byte, OS-CSPRNG-generated Proxmox VNC proxy credential.
 ///
 /// It intentionally implements neither `Clone`, `Display`, nor serialization.
-pub struct ProxyTicket(SecretString);
+pub struct ProxyTicket {
+    value: SecretString,
+    // Field order is intentional: the secret is dropped before the test signal fires.
+    #[cfg(test)]
+    _drop_signal: TestTicketDropSignal,
+}
+
+#[cfg(test)]
+struct TestTicketDropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+#[cfg(test)]
+impl Drop for TestTicketDropSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
 
 impl ProxyTicket {
     pub fn generate() -> Self {
@@ -31,22 +48,40 @@ impl ProxyTicket {
             .take(TICKET_LENGTH)
             .map(char::from)
             .collect();
-        Self(SecretString::from(value))
+        Self {
+            value: SecretString::from(value),
+            #[cfg(test)]
+            _drop_signal: TestTicketDropSignal(None),
+        }
     }
 
     pub fn auth_len(&self) -> usize {
-        self.0.expose_secret().len()
+        self.value.expose_secret().len()
     }
 
     pub fn auth_is_ascii_alphanumeric(&self) -> bool {
-        self.0
+        self.value
             .expose_secret()
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric())
     }
 
     pub(crate) fn expose_for_auth(&self) -> &str {
-        self.0.expose_secret()
+        self.value.expose_secret()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_auth_test_with_drop_signal(
+        value: &str,
+    ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                value: SecretString::from(value),
+                _drop_signal: TestTicketDropSignal(Some(sender)),
+            },
+            receiver,
+        )
     }
 
     fn generate_for_proxy() -> Self {

@@ -50,10 +50,24 @@ async fn legacy_security_fixture(security_type: u32) -> Result<(), rustedoutclie
 }
 
 fn server_init_bytes(width: u16, height: u16, name: &[u8]) -> Vec<u8> {
+    server_init_bytes_with_format(
+        width,
+        height,
+        [32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0],
+        name,
+    )
+}
+
+fn server_init_bytes_with_format(
+    width: u16,
+    height: u16,
+    pixel_format: [u8; 16],
+    name: &[u8],
+) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(24 + name.len());
     bytes.extend_from_slice(&width.to_be_bytes());
     bytes.extend_from_slice(&height.to_be_bytes());
-    bytes.extend_from_slice(&[32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&pixel_format);
     bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
     bytes.extend_from_slice(name);
     bytes
@@ -349,6 +363,39 @@ async fn server_init_checks_dimensions_before_startup_allocation() {
         .expect("oversized dimensions must fail");
     assert_eq!(err.kind(), RfbErrorKind::Limit);
     assert_eq!(err.phase(), RfbPhase::ServerInit);
+}
+
+#[tokio::test]
+async fn server_init_rejects_structurally_invalid_true_colour_formats() {
+    let invalid_formats = [
+        // A channel maximum must be exactly 2^N - 1.
+        [32, 24, 0, 1, 0, 254, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0],
+        // Red and green masks overlap.
+        [16, 16, 0, 1, 0, 31, 0, 63, 0, 31, 5, 5, 0, 0, 0, 0],
+        // A five-bit red mask shifted by twelve extends beyond 16 bpp.
+        [16, 16, 0, 1, 0, 31, 0, 63, 0, 31, 12, 5, 0, 0, 0, 0],
+        // RGB565 has sixteen useful channel bits, not depth fifteen.
+        [16, 15, 0, 1, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0],
+        // Indexed colour is outside the native true-colour contract.
+        [16, 16, 0, 0, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0],
+        // Zero maxima, zero depth, unsupported bpp, and depth above bpp.
+        [16, 16, 0, 1, 0, 0, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0],
+        [16, 0, 0, 1, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0],
+        [24, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0],
+        [16, 17, 0, 1, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0],
+    ];
+
+    for pixel_format in invalid_formats {
+        let err = read_server_init_fixture(
+            &server_init_bytes_with_format(1, 1, pixel_format, b""),
+            ProtocolLimits::default(),
+        )
+        .await
+        .err()
+        .expect("invalid pixel format must fail closed");
+        assert_eq!(err.kind(), RfbErrorKind::ServerInit);
+        assert_eq!(err.phase(), RfbPhase::ServerInit);
+    }
 }
 
 #[tokio::test]

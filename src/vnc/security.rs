@@ -10,6 +10,15 @@ use super::{RfbError, RfbErrorKind, RfbPhase, RfbReader};
 const VNC_AUTH_SECURITY_TYPE: u8 = 2;
 const BANNER_LENGTH: usize = 12;
 
+#[derive(Default)]
+struct ZeroizingDesBlock(Block<Des>);
+
+impl Drop for ZeroizingDesBlock {
+    fn drop(&mut self) {
+        self.0.as_mut_slice().zeroize();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RfbVersion {
     V3_3,
@@ -207,18 +216,18 @@ where
     })?;
     key.zeroize();
 
-    let mut first = Block::<Des>::default();
-    let mut second = Block::<Des>::default();
-    first.copy_from_slice(&challenge[..8]);
-    second.copy_from_slice(&challenge[8..]);
-    cipher.encrypt_block(&mut first);
-    cipher.encrypt_block(&mut second);
+    let mut first = ZeroizingDesBlock::default();
+    let mut second = ZeroizingDesBlock::default();
+    first.0.copy_from_slice(&challenge[..8]);
+    second.0.copy_from_slice(&challenge[8..]);
+    cipher.encrypt_block(&mut first.0);
+    cipher.encrypt_block(&mut second.0);
 
     let mut response = Zeroizing::new([0_u8; 16]);
-    response[..8].copy_from_slice(&first);
-    response[8..].copy_from_slice(&second);
-    first.fill(0);
-    second.fill(0);
+    response[..8].copy_from_slice(&first.0);
+    response[8..].copy_from_slice(&second.0);
+    drop(first);
+    drop(second);
     drop(cipher);
     challenge.zeroize();
 
@@ -268,4 +277,84 @@ where
     drop(ticket);
     authentication_result?;
     read_security_result(reader, version).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        io::{duplex, AsyncReadExt, AsyncWriteExt},
+        time::timeout,
+    };
+
+    use super::{negotiate_security, RfbVersion, VNC_AUTH_SECURITY_TYPE};
+    use crate::{
+        ssh::ProxyTicket,
+        vnc::{ProtocolLimits, RfbReader},
+    };
+
+    #[test]
+    fn des_block_temporaries_have_zeroizing_drop_guards() {
+        let source = include_str!("security.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("test module marker must remain present")
+            .0;
+
+        assert_eq!(
+            production.matches("ZeroizingDesBlock::default()").count(),
+            2,
+            "both DES block temporaries must be guarded until drop"
+        );
+        assert!(
+            production.contains("impl Drop for ZeroizingDesBlock")
+                && production.contains("self.0.as_mut_slice().zeroize();"),
+            "the DES block guard must zeroize its owned bytes on every drop path"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_vnc_auth_matches_fixed_vector_and_drops_ticket_before_result() {
+        const CHALLENGE: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        const EXPECTED_RESPONSE: [u8; 16] = [
+            0xb8, 0x66, 0x92, 0x41, 0x25, 0xc8, 0xee, 0xbb, 0x9d, 0xeb, 0xc1, 0xdb, 0x61, 0xc5,
+            0x38, 0xe2,
+        ];
+
+        let (client_stream, mut server_stream) = duplex(64);
+        let mut reader = RfbReader::new(client_stream, ProtocolLimits::default());
+        let (ticket, ticket_dropped) = ProxyTicket::for_auth_test_with_drop_signal("password");
+        let negotiation =
+            tokio::spawn(
+                async move { negotiate_security(&mut reader, ticket, RfbVersion::V3_8).await },
+            );
+
+        server_stream
+            .write_all(&[1, VNC_AUTH_SECURITY_TYPE])
+            .await
+            .unwrap();
+        let selected = server_stream.read_u8().await.unwrap();
+        assert_eq!(selected, VNC_AUTH_SECURITY_TYPE);
+
+        server_stream.write_all(&CHALLENGE).await.unwrap();
+        let mut response = [0_u8; 16];
+        server_stream.read_exact(&mut response).await.unwrap();
+        assert!(response == EXPECTED_RESPONSE, "fixed VNC response mismatch");
+
+        timeout(Duration::from_secs(1), ticket_dropped)
+            .await
+            .expect("ticket was retained while SecurityResult was withheld")
+            .expect("ticket drop signal closed without firing");
+        assert!(
+            !negotiation.is_finished(),
+            "negotiation must still be awaiting SecurityResult"
+        );
+
+        server_stream.write_all(&0_u32.to_be_bytes()).await.unwrap();
+        assert!(negotiation.await.unwrap().is_ok());
+    }
 }
