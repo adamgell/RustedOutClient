@@ -14,7 +14,10 @@ pub use inventory::{
 };
 pub use master::{SshMaster, SshMasterError, VerifiedSshMaster};
 pub use proxy::{ProxyOpenError, ProxyTicket, TrustedSshProxy};
-pub use stream::{ProxyStream, ProxyStreamError};
+pub use stream::{
+    ProxyCleanupFailure, ProxyCleanupStage, ProxyIoFailure, ProxyIoStage, ProxyStream,
+    ProxyStreamError,
+};
 
 #[cfg(test)]
 pub(super) async fn process_test_guard() -> tokio::sync::MutexGuard<'static, ()> {

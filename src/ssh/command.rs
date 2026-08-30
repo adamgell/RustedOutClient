@@ -7,6 +7,12 @@ use std::{
 
 use secrecy::{ExposeSecret, SecretString};
 
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use crate::model::{PveProfile, VmId};
 
 use super::ProxyTicket;
@@ -31,6 +37,8 @@ pub struct CommandSpec {
     pub args: Vec<OsString>,
     env: Vec<(OsString, SecretString)>,
     pub capture_stderr: bool,
+    #[cfg(test)]
+    drop_probe: Option<Arc<AtomicBool>>,
 }
 
 impl CommandSpec {
@@ -58,6 +66,20 @@ impl CommandSpec {
             command.stderr(Stdio::piped());
         }
         command
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_drop_probe(&mut self, probe: Arc<AtomicBool>) {
+        self.drop_probe = Some(probe);
+    }
+}
+
+impl Drop for CommandSpec {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(probe) = &self.drop_probe {
+            probe.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -141,6 +163,8 @@ impl SshCommandFactory {
             args,
             env: Vec::new(),
             capture_stderr: true,
+            #[cfg(test)]
+            drop_probe: None,
         }
     }
 

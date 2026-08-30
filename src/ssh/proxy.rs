@@ -110,7 +110,7 @@ impl TrustedSshProxy {
 
         let ticket = ProxyTicket::generate_for_proxy();
         let spec = master.proxy_spec(vmid, &ticket);
-        let stream = ProxyStream::spawn(spec)?;
+        let stream = ProxyStream::spawn(spec).await?;
         Ok(Self { stream, ticket })
     }
 
