@@ -89,7 +89,9 @@ if [ "$proxy" = true ]; then
     esac
     printf '%s\n' "$$" > "${socket}.proxy.pid"
     : > "${socket}.proxy.env-valid"
-    printf 'RFB 003.008\n'
+    if [ ! -f "${socket}.proxy_no_stdout" ]; then
+        printf 'RFB 003.008\n'
+    fi
     if [ -f "${socket}.proxy_stderr_open" ]; then
         (
             trap 'exit 0' PIPE TERM INT HUP
@@ -114,9 +116,16 @@ if [ "$proxy" = true ]; then
         exit 255
     fi
     if [ -f "${socket}.hang_proxy" ]; then
-        while :; do
-            sleep 0.05
-        done
+        if [ -f "${socket}.proxy_live_probe" ]; then
+            while :; do
+                printf '%s' x >> "${socket}.proxy.live-heartbeat"
+                sleep 0.05
+            done
+        else
+            while :; do
+                sleep 0.05
+            done
+        fi
     fi
     exit 0
 fi

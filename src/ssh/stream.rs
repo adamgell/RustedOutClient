@@ -118,20 +118,111 @@ pub enum ProxyReapState {
     UnconfirmedFallbackActive,
 }
 
+const CLEANUP_EVIDENCE_STAGE_COUNT: usize = 8;
+
+const fn cleanup_evidence_index(stage: ProxyIoStage) -> Option<usize> {
+    match stage {
+        ProxyIoStage::NaturalWait => Some(0),
+        ProxyIoStage::GracefulWait => Some(1),
+        ProxyIoStage::Kill => Some(2),
+        ProxyIoStage::FinalReap => Some(3),
+        ProxyIoStage::StderrDrain => Some(4),
+        ProxyIoStage::ExceptionalKill => Some(5),
+        ProxyIoStage::ExceptionalPoll => Some(6),
+        ProxyIoStage::FallbackSpawn => Some(7),
+        ProxyIoStage::Spawn
+        | ProxyIoStage::SetupStdin
+        | ProxyIoStage::SetupStdout
+        | ProxyIoStage::Read
+        | ProxyIoStage::Write
+        | ProxyIoStage::Flush
+        | ProxyIoStage::Shutdown => None,
+    }
+}
+
+const fn io_stage_for_cleanup_stage(stage: ProxyCleanupStage) -> Option<ProxyIoStage> {
+    match stage {
+        ProxyCleanupStage::OwnerJoin => None,
+        ProxyCleanupStage::NaturalWait => Some(ProxyIoStage::NaturalWait),
+        ProxyCleanupStage::GracefulWait => Some(ProxyIoStage::GracefulWait),
+        ProxyCleanupStage::Kill => Some(ProxyIoStage::Kill),
+        ProxyCleanupStage::FinalReap => Some(ProxyIoStage::FinalReap),
+        ProxyCleanupStage::StderrDrain => Some(ProxyIoStage::StderrDrain),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CleanupEvidence {
+    io: [Option<ProxyIoFailure>; CLEANUP_EVIDENCE_STAGE_COUNT],
+    seen: u16,
+}
+
+impl Default for CleanupEvidence {
+    fn default() -> Self {
+        Self {
+            io: [None; CLEANUP_EVIDENCE_STAGE_COUNT],
+            seen: 0,
+        }
+    }
+}
+
+impl CleanupEvidence {
+    fn mark_seen(&mut self, stage: ProxyIoStage) {
+        if let Some(index) = cleanup_evidence_index(stage) {
+            self.seen |= 1 << index;
+        }
+    }
+
+    fn record_io(&mut self, failure: ProxyIoFailure) {
+        if let Some(index) = cleanup_evidence_index(failure.stage()) {
+            self.mark_seen(failure.stage());
+            if self.io[index].is_none() {
+                self.io[index] = Some(failure);
+            }
+        }
+    }
+
+    fn stage_seen(self, stage: ProxyIoStage) -> bool {
+        cleanup_evidence_index(stage)
+            .map(|index| self.seen & (1 << index) != 0)
+            .unwrap_or(false)
+    }
+
+    fn io_failure_for(self, stage: ProxyIoStage) -> Option<ProxyIoFailure> {
+        cleanup_evidence_index(stage).and_then(|index| self.io[index])
+    }
+
+    fn merge(&mut self, later: Self) {
+        self.seen |= later.seen;
+        for (slot, incoming) in self.io.iter_mut().zip(later.io) {
+            if slot.is_none() {
+                *slot = incoming;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProxyCleanupFailure {
     stage: ProxyCleanupStage,
-    io: [Option<ProxyIoFailure>; 4],
+    evidence: CleanupEvidence,
     reap_state: ProxyReapState,
 }
 
 impl ProxyCleanupFailure {
     fn new(stage: ProxyCleanupStage, io: Option<ProxyIoFailure>) -> Self {
-        Self {
+        let mut failure = Self {
             stage,
-            io: [io, None, None, None],
+            evidence: CleanupEvidence::default(),
             reap_state: ProxyReapState::Confirmed,
+        };
+        if let Some(stage) = io_stage_for_cleanup_stage(stage) {
+            failure.evidence.mark_seen(stage);
         }
+        if let Some(io) = io {
+            failure.evidence.record_io(io);
+        }
+        failure
     }
 
     pub fn stage(self) -> ProxyCleanupStage {
@@ -139,45 +230,32 @@ impl ProxyCleanupFailure {
     }
 
     pub fn io_failure(self) -> Option<ProxyIoFailure> {
-        self.io[0]
+        self.evidence.io.into_iter().flatten().next()
     }
 
     pub fn additional_io_failure(self) -> Option<ProxyIoFailure> {
-        self.io[1]
+        self.evidence.io.into_iter().flatten().nth(1)
     }
 
-    pub fn io_failures(self) -> [Option<ProxyIoFailure>; 4] {
-        self.io
+    pub fn io_failures(self) -> [Option<ProxyIoFailure>; CLEANUP_EVIDENCE_STAGE_COUNT] {
+        self.evidence.io
+    }
+
+    pub fn stage_seen(self, stage: ProxyIoStage) -> bool {
+        self.evidence.stage_seen(stage)
+    }
+
+    pub fn io_failure_for(self, stage: ProxyIoStage) -> Option<ProxyIoFailure> {
+        self.evidence.io_failure_for(stage)
     }
 
     pub fn reap_state(self) -> ProxyReapState {
         self.reap_state
     }
 
-    fn with_reap_state(mut self, reap_state: ProxyReapState) -> Self {
-        self.reap_state = reap_state;
-        self
-    }
-
-    fn push_io(&mut self, failure: ProxyIoFailure) {
-        if self
-            .io
-            .iter()
-            .flatten()
-            .any(|existing| existing.stage() == failure.stage())
-        {
-            return;
-        }
-        if let Some(slot) = self.io.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(failure);
-        }
-    }
-
     fn merge_exceptional(mut self, outcome: ExceptionalOutcome) -> Self {
         self.reap_state = outcome.reap_state;
-        for failure in outcome.io.into_iter().flatten() {
-            self.push_io(failure);
-        }
+        self.evidence.merge(outcome.evidence);
         self
     }
 
@@ -185,9 +263,7 @@ impl ProxyCleanupFailure {
         if later.reap_state != ProxyReapState::Confirmed {
             self.reap_state = later.reap_state;
         }
-        for failure in later.io.into_iter().flatten() {
-            self.push_io(failure);
-        }
+        self.evidence.merge(later.evidence);
         self
     }
 }
@@ -347,30 +423,45 @@ type TerminalResult = Result<(), ProxyStreamError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExceptionalOutcome {
-    io: [Option<ProxyIoFailure>; 3],
+    evidence: CleanupEvidence,
     reap_state: ProxyReapState,
 }
 
 impl ExceptionalOutcome {
     fn new(reap_state: ProxyReapState) -> Self {
         Self {
-            io: [None, None, None],
+            evidence: CleanupEvidence::default(),
             reap_state,
         }
     }
 
     fn push_io(&mut self, failure: ProxyIoFailure) {
-        if self
-            .io
-            .iter()
-            .flatten()
-            .any(|existing| existing.stage() == failure.stage())
-        {
-            return;
-        }
-        if let Some(slot) = self.io.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(failure);
-        }
+        self.evidence.record_io(failure);
+    }
+
+    fn mark_seen(&mut self, stage: ProxyIoStage) {
+        self.evidence.mark_seen(stage);
+    }
+
+    #[cfg(test)]
+    fn io_failure_for(self, stage: ProxyIoStage) -> Option<ProxyIoFailure> {
+        self.evidence.io_failure_for(stage)
+    }
+
+    fn merge(&mut self, later: Self) {
+        self.evidence.merge(later.evidence);
+        self.reap_state = match (self.reap_state, later.reap_state) {
+            (ProxyReapState::Confirmed, _) | (_, ProxyReapState::Confirmed) => {
+                ProxyReapState::Confirmed
+            }
+            (ProxyReapState::UnconfirmedFallbackActive, _)
+            | (_, ProxyReapState::UnconfirmedFallbackActive) => {
+                ProxyReapState::UnconfirmedFallbackActive
+            }
+            (ProxyReapState::Unconfirmed, ProxyReapState::Unconfirmed) => {
+                ProxyReapState::Unconfirmed
+            }
+        };
     }
 }
 
@@ -379,10 +470,15 @@ struct ExceptionalOutcomeState(Arc<Mutex<Option<ExceptionalOutcome>>>);
 
 impl ExceptionalOutcomeState {
     fn publish(&self, outcome: ExceptionalOutcome) {
-        *self
+        let mut published = self
             .0
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = published.as_mut() {
+            existing.merge(outcome);
+        } else {
+            *published = Some(outcome);
+        }
     }
 
     fn snapshot(&self) -> Option<ExceptionalOutcome> {
@@ -482,6 +578,9 @@ enum TestCleanupFault {
     OwnerCancel,
     OwnerCancelExceptionalEvidence,
     OwnerCancelFallbackSpawnFailure,
+    ExhaustiveEvidence,
+    SetupUnconfirmedExceptionalEvidence,
+    SetupFallbackSpawnFailure,
 }
 
 #[cfg(test)]
@@ -542,6 +641,10 @@ impl StreamFaults {
                         ProxyIoStage::Kill
                     )
                     | (Some(TestCleanupFault::Wait), ProxyIoStage::FinalReap)
+                    | (
+                        Some(TestCleanupFault::ExhaustiveEvidence),
+                        ProxyIoStage::GracefulWait | ProxyIoStage::Kill | ProxyIoStage::FinalReap
+                    )
             );
             if matches {
                 let error = io::Error::from_raw_os_error(32);
@@ -573,14 +676,7 @@ impl StreamFaults {
 
     #[cfg(test)]
     fn owner_cancels(self) -> bool {
-        matches!(
-            self.cleanup,
-            Some(
-                TestCleanupFault::OwnerCancel
-                    | TestCleanupFault::OwnerCancelExceptionalEvidence
-                    | TestCleanupFault::OwnerCancelFallbackSpawnFailure
-            )
-        )
+        matches!(self.cleanup, Some(TestCleanupFault::OwnerCancel))
     }
 
     fn natural_wait_fails(self) -> bool {
@@ -588,7 +684,11 @@ impl StreamFaults {
         {
             matches!(
                 self.cleanup,
-                Some(TestCleanupFault::NaturalWait | TestCleanupFault::NaturalWaitAndKill)
+                Some(
+                    TestCleanupFault::NaturalWait
+                        | TestCleanupFault::NaturalWaitAndKill
+                        | TestCleanupFault::ExhaustiveEvidence
+                )
             )
         }
         #[cfg(not(test))]
@@ -600,7 +700,16 @@ impl StreamFaults {
     fn exceptional_evidence_fails(self) -> bool {
         #[cfg(test)]
         {
-            self.cleanup == Some(TestCleanupFault::OwnerCancelExceptionalEvidence)
+            matches!(
+                self.cleanup,
+                Some(
+                    TestCleanupFault::OwnerCancelExceptionalEvidence
+                        | TestCleanupFault::OwnerCancelFallbackSpawnFailure
+                        | TestCleanupFault::ExhaustiveEvidence
+                        | TestCleanupFault::SetupUnconfirmedExceptionalEvidence
+                        | TestCleanupFault::SetupFallbackSpawnFailure
+                )
+            )
         }
         #[cfg(not(test))]
         {
@@ -611,7 +720,13 @@ impl StreamFaults {
     fn fallback_spawn_fails(self) -> bool {
         #[cfg(test)]
         {
-            self.cleanup == Some(TestCleanupFault::OwnerCancelFallbackSpawnFailure)
+            matches!(
+                self.cleanup,
+                Some(
+                    TestCleanupFault::OwnerCancelFallbackSpawnFailure
+                        | TestCleanupFault::SetupFallbackSpawnFailure
+                )
+            )
         }
         #[cfg(not(test))]
         {
@@ -627,6 +742,9 @@ impl StreamFaults {
                 Some(
                     TestCleanupFault::OwnerCancelExceptionalEvidence
                         | TestCleanupFault::OwnerCancelFallbackSpawnFailure
+                        | TestCleanupFault::ExhaustiveEvidence
+                        | TestCleanupFault::SetupUnconfirmedExceptionalEvidence
+                        | TestCleanupFault::SetupFallbackSpawnFailure
                 )
             )
         }
@@ -640,11 +758,40 @@ impl StreamFaults {
         #[cfg(test)]
         {
             self.setup == Some(TestSetupFault::MissingStdout)
+                || matches!(
+                    self.cleanup,
+                    Some(
+                        TestCleanupFault::SetupUnconfirmedExceptionalEvidence
+                            | TestCleanupFault::SetupFallbackSpawnFailure
+                    )
+                )
         }
         #[cfg(not(test))]
         {
             false
         }
+    }
+
+    fn normal_kill_fails(self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(
+                self.cleanup,
+                Some(
+                    TestCleanupFault::ExhaustiveEvidence
+                        | TestCleanupFault::SetupUnconfirmedExceptionalEvidence
+                        | TestCleanupFault::SetupFallbackSpawnFailure
+                )
+            )
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn normal_final_wait_fails(self) -> bool {
+        self.normal_kill_fails()
     }
 }
 
@@ -753,11 +900,16 @@ impl ProxyStream {
             if outcome.reaped {
                 child.mark_reaped();
             }
-            let cleanup = outcome.cleanup.or_else(|| stderr_result.err());
-            return Err(match cleanup {
-                Some(cleanup) => ProxyStreamError::Io(setup_error).with_cleanup(cleanup),
-                None => ProxyStreamError::Io(setup_error),
-            });
+            let terminal = compose_terminal(outcome, stderr_result);
+            drop(child);
+            let mut error = match terminal {
+                Ok(()) => ProxyStreamError::Io(setup_error),
+                Err(error) => error.with_io(setup_error),
+            };
+            if let Some(exceptional) = exceptional_outcome.snapshot() {
+                error = error.with_exceptional(exceptional);
+            }
+            return Err(error);
         }
 
         let (cleanup, cleanup_requested) = oneshot::channel();
@@ -1069,14 +1221,13 @@ fn exceptional_reap(
     let _active = ActiveReaper;
 
     let mut outcome = ExceptionalOutcome::new(ProxyReapState::Unconfirmed);
-    let kill_result = child.start_kill();
-    if faults.exceptional_evidence_fails() {
-        let error = io::Error::from_raw_os_error(32);
-        outcome.push_io(ProxyIoFailure::from_error(
-            ProxyIoStage::ExceptionalKill,
-            &error,
-        ));
-    } else if let Err(error) = kill_result {
+    outcome.mark_seen(ProxyIoStage::ExceptionalKill);
+    let kill_result = if faults.exceptional_evidence_fails() {
+        Err(io::Error::from_raw_os_error(32))
+    } else {
+        child.start_kill()
+    };
+    if let Err(error) = kill_result {
         outcome.push_io(ProxyIoFailure::from_error(
             ProxyIoStage::ExceptionalKill,
             &error,
@@ -1084,6 +1235,7 @@ fn exceptional_reap(
     }
     let started = Instant::now();
     let deadline = started.checked_add(reap_timeout).unwrap_or(started);
+    outcome.mark_seen(ProxyIoStage::ExceptionalPoll);
     loop {
         let wait_result = if faults.exceptional_poll_stalls() {
             if faults.exceptional_evidence_fails() {
@@ -1143,6 +1295,7 @@ fn transfer_to_fallback(
     // Publish ownership transfer before attempting to start the authority so
     // close can never mistake an unconfirmed reap for success.
     outcome.reap_state = ProxyReapState::UnconfirmedFallbackActive;
+    outcome.mark_seen(ProxyIoStage::FallbackSpawn);
     outcome_state.publish(outcome);
 
     let child_slot = Arc::new(Mutex::new(Some(child)));
@@ -1222,6 +1375,7 @@ fn fallback_authority(
         }
     }
 
+    outcome.mark_seen(ProxyIoStage::ExceptionalKill);
     if let Err(error) = child.start_kill() {
         outcome.push_io(ProxyIoFailure::from_error(
             ProxyIoStage::ExceptionalKill,
@@ -1229,6 +1383,7 @@ fn fallback_authority(
         ));
         outcome_state.publish(outcome);
     }
+    outcome.mark_seen(ProxyIoStage::ExceptionalPoll);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
@@ -1329,6 +1484,53 @@ struct StopOutcome {
     cleanup: Option<ProxyCleanupFailure>,
 }
 
+#[derive(Default)]
+struct CleanupAccumulator {
+    primary: Option<ProxyCleanupStage>,
+    evidence: CleanupEvidence,
+    reap_state: Option<ProxyReapState>,
+}
+
+impl CleanupAccumulator {
+    fn mark_seen(&mut self, stage: ProxyIoStage) {
+        self.evidence.mark_seen(stage);
+    }
+
+    fn record_failure(&mut self, stage: ProxyCleanupStage, io: Option<ProxyIoFailure>) {
+        if self.primary.is_none() {
+            self.primary = Some(stage);
+        }
+        if let Some(io_stage) = io_stage_for_cleanup_stage(stage) {
+            self.evidence.mark_seen(io_stage);
+        }
+        if let Some(io) = io {
+            self.evidence.record_io(io);
+        }
+    }
+
+    fn merge(&mut self, failure: ProxyCleanupFailure) {
+        if self.primary.is_none() {
+            self.primary = Some(failure.stage);
+        }
+        self.evidence.merge(failure.evidence);
+        if failure.reap_state != ProxyReapState::Confirmed {
+            self.reap_state = Some(failure.reap_state);
+        }
+    }
+
+    fn set_reap_state(&mut self, state: ProxyReapState) {
+        self.reap_state = Some(state);
+    }
+
+    fn finish(self) -> Option<ProxyCleanupFailure> {
+        self.primary.map(|stage| ProxyCleanupFailure {
+            stage,
+            evidence: self.evidence,
+            reap_state: self.reap_state.unwrap_or(ProxyReapState::Confirmed),
+        })
+    }
+}
+
 async fn terminate_owned_child(
     child: &mut Child,
     faults: StreamFaults,
@@ -1342,67 +1544,66 @@ async fn terminate_owned_child(
             cleanup: None,
         },
         first_wait => {
-            let mut cleanup = match first_wait {
-                Ok(Err(error)) => Some(ProxyCleanupFailure::new(
+            let mut cleanup = CleanupAccumulator::default();
+            cleanup.mark_seen(ProxyIoStage::GracefulWait);
+            if let Ok(Err(error)) = first_wait {
+                cleanup.record_failure(
                     ProxyCleanupStage::GracefulWait,
                     Some(ProxyIoFailure::from_error(
                         ProxyIoStage::GracefulWait,
                         &error,
                     )),
-                )),
-                Ok(Ok(_)) | Err(_) => None,
-            };
-            if let Some(injected) = faults.injected_cleanup(ProxyIoStage::GracefulWait) {
-                cleanup.get_or_insert(injected);
+                );
             }
-            let kill_result = child.start_kill();
+            if let Some(injected) = faults.injected_cleanup(ProxyIoStage::GracefulWait) {
+                cleanup.merge(injected);
+            }
+            cleanup.mark_seen(ProxyIoStage::Kill);
+            let kill_result = if faults.normal_kill_fails() {
+                Err(io::Error::from_raw_os_error(1))
+            } else {
+                child.start_kill()
+            };
             if let Err(error) = kill_result {
-                cleanup.get_or_insert_with(|| {
-                    ProxyCleanupFailure::new(
-                        ProxyCleanupStage::Kill,
-                        Some(ProxyIoFailure::from_error(ProxyIoStage::Kill, &error)),
-                    )
-                });
+                cleanup.record_failure(
+                    ProxyCleanupStage::Kill,
+                    Some(ProxyIoFailure::from_error(ProxyIoStage::Kill, &error)),
+                );
             }
             if let Some(injected) = faults.injected_cleanup(ProxyIoStage::Kill) {
-                cleanup.get_or_insert(injected);
+                cleanup.merge(injected);
             }
-            let final_wait = timeout(policy.reap_timeout, child.wait()).await;
+            cleanup.mark_seen(ProxyIoStage::FinalReap);
+            let final_wait = if faults.normal_final_wait_fails() {
+                Some(Err(io::Error::from_raw_os_error(13)))
+            } else {
+                timeout(policy.reap_timeout, child.wait()).await.ok()
+            };
             let (status, reaped) = match final_wait {
-                Ok(Ok(status)) => (Some(status), true),
-                Ok(Err(error)) => {
-                    cleanup.get_or_insert_with(|| {
-                        ProxyCleanupFailure::new(
-                            ProxyCleanupStage::FinalReap,
-                            Some(ProxyIoFailure::from_error(ProxyIoStage::FinalReap, &error)),
-                        )
-                    });
+                Some(Ok(status)) => (Some(status), true),
+                Some(Err(error)) => {
+                    cleanup.record_failure(
+                        ProxyCleanupStage::FinalReap,
+                        Some(ProxyIoFailure::from_error(ProxyIoStage::FinalReap, &error)),
+                    );
                     (None, false)
                 }
-                Err(_) => {
-                    cleanup.get_or_insert_with(|| {
-                        ProxyCleanupFailure::new(ProxyCleanupStage::FinalReap, None)
-                    });
+                None => {
+                    cleanup.record_failure(ProxyCleanupStage::FinalReap, None);
                     (None, false)
                 }
             };
             if let Some(injected) = faults.injected_cleanup(ProxyIoStage::FinalReap) {
-                cleanup.get_or_insert(injected);
+                cleanup.merge(injected);
             }
             if !reaped {
-                cleanup = Some(
-                    cleanup
-                        .unwrap_or_else(|| {
-                            ProxyCleanupFailure::new(ProxyCleanupStage::FinalReap, None)
-                        })
-                        .with_reap_state(ProxyReapState::Unconfirmed),
-                );
+                cleanup.set_reap_state(ProxyReapState::Unconfirmed);
             }
             StopOutcome {
                 status,
                 forced: true,
                 reaped,
-                cleanup,
+                cleanup: cleanup.finish(),
             }
         }
     }
@@ -1473,7 +1674,12 @@ fn compose_terminal(
     outcome: StopOutcome,
     stderr: Result<Vec<u8>, ProxyCleanupFailure>,
 ) -> TerminalResult {
-    let cleanup = outcome.cleanup.or_else(|| stderr.as_ref().err().copied());
+    let cleanup = match (outcome.cleanup, stderr.as_ref().err().copied()) {
+        (Some(normal), Some(stderr)) => Some(normal.merge_cleanup(stderr)),
+        (Some(normal), None) => Some(normal),
+        (None, Some(stderr)) => Some(stderr),
+        (None, None) => None,
+    };
     let process_result = match (outcome.status, outcome.forced, stderr.as_ref()) {
         (Some(_), true, _) => Ok(()),
         (Some(status), false, Ok(stderr)) => classify_status(status, stderr),
@@ -1722,6 +1928,11 @@ mod tests {
             b"synthetic fixture control\n",
         )
         .unwrap();
+        fs::write(
+            runtime.control_socket().with_extension("proxy_live_probe"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
         let fallback_gate = runtime
             .control_socket()
             .with_extension("allow_fallback_reap");
@@ -1741,7 +1952,9 @@ mod tests {
             spec,
             faults,
             TestStreamPolicy::short_with_fallback_gate(
-                runtime.control_socket().with_extension("proxy.pid"),
+                runtime
+                    .control_socket()
+                    .with_extension("proxy.stderr-holder.pid"),
                 fallback_gate.clone(),
             ),
         )
@@ -1755,6 +1968,19 @@ mod tests {
             .with_extension("proxy.stderr-holder.pid");
         wait_for(&holder_path).await;
         let holder_pid = helper_pid(&holder_path);
+        stream.write_all(b"x").await.unwrap();
+        let heartbeat = runtime
+            .control_socket()
+            .with_extension("proxy.live-heartbeat");
+        wait_for(&heartbeat).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while active_stderr_captures() != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("real stderr capture did not become active");
+        stream.owner.as_ref().unwrap().abort();
         assert!(stream.flush().await.is_err());
 
         let first = tokio::time::timeout(Duration::from_secs(30), stream.close())
@@ -1784,6 +2010,13 @@ mod tests {
         .await
         .expect("exceptional fallback authority did not take ownership");
         assert_eq!(exceptional_reaps_completed(), completed);
+        let heartbeat_before = fs::metadata(&heartbeat).unwrap().len();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let heartbeat_after = fs::metadata(&heartbeat).unwrap().len();
+        assert!(
+            heartbeat_after > heartbeat_before,
+            "the substituted first-kill failure must leave the exact child executing"
+        );
 
         fs::write(&fallback_gate, b"synthetic fixture control\n").unwrap();
         assert_exact_pid_is_gone(pid).await;
@@ -1791,6 +2024,122 @@ mod tests {
         assert_no_proxy_lifecycle_activity().await;
         assert_eq!(exceptional_reaps_completed(), completed + 1);
         assert_eq!(stream.close().await.unwrap_err(), first);
+    }
+
+    #[test]
+    fn exceptional_outcome_publication_merges_evidence_without_regressing_reap_state() {
+        let state = super::ExceptionalOutcomeState::default();
+        let mut confirmed = super::ExceptionalOutcome::new(ProxyReapState::Confirmed);
+        confirmed.push_io(super::ProxyIoFailure::from_error(
+            ProxyIoStage::ExceptionalKill,
+            &io::Error::from_raw_os_error(32),
+        ));
+        state.publish(confirmed);
+
+        let mut stale = super::ExceptionalOutcome::new(ProxyReapState::UnconfirmedFallbackActive);
+        stale.push_io(super::ProxyIoFailure::from_error(
+            ProxyIoStage::ExceptionalPoll,
+            &io::Error::from_raw_os_error(13),
+        ));
+        state.publish(stale);
+
+        let published = state.snapshot().unwrap();
+        assert_eq!(published.reap_state, ProxyReapState::Confirmed);
+        assert!(published
+            .io_failure_for(ProxyIoStage::ExceptionalKill)
+            .is_some());
+        assert!(published
+            .io_failure_for(ProxyIoStage::ExceptionalPoll)
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn more_than_four_cleanup_stages_survive_normal_and_exceptional_merges() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("hang_proxy"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime.control_socket().with_extension("proxy_stderr_open"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let fallback_gate = runtime
+            .control_socket()
+            .with_extension("allow_exhaustive_fallback_reap");
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let ticket = ProxyTicket::generate();
+        let spec = factory
+            .proxy(&fixture_profile(), VmId::new(107).unwrap(), &ticket)
+            .unwrap();
+        let mut policy = TestStreamPolicy::short_with_fallback_gate(
+            runtime
+                .control_socket()
+                .with_extension("proxy.stderr-holder.pid"),
+            fallback_gate.clone(),
+        );
+        policy.pipe_drain_timeout = Duration::from_millis(100);
+        let mut stream = ProxyStream::spawn_with_test_seams(
+            spec,
+            TestStreamFaults::cleanup(TestCleanupFault::ExhaustiveEvidence),
+            policy,
+        )
+        .await
+        .unwrap();
+        let pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&pid_path).await;
+        let pid = helper_pid(&pid_path);
+        let holder_path = runtime
+            .control_socket()
+            .with_extension("proxy.stderr-holder.pid");
+        wait_for(&holder_path).await;
+        let holder_pid = helper_pid(&holder_path);
+
+        let first = stream.close().await.unwrap_err();
+        let cleanup = first.cleanup_failure().unwrap();
+        assert_eq!(cleanup.stage(), ProxyCleanupStage::NaturalWait);
+        assert_eq!(
+            cleanup.reap_state(),
+            ProxyReapState::UnconfirmedFallbackActive
+        );
+        for stage in [
+            ProxyIoStage::NaturalWait,
+            ProxyIoStage::GracefulWait,
+            ProxyIoStage::Kill,
+            ProxyIoStage::FinalReap,
+            ProxyIoStage::StderrDrain,
+            ProxyIoStage::ExceptionalKill,
+            ProxyIoStage::ExceptionalPoll,
+            ProxyIoStage::FallbackSpawn,
+        ] {
+            assert!(cleanup.stage_seen(stage), "missing cleanup stage {stage:?}");
+        }
+        assert!(cleanup.io_failure_for(ProxyIoStage::NaturalWait).is_some());
+        assert!(cleanup.io_failure_for(ProxyIoStage::GracefulWait).is_some());
+        assert!(cleanup.io_failure_for(ProxyIoStage::Kill).is_some());
+        assert!(cleanup.io_failure_for(ProxyIoStage::FinalReap).is_some());
+        assert!(cleanup.io_failure_for(ProxyIoStage::StderrDrain).is_none());
+        assert!(cleanup
+            .io_failure_for(ProxyIoStage::ExceptionalKill)
+            .is_some());
+        assert!(cleanup
+            .io_failure_for(ProxyIoStage::ExceptionalPoll)
+            .is_some());
+        assert!(cleanup
+            .io_failure_for(ProxyIoStage::FallbackSpawn)
+            .is_none());
+        assert_eq!(stream.close().await.unwrap_err(), first);
+
+        fs::write(&fallback_gate, b"synthetic fixture control\n").unwrap();
+        assert_exact_pid_is_gone(pid).await;
+        assert_exact_pid_is_gone(holder_pid).await;
+        assert_no_proxy_lifecycle_activity().await;
     }
 
     #[cfg(unix)]
@@ -1804,14 +2153,31 @@ mod tests {
             b"synthetic fixture control\n",
         )
         .unwrap();
+        fs::write(
+            runtime.control_socket().with_extension("proxy_stderr_open"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime.control_socket().with_extension("proxy_live_probe"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
         let pid_path = runtime.control_socket().with_extension("proxy.pid");
+        let holder_path = runtime
+            .control_socket()
+            .with_extension("proxy.stderr-holder.pid");
+        let fallback_gate = runtime
+            .control_socket()
+            .with_extension("allow_sync_fallback_reap");
         let factory =
             SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
         let ticket = ProxyTicket::generate();
         let spec = factory
             .proxy(&fixture_profile(), VmId::new(107).unwrap(), &ticket)
             .unwrap();
-        let mut policy = TestStreamPolicy::short_after_ready(pid_path.clone());
+        let mut policy =
+            TestStreamPolicy::short_with_fallback_gate(holder_path.clone(), fallback_gate.clone());
         policy.reap_timeout = Duration::from_millis(100);
         let mut stream = ProxyStream::spawn_with_test_seams(
             spec,
@@ -1822,19 +2188,65 @@ mod tests {
         .unwrap();
         wait_for(&pid_path).await;
         let pid = helper_pid(&pid_path);
+        wait_for(&holder_path).await;
+        let holder_pid = helper_pid(&holder_path);
+        stream.write_all(b"x").await.unwrap();
+        let heartbeat = runtime
+            .control_socket()
+            .with_extension("proxy.live-heartbeat");
+        wait_for(&heartbeat).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while active_stderr_captures() != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("real stderr capture did not become active");
+        stream.owner.as_ref().unwrap().abort();
+
+        let observed_live = Arc::new(AtomicBool::new(false));
+        let observer_result = Arc::clone(&observed_live);
+        let observer = std::thread::spawn(move || {
+            let started = Instant::now();
+            while active_fallback_authorities() != 1 {
+                assert!(started.elapsed() < Duration::from_secs(30));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let before = fs::metadata(&heartbeat).unwrap().len();
+            std::thread::sleep(Duration::from_millis(150));
+            let after = fs::metadata(&heartbeat).unwrap().len();
+            observer_result.store(after > before, Ordering::SeqCst);
+            fs::write(&fallback_gate, b"synthetic fixture control\n").unwrap();
+        });
 
         let error = tokio::time::timeout(Duration::from_secs(30), stream.close())
             .await
             .unwrap()
             .unwrap_err();
+        observer.join().unwrap();
+        assert!(
+            observed_live.load(Ordering::SeqCst),
+            "the failed first kill must leave the exact child executing until synchronous fallback"
+        );
         let cleanup = error.cleanup_failure().unwrap();
         assert_eq!(cleanup.reap_state(), ProxyReapState::Confirmed);
-        let spawn = cleanup.io_failure().unwrap();
+        let kill = cleanup
+            .io_failure_for(ProxyIoStage::ExceptionalKill)
+            .unwrap();
+        assert_eq!(kill.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(kill.raw_os_error(), Some(32));
+        let poll = cleanup
+            .io_failure_for(ProxyIoStage::ExceptionalPoll)
+            .unwrap();
+        assert_eq!(poll.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(poll.raw_os_error(), Some(13));
+        let spawn = cleanup.io_failure_for(ProxyIoStage::FallbackSpawn).unwrap();
         assert_eq!(spawn.stage(), ProxyIoStage::FallbackSpawn);
         assert_eq!(spawn.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(spawn.raw_os_error(), Some(13));
         assert_eq!(stream.close().await.unwrap_err(), error);
         assert_exact_pid_is_gone(pid).await;
+        assert_exact_pid_is_gone(holder_pid).await;
         assert_no_proxy_lifecycle_activity().await;
     }
 
@@ -1895,9 +2307,8 @@ mod tests {
         let error = stream.close().await.unwrap_err();
         let cleanup = error.cleanup_failure().unwrap();
         assert_eq!(cleanup.stage(), ProxyCleanupStage::NaturalWait);
-        let failures = cleanup.io_failures();
-        assert_eq!(failures[0].unwrap().stage(), ProxyIoStage::NaturalWait);
-        assert_eq!(failures[1].unwrap().stage(), ProxyIoStage::Kill);
+        assert!(cleanup.io_failure_for(ProxyIoStage::NaturalWait).is_some());
+        assert!(cleanup.io_failure_for(ProxyIoStage::Kill).is_some());
         assert_eq!(cleanup.reap_state(), ProxyReapState::Confirmed);
         assert_no_proxy_lifecycle_activity().await;
     }
@@ -2224,7 +2635,10 @@ mod tests {
                 | TestCleanupFault::OwnerPanic
                 | TestCleanupFault::OwnerCancel
                 | TestCleanupFault::OwnerCancelExceptionalEvidence
-                | TestCleanupFault::OwnerCancelFallbackSpawnFailure => unreachable!(),
+                | TestCleanupFault::OwnerCancelFallbackSpawnFailure
+                | TestCleanupFault::ExhaustiveEvidence
+                | TestCleanupFault::SetupUnconfirmedExceptionalEvidence
+                | TestCleanupFault::SetupFallbackSpawnFailure => unreachable!(),
             };
             assert_eq!(first.io_failure().unwrap().stage(), expected_stage);
             assert_exact_pid_is_gone(pid).await;
@@ -2298,6 +2712,197 @@ mod tests {
         assert_exact_pid_is_gone(pid).await;
         assert_eq!(active_owner_tasks(), 0);
         assert_eq!(active_exceptional_reapers(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_failure_composes_nonzero_terminal_status_from_bounded_stderr() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("proxy_auth_failure"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime.control_socket().with_extension("proxy_no_stdout"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+
+        let result = spawn_test_stream(
+            &runtime,
+            executable,
+            TestStreamFaults::setup(TestSetupFault::MissingStdout),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("missing stdout setup unexpectedly succeeded"),
+        };
+        assert_eq!(
+            error.io_failure().unwrap().stage(),
+            ProxyIoStage::SetupStdout
+        );
+        assert_eq!(
+            error.ssh_failure_kind(),
+            Some(SshFailureKind::Authentication)
+        );
+        let pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&pid_path).await;
+        assert_exact_pid_is_gone(helper_pid(&pid_path)).await;
+        assert_no_proxy_lifecycle_activity().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_unconfirmed_reap_returns_complete_active_fallback_evidence() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("hang_proxy"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime.control_socket().with_extension("proxy_stderr_open"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let startup_gate = runtime
+            .control_socket()
+            .with_extension("allow_setup_failure");
+        let fallback_gate = runtime
+            .control_socket()
+            .with_extension("allow_setup_fallback_reap");
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let ticket = ProxyTicket::generate();
+        let spec = factory
+            .proxy(&fixture_profile(), VmId::new(107).unwrap(), &ticket)
+            .unwrap();
+        let mut policy = TestStreamPolicy::short_with_fallback_gate(
+            runtime
+                .control_socket()
+                .with_extension("proxy.stderr-holder.pid"),
+            fallback_gate.clone(),
+        );
+        policy.startup_gate = Some(startup_gate.clone());
+        policy.pipe_drain_timeout = Duration::from_millis(100);
+        let startup = tokio::spawn(ProxyStream::spawn_with_test_seams(
+            spec,
+            TestStreamFaults::cleanup(TestCleanupFault::SetupUnconfirmedExceptionalEvidence),
+            policy,
+        ));
+        let pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&pid_path).await;
+        let pid = helper_pid(&pid_path);
+        let holder_path = runtime
+            .control_socket()
+            .with_extension("proxy.stderr-holder.pid");
+        wait_for(&holder_path).await;
+        let holder_pid = helper_pid(&holder_path);
+        fs::write(&startup_gate, b"synthetic fixture control\n").unwrap();
+
+        let error = match startup.await.unwrap() {
+            Err(error) => error,
+            Ok(_) => panic!("missing stdout setup unexpectedly succeeded"),
+        };
+        assert_eq!(
+            error.io_failure().unwrap().stage(),
+            ProxyIoStage::SetupStdout
+        );
+        let cleanup = error.cleanup_failure().unwrap();
+        assert_eq!(
+            cleanup.reap_state(),
+            ProxyReapState::UnconfirmedFallbackActive
+        );
+        for stage in [
+            ProxyIoStage::GracefulWait,
+            ProxyIoStage::Kill,
+            ProxyIoStage::FinalReap,
+            ProxyIoStage::StderrDrain,
+            ProxyIoStage::ExceptionalKill,
+            ProxyIoStage::ExceptionalPoll,
+        ] {
+            assert!(
+                cleanup.stage_seen(stage),
+                "missing setup cleanup stage {stage:?}"
+            );
+        }
+        assert!(exact_pid_is_alive(pid));
+        assert_eq!(active_fallback_authorities(), 1);
+
+        fs::write(&fallback_gate, b"synthetic fixture control\n").unwrap();
+        assert_exact_pid_is_gone(pid).await;
+        assert_exact_pid_is_gone(holder_pid).await;
+        assert_no_proxy_lifecycle_activity().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_fallback_spawn_failure_returns_confirmed_complete_evidence() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime.control_socket().with_extension("hang_proxy"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let startup_gate = runtime
+            .control_socket()
+            .with_extension("allow_setup_spawn_failure");
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let ticket = ProxyTicket::generate();
+        let spec = factory
+            .proxy(&fixture_profile(), VmId::new(107).unwrap(), &ticket)
+            .unwrap();
+        let mut policy = TestStreamPolicy::short_after_ready(
+            runtime.control_socket().with_extension("proxy.pid"),
+        );
+        policy.reap_timeout = Duration::from_millis(100);
+        policy.startup_gate = Some(startup_gate.clone());
+        let startup = tokio::spawn(ProxyStream::spawn_with_test_seams(
+            spec,
+            TestStreamFaults::cleanup(TestCleanupFault::SetupFallbackSpawnFailure),
+            policy,
+        ));
+        let pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&pid_path).await;
+        let pid = helper_pid(&pid_path);
+        fs::write(&startup_gate, b"synthetic fixture control\n").unwrap();
+
+        let error = match startup.await.unwrap() {
+            Err(error) => error,
+            Ok(_) => panic!("missing stdout setup unexpectedly succeeded"),
+        };
+        assert_eq!(
+            error.io_failure().unwrap().stage(),
+            ProxyIoStage::SetupStdout
+        );
+        let cleanup = error.cleanup_failure().unwrap();
+        assert_eq!(cleanup.reap_state(), ProxyReapState::Confirmed);
+        for stage in [
+            ProxyIoStage::Kill,
+            ProxyIoStage::FinalReap,
+            ProxyIoStage::ExceptionalKill,
+            ProxyIoStage::ExceptionalPoll,
+            ProxyIoStage::FallbackSpawn,
+        ] {
+            assert!(
+                cleanup.stage_seen(stage),
+                "missing setup cleanup stage {stage:?}"
+            );
+            assert!(cleanup.io_failure_for(stage).is_some());
+        }
+        assert_exact_pid_is_gone(pid).await;
+        assert_no_proxy_lifecycle_activity().await;
     }
 
     #[cfg(unix)]
