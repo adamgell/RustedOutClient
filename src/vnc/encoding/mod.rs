@@ -1,7 +1,8 @@
 use tokio::io::AsyncRead;
 
 use super::{
-    messages::PixelFormat, CheckedRect, Framebuffer, RfbError, RfbErrorKind, RfbPhase, RfbReader,
+    limits::validate_framebuffer_layout_for_phase, messages::PixelFormat, CheckedRect, Framebuffer,
+    RfbError, RfbErrorKind, RfbPhase, RfbReader,
 };
 
 pub mod copyrect;
@@ -9,6 +10,19 @@ pub mod hextile;
 pub mod raw;
 pub mod tight;
 pub mod zrle;
+
+pub(crate) fn validate_session_framebuffer<S>(
+    reader: &RfbReader<S>,
+    framebuffer: &Framebuffer,
+) -> Result<(), RfbError> {
+    validate_framebuffer_layout_for_phase(
+        framebuffer.width(),
+        framebuffer.height(),
+        reader.limits(),
+        RfbPhase::Encoding,
+    )?;
+    Ok(())
+}
 
 pub(crate) fn checked_destination(
     framebuffer: &Framebuffer,

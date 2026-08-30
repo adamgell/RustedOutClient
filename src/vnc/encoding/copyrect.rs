@@ -1,7 +1,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::vnc::{
-    encoding::{checked_destination, map_framebuffer_error},
+    encoding::{checked_destination, map_framebuffer_error, validate_session_framebuffer},
     Framebuffer, RfbError, RfbPhase, RfbReader,
 };
 
@@ -16,6 +16,7 @@ pub async fn decode<S>(
 where
     S: AsyncRead + Unpin,
 {
+    validate_session_framebuffer(reader, framebuffer)?;
     let destination =
         checked_destination(framebuffer, destination_x, destination_y, width, height)?;
     let source_x = reader

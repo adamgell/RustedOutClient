@@ -65,10 +65,63 @@ fn sparse_32_depth24_format() -> PixelFormat {
     }
 }
 
+fn rgb332_format() -> PixelFormat {
+    PixelFormat {
+        bits_per_pixel: 8,
+        depth: 8,
+        big_endian: false,
+        true_colour: true,
+        red_max: 7,
+        green_max: 7,
+        blue_max: 3,
+        red_shift: 5,
+        green_shift: 2,
+        blue_shift: 0,
+    }
+}
+
+fn most_significant_32_format(big_endian: bool) -> PixelFormat {
+    PixelFormat {
+        bits_per_pixel: 32,
+        depth: 24,
+        big_endian,
+        true_colour: true,
+        red_max: 255,
+        green_max: 255,
+        blue_max: 255,
+        red_shift: 24,
+        green_shift: 16,
+        blue_shift: 8,
+    }
+}
+
+fn overlapping_cpixel_windows_format() -> PixelFormat {
+    PixelFormat {
+        bits_per_pixel: 32,
+        depth: 16,
+        big_endian: false,
+        true_colour: true,
+        red_max: 31,
+        green_max: 63,
+        blue_max: 31,
+        red_shift: 19,
+        green_shift: 13,
+        blue_shift: 8,
+    }
+}
+
 fn invalid_format() -> PixelFormat {
     PixelFormat {
         red_max: 0,
         ..canonical_format()
+    }
+}
+
+fn reader_policy_for_one_pixel() -> ProtocolLimits {
+    ProtocolLimits {
+        max_pixels: 1,
+        max_framebuffer_bytes: 4,
+        ..limits()
     }
 }
 
@@ -261,6 +314,30 @@ async fn raw_truncation_never_mutates_the_framebuffer() {
 }
 
 #[tokio::test]
+async fn raw_rejects_a_framebuffer_exceeding_the_reader_session_policy_before_payload_read() {
+    let wire = [pixel32(1, 2, 3), pixel32(4, 5, 6)].concat();
+    let mut reader = RfbReader::new(wire.as_slice(), reader_policy_for_one_pixel());
+    let mut framebuffer = framebuffer(2, 1);
+    let before = full_snapshot(&framebuffer);
+
+    let error = raw::decode(
+        &mut reader,
+        &mut framebuffer,
+        &canonical_format(),
+        0,
+        0,
+        2,
+        1,
+    )
+    .await
+    .unwrap_err();
+
+    assert_typed(&error, RfbPhase::Encoding, RfbErrorKind::Limit);
+    assert_eq!(full_snapshot(&framebuffer), before);
+    assert_eq!(reader.into_inner(), wire.as_slice());
+}
+
+#[tokio::test]
 async fn copyrect_minimal_nonoverlap_and_overlap_are_exact() {
     let mut framebuffer = Framebuffer::new(4, 1, limits()).unwrap();
     let all = CheckedRect::new(0, 0, 4, 1, 4, 1).unwrap();
@@ -320,6 +397,22 @@ async fn copyrect_truncated_coordinates_are_typed_and_atomic() {
         .unwrap_err();
     assert_typed(&error, RfbPhase::Encoding, RfbErrorKind::Io);
     assert_eq!(full_snapshot(&framebuffer), before);
+}
+
+#[tokio::test]
+async fn copyrect_rejects_a_framebuffer_exceeding_the_reader_session_policy_before_coordinates() {
+    let wire = [0_u8, 0, 0, 0];
+    let mut reader = RfbReader::new(wire.as_slice(), reader_policy_for_one_pixel());
+    let mut framebuffer = framebuffer(2, 1);
+    let before = full_snapshot(&framebuffer);
+
+    let error = copyrect::decode(&mut reader, &mut framebuffer, 0, 0, 1, 1)
+        .await
+        .unwrap_err();
+
+    assert_typed(&error, RfbPhase::Encoding, RfbErrorKind::Limit);
+    assert_eq!(full_snapshot(&framebuffer), before);
+    assert_eq!(reader.into_inner(), wire.as_slice());
 }
 
 #[tokio::test]
@@ -496,6 +589,35 @@ async fn hextile_raw_and_coloured_tiles_invalidate_carried_colour_state_atomical
         assert_typed(&error, RfbPhase::Encoding, RfbErrorKind::Decoder);
         assert_eq!(full_snapshot(&framebuffer), before);
     }
+}
+
+#[tokio::test]
+async fn hextile_rejects_a_framebuffer_exceeding_the_reader_session_policy_before_subtype() {
+    let wire = [
+        vec![0x01],
+        pixel32(1, 2, 3).to_vec(),
+        pixel32(4, 5, 6).to_vec(),
+    ]
+    .concat();
+    let mut reader = RfbReader::new(wire.as_slice(), reader_policy_for_one_pixel());
+    let mut framebuffer = framebuffer(2, 1);
+    let before = full_snapshot(&framebuffer);
+
+    let error = hextile::decode(
+        &mut reader,
+        &mut framebuffer,
+        &canonical_format(),
+        0,
+        0,
+        2,
+        1,
+    )
+    .await
+    .unwrap_err();
+
+    assert_typed(&error, RfbPhase::Encoding, RfbErrorKind::Limit);
+    assert_eq!(full_snapshot(&framebuffer), before);
+    assert_eq!(reader.into_inner(), wire.as_slice());
 }
 
 #[tokio::test]
@@ -763,6 +885,129 @@ async fn zrle_cpixel_width_requires_channels_to_fit_three_contiguous_bytes() {
     .await
     .unwrap();
     assert_eq!(full_snapshot(&framebuffer), rgba(255, 0, 0));
+}
+
+#[tokio::test]
+async fn zrle_rejects_a_framebuffer_exceeding_the_reader_session_policy_before_length() {
+    let wire = zrle_wire(&[vec![1], cpixel(1, 2, 3).to_vec()].concat());
+    let mut reader = RfbReader::new(wire.as_slice(), reader_policy_for_one_pixel());
+    let mut framebuffer = framebuffer(2, 1);
+    let before = full_snapshot(&framebuffer);
+
+    let error = zrle::decode(
+        &mut reader,
+        &mut framebuffer,
+        &canonical_format(),
+        0,
+        0,
+        2,
+        1,
+        &mut zrle::ZrleState::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_typed(&error, RfbPhase::Encoding, RfbErrorKind::Limit);
+    assert_eq!(full_snapshot(&framebuffer), before);
+    assert_eq!(reader.into_inner(), wire.as_slice());
+}
+
+#[tokio::test]
+async fn zrle_state_continues_across_two_sync_flush_packets_without_reset() {
+    let first_decoded = [vec![1], cpixel(0x11, 0x22, 0x33).to_vec()].concat();
+    let second_decoded = [vec![1], cpixel(0x44, 0x55, 0x66).to_vec()].concat();
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&first_decoded).unwrap();
+    encoder.flush().unwrap();
+    let split = encoder.get_ref().len();
+    let first_compressed = encoder.get_ref().clone();
+    encoder.write_all(&second_decoded).unwrap();
+    encoder.flush().unwrap();
+    let second_compressed = encoder.get_ref()[split..].to_vec();
+
+    let mut first_wire = Vec::new();
+    first_wire.extend_from_slice(&(first_compressed.len() as u32).to_be_bytes());
+    first_wire.extend_from_slice(&first_compressed);
+    let mut second_wire = Vec::new();
+    second_wire.extend_from_slice(&(second_compressed.len() as u32).to_be_bytes());
+    second_wire.extend_from_slice(&second_compressed);
+
+    let mut state = zrle::ZrleState::new();
+    let mut framebuffer = framebuffer(2, 1);
+    let mut first_reader = RfbReader::new(first_wire.as_slice(), limits());
+    zrle::decode(
+        &mut first_reader,
+        &mut framebuffer,
+        &canonical_format(),
+        0,
+        0,
+        1,
+        1,
+        &mut state,
+    )
+    .await
+    .unwrap();
+    assert!(first_reader.into_inner().is_empty());
+
+    let mut second_reader = RfbReader::new(second_wire.as_slice(), limits());
+    zrle::decode(
+        &mut second_reader,
+        &mut framebuffer,
+        &canonical_format(),
+        1,
+        0,
+        1,
+        1,
+        &mut state,
+    )
+    .await
+    .unwrap();
+    assert!(second_reader.into_inner().is_empty());
+    assert_eq!(
+        full_snapshot(&framebuffer),
+        [rgba(0x11, 0x22, 0x33), rgba(0x44, 0x55, 0x66)].concat()
+    );
+}
+
+#[tokio::test]
+async fn zrle_cpixel_covers_little_big_and_overlapping_most_significant_modes_exactly() {
+    let cases = [
+        (
+            most_significant_32_format(false),
+            vec![0x33, 0x22, 0x11],
+            rgba(0x11, 0x22, 0x33),
+        ),
+        (
+            most_significant_32_format(true),
+            vec![0x11, 0x22, 0x33],
+            rgba(0x11, 0x22, 0x33),
+        ),
+        (
+            overlapping_cpixel_windows_format(),
+            vec![0x00, 0x00, 0xf8],
+            rgba(0xff, 0x00, 0x00),
+        ),
+    ];
+
+    for (format, cpixel_bytes, expected) in cases {
+        let wire = zrle_wire(&[vec![1], cpixel_bytes].concat());
+        let mut reader = RfbReader::new(wire.as_slice(), limits());
+        let mut framebuffer = framebuffer(1, 1);
+        zrle::decode(
+            &mut reader,
+            &mut framebuffer,
+            &format,
+            0,
+            0,
+            1,
+            1,
+            &mut zrle::ZrleState::new(),
+        )
+        .await
+        .unwrap();
+        assert!(reader.into_inner().is_empty());
+        assert_eq!(full_snapshot(&framebuffer), expected);
+    }
 }
 
 #[tokio::test]
@@ -1128,6 +1373,60 @@ async fn tight_jpeg_checks_length_dimensions_and_decode_before_framebuffer_commi
         assert_typed(&error, RfbPhase::Encoding, RfbErrorKind::Decoder);
         assert_eq!(full_snapshot(&framebuffer), before);
     }
+}
+
+#[tokio::test]
+async fn tight_jpeg_rejects_rgb332_before_reading_compact_length_or_payload() {
+    let encoded = jpeg(1, 1, [10, 20, 30]);
+    let mut wire = vec![0x90];
+    wire.extend_from_slice(&compact_length(encoded.len() as u32));
+    wire.extend_from_slice(&encoded);
+    let unread = wire[1..].to_vec();
+    let mut reader = RfbReader::new(wire.as_slice(), limits());
+    let mut framebuffer = framebuffer(1, 1);
+    let before = full_snapshot(&framebuffer);
+
+    let error = tight::decode(
+        &mut reader,
+        &mut framebuffer,
+        &rgb332_format(),
+        0,
+        0,
+        1,
+        1,
+        &mut tight::TightState::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_typed(&error, RfbPhase::Encoding, RfbErrorKind::Decoder);
+    assert_eq!(full_snapshot(&framebuffer), before);
+    assert_eq!(reader.into_inner(), unread.as_slice());
+}
+
+#[tokio::test]
+async fn tight_rejects_a_framebuffer_exceeding_the_reader_session_policy_before_control() {
+    let wire = [vec![0x80], tpixel(1, 2, 3).to_vec()].concat();
+    let mut reader = RfbReader::new(wire.as_slice(), reader_policy_for_one_pixel());
+    let mut framebuffer = framebuffer(2, 1);
+    let before = full_snapshot(&framebuffer);
+
+    let error = tight::decode(
+        &mut reader,
+        &mut framebuffer,
+        &canonical_format(),
+        0,
+        0,
+        2,
+        1,
+        &mut tight::TightState::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_typed(&error, RfbPhase::Encoding, RfbErrorKind::Limit);
+    assert_eq!(full_snapshot(&framebuffer), before);
+    assert_eq!(reader.into_inner(), wire.as_slice());
 }
 
 #[tokio::test]

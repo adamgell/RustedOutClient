@@ -5,7 +5,7 @@ use image::{codecs::jpeg::JpegDecoder, ColorType, ImageDecoder};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::vnc::{
-    encoding::{checked_destination, commit},
+    encoding::{checked_destination, commit, validate_session_framebuffer},
     messages::PixelFormat,
     wire::allocate_zeroed,
     Framebuffer, RfbError, RfbPhase, RfbReader,
@@ -64,7 +64,7 @@ where
     S: AsyncRead + Unpin,
 {
     pixel_format.validate_for_phase(RfbPhase::Encoding)?;
-    reader.limits().validate_for_phase(RfbPhase::Encoding)?;
+    validate_session_framebuffer(reader, framebuffer)?;
     let rectangle = checked_destination(framebuffer, x, y, width, height)?;
     if width > MAX_TIGHT_WIDTH {
         return Err(RfbError::limit(RfbPhase::Encoding, "Tight rectangle width"));
@@ -113,7 +113,10 @@ where
             .await?
         }
         8 => fill(reader, pixel_format, width, height, &mut budget).await?,
-        9 => jpeg(reader, width, height, &mut budget).await?,
+        9 if matches!(pixel_format.bits_per_pixel, 16 | 32) => {
+            jpeg(reader, width, height, &mut budget).await?
+        }
+        9 => return Err(RfbError::decoder("Tight JPEG pixel format")),
         10 | 14 => return Err(RfbError::decoder("Tight without zlib")),
         _ => return Err(RfbError::decoder("Tight compression method")),
     };

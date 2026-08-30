@@ -1,0 +1,10 @@
+error[E0624]: method `to_rgb` is private
+  --> tests/ui/pixel_format_to_rgb.rs:16:23
+   |
+16 |     let _ = malformed.to_rgb(0);
+   |                       ^^^^^^ private method
+   |
+  ::: src/vnc/messages.rs
+   |
+   |     pub(crate) fn to_rgb(&self, pixel: u32) -> (u8, u8, u8) {
+   |     ------------------------------------------------------- private method defined here

@@ -463,6 +463,8 @@ fn command_and_event_queues_are_exactly_capacity_256_and_nonblocking() {
 }
 
 #[test]
-fn raw_proxy_stream_cannot_call_public_vnc_api() {
-    trybuild::TestCases::new().compile_fail("tests/ui/untrusted_stream.rs");
+fn public_vnc_api_rejects_untrusted_stream_and_unchecked_pixel_conversion() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui/untrusted_stream.rs");
+    cases.compile_fail("tests/ui/pixel_format_to_rgb.rs");
 }

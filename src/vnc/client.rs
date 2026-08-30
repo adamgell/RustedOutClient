@@ -888,15 +888,19 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use crossbeam_channel::bounded;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        configure_server, decoder_pixel_format, framebuffer_rects, tight, EventQueue, TightState,
+        configure_server, decoder_pixel_format, framebuffer_rects, run_session, tight, EventQueue,
+        TightState,
     };
     use crate::{
-        connection::{FbRect, VncEvent},
+        connection::{FbRect, VncCommand, VncEvent},
         vnc::{
+            messages::{encoding as enc, server_msg},
             CheckedRect, Framebuffer, ProtocolLimits, RfbError, RfbErrorKind, RfbPhase, RfbReader,
         },
     };
@@ -942,6 +946,21 @@ mod tests {
         }
     }
 
+    fn push_rectangle_header(
+        wire: &mut Vec<u8>,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        encoding: i32,
+    ) {
+        wire.extend_from_slice(&x.to_be_bytes());
+        wire.extend_from_slice(&y.to_be_bytes());
+        wire.extend_from_slice(&width.to_be_bytes());
+        wire.extend_from_slice(&height.to_be_bytes());
+        wire.extend_from_slice(&encoding.to_be_bytes());
+    }
+
     #[tokio::test]
     async fn valid_native_formats_emit_canonical_pixel_format_before_encodings() {
         for format in [CANONICAL_FORMAT, RGB565_16_FORMAT, RGB565_32_FORMAT] {
@@ -976,6 +995,93 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(framebuffer.pixels(), [0x11, 0x22, 0x33, 0xff]);
+    }
+
+    #[tokio::test]
+    async fn framebuffer_update_orders_old_dirty_resize_new_dirty_and_refresh_requests() {
+        let mut update = vec![server_msg::FB_UPDATE, 0];
+        update.extend_from_slice(&3_u16.to_be_bytes());
+        push_rectangle_header(&mut update, 0, 0, 2, 1, enc::RAW);
+        update.extend_from_slice(&[0x03, 0x02, 0x01, 0, 0x06, 0x05, 0x04, 0]);
+        push_rectangle_header(&mut update, 0, 0, 3, 1, enc::DESKTOP_SIZE);
+        push_rectangle_header(&mut update, 2, 0, 1, 1, enc::RAW);
+        update.extend_from_slice(&[0x09, 0x08, 0x07, 0]);
+
+        let (client, mut peer) = duplex(512);
+        peer.write_all(&update).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let limits = ProtocolLimits::default();
+        let mut reader = RfbReader::new(client, limits);
+        let mut framebuffer = Framebuffer::new(2, 1, limits).unwrap();
+        let (event_tx, event_rx) = bounded(8);
+        let mut events = EventQueue::new(event_tx, limits);
+        let (_command_tx, command_rx) = bounded::<VncCommand>(1);
+
+        let error = run_session(
+            &mut reader,
+            &mut framebuffer,
+            &mut events,
+            &command_rx,
+            limits,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.phase(), RfbPhase::Session);
+        assert_eq!(error.kind(), RfbErrorKind::Io);
+        assert_eq!(error.io_kind(), Some(io::ErrorKind::UnexpectedEof));
+
+        drop(reader);
+        let mut outbound = Vec::new();
+        peer.read_to_end(&mut outbound).await.unwrap();
+        assert_eq!(
+            outbound,
+            [
+                3, 0, 0, 0, 0, 0, 0, 3, 0, 1, // resize refresh: nonincremental, 3x1
+                3, 1, 0, 0, 0, 0, 0, 3, 0, 1, // normal post-update incremental, 3x1
+            ]
+        );
+
+        let VncEvent::FramebufferRects(old_rects) = event_rx.try_recv().unwrap() else {
+            panic!("expected old-dimension framebuffer event first");
+        };
+        assert_eq!(old_rects.len(), 1);
+        assert_eq!(
+            (
+                old_rects[0].x,
+                old_rects[0].y,
+                old_rects[0].w,
+                old_rects[0].h,
+            ),
+            (0, 0, 2, 1)
+        );
+        assert_eq!(
+            old_rects[0].rgba,
+            [0x01, 0x02, 0x03, 0xff, 0x04, 0x05, 0x06, 0xff,]
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(VncEvent::DesktopSize(3, 1))
+        ));
+        let VncEvent::FramebufferRects(new_rects) = event_rx.try_recv().unwrap() else {
+            panic!("expected new-dimension framebuffer event after DesktopSize");
+        };
+        assert_eq!(new_rects.len(), 1);
+        assert_eq!(
+            (
+                new_rects[0].x,
+                new_rects[0].y,
+                new_rects[0].w,
+                new_rects[0].h,
+            ),
+            (2, 0, 1, 1)
+        );
+        assert_eq!(new_rects[0].rgba, [0x07, 0x08, 0x09, 0xff]);
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(framebuffer.dimensions(), (3, 1));
+        assert_eq!(
+            framebuffer.pixels(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 0x07, 0x08, 0x09, 0xff]
+        );
     }
 
     #[test]

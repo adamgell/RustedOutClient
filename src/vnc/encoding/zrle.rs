@@ -2,7 +2,7 @@ use flate2::{Decompress, FlushDecompress};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::vnc::{
-    encoding::{checked_destination, commit},
+    encoding::{checked_destination, commit, validate_session_framebuffer},
     messages::PixelFormat,
     wire::allocate_zeroed,
     Framebuffer, RfbError, RfbPhase, RfbReader,
@@ -44,7 +44,7 @@ where
     S: AsyncRead + Unpin,
 {
     pixel_format.validate_for_phase(RfbPhase::Encoding)?;
-    reader.limits().validate_for_phase(RfbPhase::Encoding)?;
+    validate_session_framebuffer(reader, framebuffer)?;
     let rectangle = checked_destination(framebuffer, x, y, width, height)?;
     let maximum_output = max_decompressed_bytes(width, height, pixel_format)?;
     let declared = reader
