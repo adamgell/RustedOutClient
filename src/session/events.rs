@@ -31,6 +31,7 @@ impl Default for OpenOptions {
 pub enum InputAction {
     Key { down: bool, keysym: u32 },
     Pointer { buttons: u8, x: u16, y: u16 },
+    ReleasePointer { x: u16, y: u16 },
     CtrlAltDelete,
     ReleaseAllKeys,
     FocusLost,

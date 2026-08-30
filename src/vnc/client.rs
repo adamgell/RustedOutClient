@@ -36,6 +36,7 @@ pub struct VncOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtendedDesktopSize {
     ServerSize(DesktopSize),
+    ServerUnsupported(DesktopSize),
     Pending(DesktopSize),
     Rejected,
     Unsupported,
@@ -415,8 +416,15 @@ pub fn parse_extended_desktop_size(
     if result == 1 || result == 2 {
         return Ok(ExtendedDesktopSize::Rejected);
     }
-    if result == 3 || !exact_single {
+    if result == 3 {
         return Ok(ExtendedDesktopSize::Unsupported);
+    }
+    if !exact_single {
+        return if reason == 1 {
+            Ok(ExtendedDesktopSize::Unsupported)
+        } else {
+            Ok(ExtendedDesktopSize::ServerUnsupported(size))
+        };
     }
     if reason == 1 {
         Ok(ExtendedDesktopSize::Pending(size))
@@ -968,6 +976,41 @@ where
                                     )
                                     .await?;
                                 }
+                                ExtendedDesktopSize::ServerUnsupported(size) => {
+                                    if let Some(region) = dirty.take() {
+                                        let rect = snapshot_rect(
+                                            framebuffer,
+                                            region.left,
+                                            region.top,
+                                            region.right - region.left,
+                                            region.bottom - region.top,
+                                            limits,
+                                        )?;
+                                        events.send_framebuffer(
+                                            framebuffer,
+                                            framebuffer_rects(rect)?,
+                                        )?;
+                                    }
+                                    events.flush_pending(framebuffer)?;
+                                    encoding::decode_desktop_size(
+                                        framebuffer,
+                                        size.width,
+                                        size.height,
+                                    )?;
+                                    events.send_lossless(VncEvent::DesktopSize(size))?;
+                                    events.send_lossless(VncEvent::ResizeOutcome(
+                                        ResizeProtocolOutcome::ServerUnsupported,
+                                    ))?;
+                                    send_fb_update_request(
+                                        reader,
+                                        false,
+                                        0,
+                                        0,
+                                        size.width,
+                                        size.height,
+                                    )
+                                    .await?;
+                                }
                                 ExtendedDesktopSize::Pending(size) => {
                                     events.send_lossless(VncEvent::ResizeOutcome(
                                         ResizeProtocolOutcome::Forwarded(size),
@@ -1418,6 +1461,24 @@ mod tests {
         width: u16,
         height: u16,
     ) {
+        push_extended_size(
+            wire,
+            reason,
+            result,
+            width,
+            height,
+            &[(0, 0, 0, width, height, 0)],
+        );
+    }
+
+    fn push_extended_size(
+        wire: &mut Vec<u8>,
+        reason: u16,
+        result: u16,
+        width: u16,
+        height: u16,
+        screens: &[(u32, u16, u16, u16, u16, u32)],
+    ) {
         push_rectangle_header(
             wire,
             reason,
@@ -1426,13 +1487,15 @@ mod tests {
             height,
             enc::EXTENDED_DESKTOP_SIZE,
         );
-        wire.extend_from_slice(&[1, 0, 0, 0]);
-        wire.extend_from_slice(&0_u32.to_be_bytes());
-        wire.extend_from_slice(&0_u16.to_be_bytes());
-        wire.extend_from_slice(&0_u16.to_be_bytes());
-        wire.extend_from_slice(&width.to_be_bytes());
-        wire.extend_from_slice(&height.to_be_bytes());
-        wire.extend_from_slice(&0_u32.to_be_bytes());
+        wire.extend_from_slice(&[screens.len() as u8, 0, 0, 0]);
+        for (id, x, y, screen_width, screen_height, flags) in screens {
+            wire.extend_from_slice(&id.to_be_bytes());
+            wire.extend_from_slice(&x.to_be_bytes());
+            wire.extend_from_slice(&y.to_be_bytes());
+            wire.extend_from_slice(&screen_width.to_be_bytes());
+            wire.extend_from_slice(&screen_height.to_be_bytes());
+            wire.extend_from_slice(&flags.to_be_bytes());
+        }
     }
 
     #[tokio::test]
@@ -1845,6 +1908,183 @@ mod tests {
             }))
         ));
         assert_eq!(framebuffer.dimensions(), (1_600, 900));
+    }
+
+    #[tokio::test]
+    async fn server_unsupported_multiscreen_grow_advances_geometry_before_following_rect() {
+        let mut update = vec![server_msg::FB_UPDATE, 0];
+        update.extend_from_slice(&2_u16.to_be_bytes());
+        push_extended_size(
+            &mut update,
+            0,
+            0,
+            4,
+            1,
+            &[(0, 0, 0, 2, 1, 0), (1, 2, 0, 2, 1, 0)],
+        );
+        push_rectangle_header(&mut update, 3, 0, 1, 1, enc::RAW);
+        update.extend_from_slice(&[0x09, 0x08, 0x07, 0]);
+
+        let (client, mut peer) = duplex(512);
+        peer.write_all(&update).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let limits = ProtocolLimits::default();
+        let mut reader = RfbReader::new(client, limits);
+        let mut framebuffer = Framebuffer::new(2, 1, limits).unwrap();
+        let (event_tx, event_rx) = bounded(8);
+        let mut events = EventQueue::new(event_tx, limits);
+        let (_command_tx, command_rx) = bounded::<VncCommand>(1);
+        let clipboard = ClipboardSlot::default();
+
+        let error = run_session(
+            &mut reader,
+            &mut framebuffer,
+            &mut events,
+            &command_rx,
+            limits,
+            &clipboard,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.io_kind(), Some(io::ErrorKind::UnexpectedEof));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(VncEvent::DesktopSize(DesktopSize {
+                width: 4,
+                height: 1
+            }))
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(VncEvent::ResizeOutcome(
+                crate::connection::ResizeProtocolOutcome::ServerUnsupported
+            ))
+        ));
+        let VncEvent::FramebufferRects(rects) = event_rx.try_recv().unwrap() else {
+            panic!("following rectangle should use the grown geometry");
+        };
+        assert_eq!(
+            (rects[0].x, rects[0].y, rects[0].w, rects[0].h),
+            (3, 0, 1, 1)
+        );
+        assert_eq!(rects[0].rgba, [0x07, 0x08, 0x09, 0xff]);
+        assert_eq!(framebuffer.dimensions(), (4, 1));
+
+        drop(reader);
+        let mut outbound = Vec::new();
+        peer.read_to_end(&mut outbound).await.unwrap();
+        assert_eq!(
+            outbound,
+            [3, 0, 0, 0, 0, 0, 0, 4, 0, 1, 3, 1, 0, 0, 0, 0, 0, 4, 0, 1,]
+        );
+    }
+
+    #[tokio::test]
+    async fn server_unsupported_flagged_reason_two_shrinks_and_requests_new_dimensions() {
+        let mut update = vec![server_msg::FB_UPDATE, 0];
+        update.extend_from_slice(&1_u16.to_be_bytes());
+        push_extended_size(&mut update, 2, 0, 2, 1, &[(0, 0, 0, 2, 1, 1)]);
+
+        let (client, mut peer) = duplex(256);
+        peer.write_all(&update).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let limits = ProtocolLimits::default();
+        let mut reader = RfbReader::new(client, limits);
+        let mut framebuffer = Framebuffer::new(4, 2, limits).unwrap();
+        let (event_tx, event_rx) = bounded(8);
+        let mut events = EventQueue::new(event_tx, limits);
+        let (_command_tx, command_rx) = bounded::<VncCommand>(1);
+        let clipboard = ClipboardSlot::default();
+
+        run_session(
+            &mut reader,
+            &mut framebuffer,
+            &mut events,
+            &command_rx,
+            limits,
+            &clipboard,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(VncEvent::DesktopSize(DesktopSize {
+                width: 2,
+                height: 1
+            }))
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(VncEvent::ResizeOutcome(
+                crate::connection::ResizeProtocolOutcome::ServerUnsupported
+            ))
+        ));
+        assert_eq!(framebuffer.dimensions(), (2, 1));
+
+        drop(reader);
+        let mut outbound = Vec::new();
+        peer.read_to_end(&mut outbound).await.unwrap();
+        assert_eq!(
+            outbound,
+            [3, 0, 0, 0, 0, 0, 0, 2, 0, 1, 3, 1, 0, 0, 0, 0, 0, 2, 0, 1,]
+        );
+    }
+
+    #[tokio::test]
+    async fn client_rejection_and_unsupported_outcomes_do_not_mutate_geometry() {
+        let mut updates = vec![server_msg::FB_UPDATE, 0];
+        updates.extend_from_slice(&1_u16.to_be_bytes());
+        push_one_screen_extended_size(&mut updates, 1, 3, 4, 1);
+        updates.extend_from_slice(&[server_msg::FB_UPDATE, 0]);
+        updates.extend_from_slice(&1_u16.to_be_bytes());
+        push_one_screen_extended_size(&mut updates, 1, 1, 5, 1);
+
+        let (client, mut peer) = duplex(512);
+        peer.write_all(&updates).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let limits = ProtocolLimits::default();
+        let mut reader = RfbReader::new(client, limits);
+        let mut framebuffer = Framebuffer::new(2, 1, limits).unwrap();
+        let (event_tx, event_rx) = bounded(8);
+        let mut events = EventQueue::new(event_tx, limits);
+        let (_command_tx, command_rx) = bounded::<VncCommand>(1);
+        let clipboard = ClipboardSlot::default();
+
+        run_session(
+            &mut reader,
+            &mut framebuffer,
+            &mut events,
+            &command_rx,
+            limits,
+            &clipboard,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(VncEvent::ResizeOutcome(
+                crate::connection::ResizeProtocolOutcome::Unsupported
+            ))
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(VncEvent::ResizeOutcome(
+                crate::connection::ResizeProtocolOutcome::Rejected
+            ))
+        ));
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(framebuffer.dimensions(), (2, 1));
+
+        drop(reader);
+        let mut outbound = Vec::new();
+        peer.read_to_end(&mut outbound).await.unwrap();
+        assert_eq!(
+            outbound,
+            [3, 1, 0, 0, 0, 0, 0, 2, 0, 1, 3, 1, 0, 0, 0, 0, 0, 2, 0, 1,]
+        );
     }
 
     #[test]

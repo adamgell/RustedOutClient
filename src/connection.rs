@@ -24,6 +24,7 @@ pub enum ResizeProtocolOutcome {
     Forwarded(DesktopSize),
     Rejected,
     Unsupported,
+    ServerUnsupported,
 }
 
 /// A single changed rectangle: tightly-packed `w*h*4` RGBA bytes at `(x, y)`.

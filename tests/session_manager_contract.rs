@@ -151,6 +151,7 @@ impl ManagedSession for FakeSession {
             InputAction::Pointer { buttons, x, y } => {
                 self.input.pointer(buttons, x, y).map(|()| None)
             }
+            InputAction::ReleasePointer { x, y } => self.input.release_pointer(x, y).map(|()| None),
             InputAction::CtrlAltDelete => self.input.ctrl_alt_delete().map(|()| None),
             InputAction::ReleaseAllKeys => self.input.release_all_keys().map(|()| None),
             InputAction::FocusLost => self.input.focus_lost().map(|()| None),

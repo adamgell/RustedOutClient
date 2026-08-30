@@ -13,7 +13,7 @@ use crate::{
 
 use super::{
     actions::{selected_tab, UiAction},
-    state::{AppState, ClipboardStatus, FramebufferImage, QueueStatus, SetupState},
+    state::{AppState, ClipboardStatus, FramebufferUploadKind, QueueStatus, SetupState},
 };
 
 const CANVAS_BLACK: Color32 = Color32::from_rgb(0x0d, 0x11, 0x17);
@@ -28,14 +28,11 @@ struct TextureEntry {
     handle: egui::TextureHandle,
     width: u16,
     height: u16,
-    revision: u64,
 }
 
 pub(crate) struct ViewResources {
     textures: HashMap<SessionId, TextureEntry>,
-    pointer_buttons: u8,
-    pointer_position: Option<(u16, u16)>,
-    modifier_bits: u8,
+    input: InputOwnership,
     app_focused: bool,
 }
 
@@ -43,11 +40,93 @@ impl Default for ViewResources {
     fn default() -> Self {
         Self {
             textures: HashMap::new(),
-            pointer_buttons: 0,
-            pointer_position: None,
-            modifier_bits: 0,
+            input: InputOwnership::default(),
             app_focused: true,
         }
+    }
+}
+
+#[derive(Default)]
+struct InputOwnership {
+    session_id: Option<SessionId>,
+    keyboard_focused: bool,
+    modifier_bits: u8,
+    pointer_buttons: u8,
+    pointer_position: Option<(u16, u16)>,
+}
+
+impl InputOwnership {
+    #[cfg(test)]
+    fn for_session(session_id: SessionId) -> Self {
+        Self {
+            session_id: Some(session_id),
+            keyboard_focused: true,
+            ..Self::default()
+        }
+    }
+
+    fn claim(&mut self, session_id: SessionId, keyboard_focused: bool) {
+        if self.session_id.is_none() {
+            self.session_id = Some(session_id);
+        }
+        if self.session_id == Some(session_id) {
+            self.keyboard_focused |= keyboard_focused;
+        }
+    }
+
+    fn release(&mut self, actions: &mut Vec<UiAction>) {
+        let Some(session_id) = self.session_id else {
+            return;
+        };
+        if self.pointer_buttons != 0 {
+            if let Some((x, y)) = self.pointer_position {
+                actions.push(UiAction::ReleasePointer { session_id, x, y });
+            }
+        }
+        actions.push(UiAction::FocusLost { session_id });
+        *self = Self::default();
+    }
+
+    fn release_if_not(&mut self, session_id: Option<SessionId>, actions: &mut Vec<UiAction>) {
+        if self.session_id.is_some() && self.session_id != session_id {
+            self.release(actions);
+        }
+    }
+
+    fn release_pointer(&mut self, actions: &mut Vec<UiAction>) {
+        if self.pointer_buttons != 0 {
+            if let (Some(session_id), Some((x, y))) = (self.session_id, self.pointer_position) {
+                actions.push(UiAction::ReleasePointer { session_id, x, y });
+            }
+        }
+        self.pointer_buttons = 0;
+        self.pointer_position = None;
+    }
+
+    #[cfg(test)]
+    fn set_test_state(
+        &mut self,
+        modifier_bits: u8,
+        pointer_buttons: u8,
+        pointer_position: Option<(u16, u16)>,
+    ) {
+        self.modifier_bits = modifier_bits;
+        self.pointer_buttons = pointer_buttons;
+        self.pointer_position = pointer_position;
+    }
+
+    #[cfg(test)]
+    fn is_clear(&self) -> bool {
+        self.session_id.is_none()
+            && !self.keyboard_focused
+            && self.modifier_bits == 0
+            && self.pointer_buttons == 0
+            && self.pointer_position.is_none()
+    }
+
+    #[cfg(test)]
+    fn pointer_buttons(&self) -> u8 {
+        self.pointer_buttons
     }
 }
 
@@ -88,6 +167,9 @@ pub(crate) fn render(
             .any(|tab| tab.snapshot.session_id == *session_id)
     });
     let mut actions = Vec::new();
+    resources
+        .input
+        .release_if_not(state.selected_session_id(), &mut actions);
     render_menu_bar(ctx, state, &mut actions);
 
     if state.setup_state() != &SetupState::Configured {
@@ -101,19 +183,30 @@ pub(crate) fn render(
     render_diagnostics(ctx, state, &mut actions);
 
     let focused = ctx.input(|input| input.focused);
-    if resources.app_focused && !focused && state.selected_session_id().is_some() {
-        if resources.pointer_buttons != 0 {
-            if let Some((x, y)) = resources.pointer_position {
-                actions.push(UiAction::Pointer { buttons: 0, x, y });
-            }
-        }
-        resources.pointer_buttons = 0;
-        resources.pointer_position = None;
-        resources.modifier_bits = 0;
-        actions.push(UiAction::FocusLost);
+    if resources.app_focused && !focused {
+        resources.input.release(&mut actions);
     }
     resources.app_focused = focused;
+    release_owner_for_control_actions(&mut resources.input, &mut actions);
     actions
+}
+
+fn release_owner_for_control_actions(ownership: &mut InputOwnership, actions: &mut Vec<UiAction>) {
+    if actions.iter().any(|action| {
+        !matches!(
+            action,
+            UiAction::ViewportChanged { .. }
+                | UiAction::Key { .. }
+                | UiAction::Pointer { .. }
+                | UiAction::ReleasePointer { .. }
+                | UiAction::FocusLost { .. }
+        )
+    }) {
+        let mut cleanup = Vec::new();
+        ownership.release(&mut cleanup);
+        cleanup.append(actions);
+        *actions = cleanup;
+    }
 }
 
 fn render_menu_bar(ctx: &egui::Context, state: &AppState, actions: &mut Vec<UiAction>) {
@@ -580,7 +673,7 @@ fn toolbar_check(
 
 fn render_instrument_bay(
     ui: &mut egui::Ui,
-    state: &AppState,
+    state: &mut AppState,
     resources: &mut ViewResources,
     actions: &mut Vec<UiAction>,
 ) {
@@ -610,6 +703,13 @@ fn render_instrument_bay(
         );
         return;
     };
+    let session_id = tab.snapshot.session_id;
+    resources.input.release_if_not(Some(session_id), actions);
+    if response.has_focus() {
+        resources.input.claim(session_id, true);
+    } else if resources.input.session_id == Some(session_id) && resources.input.keyboard_focused {
+        resources.input.release(actions);
+    }
     let backing_width = (inner.width().max(0.0) * ui.ctx().pixels_per_point()) as u32;
     let backing_height = (inner.height().max(0.0) * ui.ctx().pixels_per_point()) as u32;
     if tab
@@ -640,14 +740,15 @@ fn render_instrument_bay(
         );
         return;
     };
-    let Some(texture) = texture_for(ui.ctx(), resources, tab.snapshot.session_id, framebuffer)
-    else {
+    let framebuffer_size = (framebuffer.width(), framebuffer.height());
+    let scale_mode = tab.scale_mode;
+    let Some(texture) = texture_for(ui.ctx(), resources, state, session_id) else {
         return;
     };
     let image_size = display_size(
-        framebuffer,
+        framebuffer_size,
         inner.size(),
-        tab.scale_mode,
+        scale_mode,
         ui.ctx().pixels_per_point(),
     );
     let image_rect = egui::Rect::from_center_size(inner.center(), image_size);
@@ -657,67 +758,100 @@ fn render_instrument_bay(
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         Color32::WHITE,
     );
-    if response.has_focus() {
-        collect_keyboard_actions(ui.ctx(), resources, actions);
+    let events = ui.ctx().input(|input| input.events.clone());
+    if response.has_focus() && resources.input.session_id == Some(session_id) {
+        let modifiers = ui.ctx().input(|input| input.modifiers);
+        collect_keyboard_events(
+            session_id,
+            &events,
+            modifiers,
+            &mut resources.input,
+            actions,
+        );
     }
-    collect_pointer_actions(ui.ctx(), image_rect, framebuffer, resources, actions);
+    let interactive_rect = visible_console_rect(image_rect, inner, ui.clip_rect());
+    collect_pointer_events(
+        session_id,
+        &events,
+        image_rect,
+        interactive_rect,
+        framebuffer_size,
+        &mut resources.input,
+        actions,
+    );
 }
 
 fn texture_for(
     ctx: &egui::Context,
     resources: &mut ViewResources,
+    state: &mut AppState,
     session_id: SessionId,
-    framebuffer: &FramebufferImage,
 ) -> Option<egui::TextureHandle> {
-    let image = || {
-        egui::ColorImage::from_rgba_unmultiplied(
-            [
-                usize::from(framebuffer.width()),
-                usize::from(framebuffer.height()),
-            ],
-            framebuffer.rgba(),
-        )
-    };
-    let entry = resources
+    let framebuffer = state.framebuffer(session_id)?;
+    let width = framebuffer.width();
+    let height = framebuffer.height();
+    let force_full = resources
         .textures
-        .entry(session_id)
-        .or_insert_with(|| TextureEntry {
-            handle: ctx.load_texture(
-                format!("session-{session_id:?}"),
-                image(),
-                egui::TextureOptions::NEAREST,
-            ),
-            width: framebuffer.width(),
-            height: framebuffer.height(),
-            revision: framebuffer.revision(),
-        });
-    if entry.width != framebuffer.width() || entry.height != framebuffer.height() {
-        *entry = TextureEntry {
-            handle: ctx.load_texture(
-                format!("session-{session_id:?}"),
-                image(),
-                egui::TextureOptions::NEAREST,
-            ),
-            width: framebuffer.width(),
-            height: framebuffer.height(),
-            revision: framebuffer.revision(),
-        };
-    } else if entry.revision != framebuffer.revision() {
-        entry.handle.set(image(), egui::TextureOptions::NEAREST);
-        entry.revision = framebuffer.revision();
+        .get(&session_id)
+        .is_none_or(|entry| entry.width != width || entry.height != height);
+    let upload = state.framebuffer_upload_plan(session_id, force_full).ok()?;
+
+    if force_full {
+        let upload = upload?;
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [usize::from(upload.width()), usize::from(upload.height())],
+            upload.rgba(),
+        );
+        resources.textures.insert(
+            session_id,
+            TextureEntry {
+                handle: ctx.load_texture(
+                    format!("session-{session_id:?}"),
+                    image,
+                    egui::TextureOptions::NEAREST,
+                ),
+                width,
+                height,
+            },
+        );
+        state
+            .acknowledge_framebuffer_upload(session_id, upload.revision())
+            .ok()?;
+    } else if let Some(upload) = upload {
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [usize::from(upload.width()), usize::from(upload.height())],
+            upload.rgba(),
+        );
+        let entry = resources.textures.get_mut(&session_id)?;
+        match upload.kind() {
+            FramebufferUploadKind::Full => {
+                entry.handle.set(image, egui::TextureOptions::NEAREST);
+            }
+            FramebufferUploadKind::Partial => {
+                entry.handle.set_partial(
+                    [usize::from(upload.x()), usize::from(upload.y())],
+                    image,
+                    egui::TextureOptions::NEAREST,
+                );
+            }
+        }
+        state
+            .acknowledge_framebuffer_upload(session_id, upload.revision())
+            .ok()?;
     }
-    Some(entry.handle.clone())
+    Some(resources.textures.get(&session_id)?.handle.clone())
 }
 
 fn display_size(
-    framebuffer: &FramebufferImage,
+    framebuffer_size: (u16, u16),
     available: Vec2,
     scale_mode: ScaleMode,
     pixels_per_point: f32,
 ) -> Vec2 {
+    let (width, height) = framebuffer_size;
     let native = egui::vec2(
-        f32::from(framebuffer.width()) / pixels_per_point.max(1.0),
-        f32::from(framebuffer.height()) / pixels_per_point.max(1.0),
+        f32::from(width) / pixels_per_point.max(1.0),
+        f32::from(height) / pixels_per_point.max(1.0),
     );
     match scale_mode {
         ScaleMode::OneToOne => native,
@@ -730,12 +864,13 @@ fn display_size(
     }
 }
 
-fn collect_keyboard_actions(
-    ctx: &egui::Context,
-    resources: &mut ViewResources,
+fn collect_keyboard_events(
+    session_id: SessionId,
+    events: &[egui::Event],
+    current_modifiers: egui::Modifiers,
+    ownership: &mut InputOwnership,
     actions: &mut Vec<UiAction>,
 ) {
-    let events = ctx.input(|input| input.events.clone());
     for event in events {
         match event {
             egui::Event::Key {
@@ -745,10 +880,11 @@ fn collect_keyboard_actions(
                 modifiers,
                 physical_key: _,
             } => {
-                sync_modifiers(modifiers, resources, actions);
-                if let Some(keysym) = key_to_keysym(key, modifiers.shift) {
+                sync_modifiers(session_id, *modifiers, ownership, actions);
+                if let Some(keysym) = key_to_keysym(*key, modifiers.shift) {
                     actions.push(UiAction::Key {
-                        down: pressed,
+                        session_id,
+                        down: *pressed,
                         keysym,
                     });
                 }
@@ -756,8 +892,13 @@ fn collect_keyboard_actions(
             egui::Event::Text(text) => {
                 for character in text.chars().filter(|character| !character.is_ascii()) {
                     let keysym = 0x0100_0000 | u32::from(character);
-                    actions.push(UiAction::Key { down: true, keysym });
                     actions.push(UiAction::Key {
+                        session_id,
+                        down: true,
+                        keysym,
+                    });
+                    actions.push(UiAction::Key {
+                        session_id,
                         down: false,
                         keysym,
                     });
@@ -766,11 +907,13 @@ fn collect_keyboard_actions(
             _ => {}
         }
     }
+    sync_modifiers(session_id, current_modifiers, ownership, actions);
 }
 
 fn sync_modifiers(
+    session_id: SessionId,
     modifiers: egui::Modifiers,
-    resources: &mut ViewResources,
+    ownership: &mut InputOwnership,
     actions: &mut Vec<UiAction>,
 ) {
     let desired = [
@@ -780,29 +923,39 @@ fn sync_modifiers(
         (modifiers.command, 0xffeb_u32, 0b1000_u8),
     ];
     for (enabled, keysym, bit) in desired {
-        let was_enabled = resources.modifier_bits & bit != 0;
+        let was_enabled = ownership.modifier_bits & bit != 0;
         if enabled != was_enabled {
             actions.push(UiAction::Key {
+                session_id,
                 down: enabled,
                 keysym,
             });
             if enabled {
-                resources.modifier_bits |= bit;
+                ownership.modifier_bits |= bit;
             } else {
-                resources.modifier_bits &= !bit;
+                ownership.modifier_bits &= !bit;
             }
         }
     }
 }
 
-fn collect_pointer_actions(
-    ctx: &egui::Context,
+fn visible_console_rect(
     image_rect: egui::Rect,
-    framebuffer: &FramebufferImage,
-    resources: &mut ViewResources,
+    inner_rect: egui::Rect,
+    clip_rect: egui::Rect,
+) -> egui::Rect {
+    image_rect.intersect(inner_rect).intersect(clip_rect)
+}
+
+fn collect_pointer_events(
+    session_id: SessionId,
+    events: &[egui::Event],
+    image_rect: egui::Rect,
+    interactive_rect: egui::Rect,
+    framebuffer_size: (u16, u16),
+    ownership: &mut InputOwnership,
     actions: &mut Vec<UiAction>,
 ) {
-    let events = ctx.input(|input| input.events.clone());
     for event in events {
         match event {
             egui::Event::PointerButton {
@@ -811,49 +964,67 @@ fn collect_pointer_actions(
                 pressed,
                 modifiers: _,
             } => {
-                let mask = pointer_button_mask(button);
-                if pressed {
-                    if !image_rect.contains(pos) {
+                let mask = pointer_button_mask(*button);
+                if *pressed {
+                    if !interactive_rect.contains(*pos) {
                         continue;
                     }
-                    resources.pointer_buttons |= mask;
-                } else if resources.pointer_buttons & mask != 0 {
-                    resources.pointer_buttons &= !mask;
+                    ownership.claim(session_id, true);
+                    if ownership.session_id != Some(session_id) {
+                        continue;
+                    }
+                    ownership.pointer_buttons |= mask;
+                } else if ownership.session_id == Some(session_id)
+                    && ownership.pointer_buttons & mask != 0
+                {
+                    if !interactive_rect.contains(*pos) {
+                        ownership.release_pointer(actions);
+                        continue;
+                    }
+                    ownership.pointer_buttons &= !mask;
                 } else {
                     continue;
                 }
-                let position = if image_rect.contains(pos) {
-                    pointer_coordinates(pos, image_rect, framebuffer)
+                let position = if interactive_rect.contains(*pos) {
+                    pointer_coordinates(*pos, image_rect, framebuffer_size)
                 } else {
-                    resources.pointer_position
+                    ownership.pointer_position
                 };
                 if let Some((x, y)) = position {
-                    resources.pointer_position = Some((x, y));
-                    actions.push(UiAction::Pointer {
-                        buttons: resources.pointer_buttons,
-                        x,
-                        y,
-                    });
+                    ownership.pointer_position = Some((x, y));
+                    if ownership.pointer_buttons == 0 {
+                        actions.push(UiAction::ReleasePointer { session_id, x, y });
+                    } else {
+                        actions.push(UiAction::Pointer {
+                            session_id,
+                            buttons: ownership.pointer_buttons,
+                            x,
+                            y,
+                        });
+                    }
                 }
             }
-            egui::Event::PointerMoved(pos) if image_rect.contains(pos) => {
-                if let Some((x, y)) = pointer_coordinates(pos, image_rect, framebuffer) {
-                    resources.pointer_position = Some((x, y));
+            egui::Event::PointerMoved(pos) if interactive_rect.contains(*pos) => {
+                if let Some((x, y)) = pointer_coordinates(*pos, image_rect, framebuffer_size) {
+                    if ownership.session_id == Some(session_id) {
+                        ownership.pointer_position = Some((x, y));
+                    }
                     actions.push(UiAction::Pointer {
-                        buttons: resources.pointer_buttons,
+                        session_id,
+                        buttons: if ownership.session_id == Some(session_id) {
+                            ownership.pointer_buttons
+                        } else {
+                            0
+                        },
                         x,
                         y,
                     });
                 }
             }
             egui::Event::PointerGone => {
-                if resources.pointer_buttons != 0 {
-                    if let Some((x, y)) = resources.pointer_position {
-                        actions.push(UiAction::Pointer { buttons: 0, x, y });
-                    }
+                if ownership.session_id == Some(session_id) {
+                    ownership.release_pointer(actions);
                 }
-                resources.pointer_buttons = 0;
-                resources.pointer_position = None;
             }
             _ => {}
         }
@@ -873,18 +1044,19 @@ fn pointer_button_mask(button: egui::PointerButton) -> u8 {
 fn pointer_coordinates(
     position: egui::Pos2,
     image_rect: egui::Rect,
-    framebuffer: &FramebufferImage,
+    framebuffer_size: (u16, u16),
 ) -> Option<(u16, u16)> {
     if image_rect.width() <= 0.0 || image_rect.height() <= 0.0 {
         return None;
     }
     let relative_x = ((position.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
     let relative_y = ((position.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
-    let x = (relative_x * f32::from(framebuffer.width())).floor() as u16;
-    let y = (relative_y * f32::from(framebuffer.height())).floor() as u16;
+    let (width, height) = framebuffer_size;
+    let x = (relative_x * f32::from(width)).floor() as u16;
+    let y = (relative_y * f32::from(height)).floor() as u16;
     Some((
-        x.min(framebuffer.width().saturating_sub(1)),
-        y.min(framebuffer.height().saturating_sub(1)),
+        x.min(width.saturating_sub(1)),
+        y.min(height.saturating_sub(1)),
     ))
 }
 
@@ -1232,5 +1404,342 @@ fn render_diagnostics(ctx: &egui::Context, state: &mut AppState, actions: &mut V
         });
     if !open {
         state.close_diagnostics();
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::{
+        collect_keyboard_events, collect_pointer_events, release_owner_for_control_actions,
+        visible_console_rect, InputOwnership,
+    };
+    use crate::{app::UiAction, session::SessionId};
+
+    fn modifier(field: &str, enabled: bool) -> egui::Modifiers {
+        let mut modifiers = egui::Modifiers::default();
+        match field {
+            "shift" => modifiers.shift = enabled,
+            "ctrl" => modifiers.ctrl = enabled,
+            "alt" => modifiers.alt = enabled,
+            "command" => modifiers.command = enabled,
+            _ => unreachable!(),
+        }
+        modifiers
+    }
+
+    fn key_actions(actions: &[UiAction]) -> Vec<(SessionId, bool, u32)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                UiAction::Key {
+                    session_id,
+                    down,
+                    keysym,
+                } => Some((*session_id, *down, *keysym)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pure_modifier_presses_and_releases_are_emitted_once_from_aggregate_state() {
+        for (name, keysym) in [
+            ("shift", 0xffe1),
+            ("ctrl", 0xffe3),
+            ("alt", 0xffe9),
+            ("command", 0xffeb),
+        ] {
+            let session_id = SessionId::new();
+            let mut ownership = InputOwnership::for_session(session_id);
+            let mut actions = Vec::new();
+
+            collect_keyboard_events(
+                session_id,
+                &[],
+                modifier(name, true),
+                &mut ownership,
+                &mut actions,
+            );
+            collect_keyboard_events(
+                session_id,
+                &[],
+                modifier(name, true),
+                &mut ownership,
+                &mut actions,
+            );
+            collect_keyboard_events(
+                session_id,
+                &[],
+                modifier(name, false),
+                &mut ownership,
+                &mut actions,
+            );
+            collect_keyboard_events(
+                session_id,
+                &[],
+                modifier(name, false),
+                &mut ownership,
+                &mut actions,
+            );
+
+            assert_eq!(
+                key_actions(&actions),
+                [(session_id, true, keysym), (session_id, false, keysym)]
+            );
+        }
+    }
+
+    #[test]
+    fn key_event_keeps_modifier_before_ordinary_key_then_final_sync_deduplicates() {
+        let session_id = SessionId::new();
+        let modifiers = modifier("ctrl", true);
+        let events = [egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }];
+        let mut ownership = InputOwnership::for_session(session_id);
+        let mut actions = Vec::new();
+
+        collect_keyboard_events(session_id, &events, modifiers, &mut ownership, &mut actions);
+
+        assert_eq!(
+            key_actions(&actions),
+            [
+                (session_id, true, 0xffe3),
+                (session_id, true, u32::from(b'a'))
+            ]
+        );
+    }
+
+    #[test]
+    fn owner_cleanup_is_targeted_clears_all_local_state_and_precedes_close_or_reconnect() {
+        for control in [UiAction::Reconnect, UiAction::Close] {
+            let outgoing = SessionId::new();
+            let incoming = SessionId::new();
+            let mut ownership = InputOwnership::for_session(outgoing);
+            ownership.set_test_state(0b1111, 0b1_1111, Some((123, 234)));
+            let mut actions = vec![control];
+
+            release_owner_for_control_actions(&mut ownership, &mut actions);
+
+            assert!(matches!(
+                actions.first(),
+                Some(UiAction::ReleasePointer { session_id, x: 123, y: 234 })
+                    if *session_id == outgoing
+            ));
+            assert!(matches!(
+                actions.get(1),
+                Some(UiAction::FocusLost { session_id }) if *session_id == outgoing
+            ));
+            assert!(matches!(
+                actions.get(2),
+                Some(UiAction::Reconnect | UiAction::Close)
+            ));
+            assert!(ownership.is_clear());
+            assert!(actions.iter().all(|action| !matches!(
+                action,
+                UiAction::ReleasePointer { session_id, .. }
+                    | UiAction::FocusLost { session_id }
+                    if *session_id == incoming
+            )));
+        }
+    }
+
+    #[test]
+    fn toolbar_and_menu_actions_release_console_ownership_before_the_action() {
+        for control in [
+            UiAction::CtrlAltDelete,
+            UiAction::FitToWindow,
+            UiAction::SetDynamicResolution(false),
+            UiAction::Diagnostics,
+        ] {
+            let outgoing = SessionId::new();
+            let mut ownership = InputOwnership::for_session(outgoing);
+            ownership.set_test_state(0b0010, 1, Some((10, 20)));
+            let mut actions = vec![control];
+
+            release_owner_for_control_actions(&mut ownership, &mut actions);
+
+            assert!(matches!(
+                actions.first(),
+                Some(UiAction::ReleasePointer { session_id, .. }) if *session_id == outgoing
+            ));
+            assert!(matches!(
+                actions.get(1),
+                Some(UiAction::FocusLost { session_id }) if *session_id == outgoing
+            ));
+            assert_eq!(actions.get(2), Some(&control));
+            assert!(ownership.is_clear());
+        }
+    }
+
+    #[test]
+    fn tab_widget_and_app_focus_cleanup_release_only_the_prior_session() {
+        let outgoing = SessionId::new();
+        let incoming = SessionId::new();
+        for next_owner in [Some(incoming), None] {
+            let mut ownership = InputOwnership::for_session(outgoing);
+            ownership.set_test_state(0b0011, 0b1_1111, Some((20, 30)));
+            let mut actions = Vec::new();
+
+            ownership.release_if_not(next_owner, &mut actions);
+
+            assert_eq!(actions.len(), 2);
+            assert!(matches!(
+                actions[0],
+                UiAction::ReleasePointer { session_id, .. } if session_id == outgoing
+            ));
+            assert!(matches!(
+                actions[1],
+                UiAction::FocusLost { session_id } if session_id == outgoing
+            ));
+            assert!(ownership.is_clear());
+        }
+    }
+
+    #[test]
+    fn visible_console_hit_testing_rejects_hidden_regions_but_releases_outside() {
+        let session_id = SessionId::new();
+        let image = egui::Rect::from_min_max(egui::pos2(-100.0, -50.0), egui::pos2(300.0, 250.0));
+        let inner = egui::Rect::from_min_max(egui::pos2(20.0, 30.0), egui::pos2(280.0, 220.0));
+        let clip = egui::Rect::from_min_max(egui::pos2(40.0, 50.0), egui::pos2(260.0, 200.0));
+        let visible = visible_console_rect(image, inner, clip);
+        assert_eq!(visible, clip);
+        let mut ownership = InputOwnership::for_session(session_id);
+        let mut actions = Vec::new();
+        let events = [
+            egui::Event::PointerMoved(egui::pos2(0.0, 0.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(0.0, 0.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: egui::pos2(60.0, 80.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerMoved(egui::pos2(0.0, 0.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(0.0, 0.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+
+        collect_pointer_events(
+            session_id,
+            &events,
+            image,
+            visible,
+            (400, 300),
+            &mut ownership,
+            &mut actions,
+        );
+
+        assert_eq!(actions.len(), 2, "hidden press/moves must be ignored");
+        assert!(matches!(
+            actions[0],
+            UiAction::Pointer {
+                session_id: target,
+                buttons: 1,
+                x: 160,
+                y: 130,
+            } if target == session_id
+        ));
+        assert!(matches!(
+            actions[1],
+            UiAction::ReleasePointer {
+                session_id: target,
+                x: 160,
+                y: 130,
+            } if target == session_id
+        ));
+        assert_eq!(ownership.pointer_buttons(), 0);
+    }
+
+    #[test]
+    fn every_supported_pointer_button_releases_on_the_original_session() {
+        let outgoing = SessionId::new();
+        let incoming = SessionId::new();
+        let image = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0));
+        let mut ownership = InputOwnership::for_session(outgoing);
+        let mut actions = Vec::new();
+
+        for button in [
+            egui::PointerButton::Primary,
+            egui::PointerButton::Middle,
+            egui::PointerButton::Secondary,
+            egui::PointerButton::Extra1,
+            egui::PointerButton::Extra2,
+        ] {
+            let events = [
+                egui::Event::PointerButton {
+                    pos: egui::pos2(50.0, 50.0),
+                    button,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: egui::pos2(150.0, 150.0),
+                    button,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            collect_pointer_events(
+                outgoing,
+                &events,
+                image,
+                image,
+                (100, 100),
+                &mut ownership,
+                &mut actions,
+            );
+        }
+
+        let presses = actions
+            .iter()
+            .filter_map(|action| match action {
+                UiAction::Pointer {
+                    session_id,
+                    buttons,
+                    ..
+                } => Some((*session_id, *buttons)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            presses,
+            [
+                (outgoing, 1),
+                (outgoing, 2),
+                (outgoing, 4),
+                (outgoing, 8),
+                (outgoing, 16),
+            ]
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    UiAction::ReleasePointer { session_id, .. } if *session_id == outgoing
+                ))
+                .count(),
+            5
+        );
+        assert!(actions.iter().all(|action| !matches!(
+            action,
+            UiAction::Pointer { session_id, .. } | UiAction::ReleasePointer { session_id, .. }
+                if *session_id == incoming
+        )));
+        assert_eq!(ownership.pointer_buttons(), 0);
     }
 }

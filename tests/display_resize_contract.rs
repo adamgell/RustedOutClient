@@ -142,8 +142,22 @@ fn extended_desktop_size_distinguishes_pending_actual_rejected_and_unsupported()
     let two_screens = screens_payload(&[(0, 0, 0, 800, 900, 0), (1, 800, 0, 800, 900, 0)]);
     assert_eq!(
         parse_extended_desktop_size(0, 0, target, &two_screens, limits).unwrap(),
-        ExtendedDesktopSize::Unsupported,
+        ExtendedDesktopSize::ServerUnsupported(target),
         "a structurally valid layout outside the one-screen subset is nonterminal"
+    );
+    assert_eq!(
+        parse_extended_desktop_size(2, 0, target, &two_screens, limits).unwrap(),
+        ExtendedDesktopSize::ServerUnsupported(target)
+    );
+    let flagged = one_screen_payload(0, 0, 0, 1_600, 900, 1);
+    assert_eq!(
+        parse_extended_desktop_size(0, 0, target, &flagged, limits).unwrap(),
+        ExtendedDesktopSize::ServerUnsupported(target)
+    );
+    assert_eq!(
+        parse_extended_desktop_size(1, 0, target, &two_screens, limits).unwrap(),
+        ExtendedDesktopSize::Unsupported,
+        "the same client-reason payload remains a non-mutating request outcome"
     );
 }
 
@@ -601,6 +615,423 @@ async fn dynamic_toggle_cancels_pending_work_and_timeout_is_nonterminal_until_re
     tokio::time::advance(std::time::Duration::from_millis(250)).await;
     settle().await;
     assert_eq!(control.resize_requests()[1], size(1_920, 1_080));
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn off_on_and_retry_do_not_replace_an_unanswered_transmitted_resize() {
+    let control = FakeControl::default();
+    let mut manager = SessionManager::spawn(
+        app_config(),
+        FakeBackend {
+            control: control.clone(),
+        },
+    );
+    settle().await;
+    drain(&mut manager);
+    let session_id = open_ready_session(&mut manager, &control, OpenOptions::default()).await;
+    drain(&mut manager);
+
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_600,
+            backing_height: 900,
+        })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    assert_eq!(control.resize_requests(), [size(1_600, 896)]);
+
+    manager
+        .send(AppCommand::SetDynamicResolution {
+            session_id,
+            enabled: false,
+        })
+        .await
+        .unwrap();
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_920,
+            backing_height: 1_080,
+        })
+        .await
+        .unwrap();
+    manager
+        .send(AppCommand::SetDynamicResolution {
+            session_id,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    manager
+        .send(AppCommand::RetryDynamicResolution { session_id })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    assert_eq!(
+        control.resize_requests(),
+        [size(1_600, 896)],
+        "toggle and Retry must not put a second request on the wire"
+    );
+
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::Forwarded(size(1_600, 896)),
+    ));
+    poll_worker().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id
+            && snapshot.resize_status == ResizeStatus::Pending(size(1_600, 896))
+    })
+    .await;
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    settle().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id && snapshot.resize_status == ResizeStatus::TimedOut
+    })
+    .await;
+    assert_eq!(control.resize_requests(), [size(1_600, 896)]);
+
+    manager
+        .send(AppCommand::RetryDynamicResolution { session_id })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    assert_eq!(
+        control.resize_requests(),
+        [size(1_600, 896), size(1_920, 1_080)]
+    );
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn unanswered_timeout_keeps_old_outcome_correlated_and_releases_only_newest_retry() {
+    let control = FakeControl::default();
+    let mut manager = SessionManager::spawn(
+        app_config(),
+        FakeBackend {
+            control: control.clone(),
+        },
+    );
+    settle().await;
+    drain(&mut manager);
+    let session_id = open_ready_session(&mut manager, &control, OpenOptions::default()).await;
+    drain(&mut manager);
+
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_600,
+            backing_height: 900,
+        })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    settle().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id && snapshot.resize_status == ResizeStatus::TimedOut
+    })
+    .await;
+
+    for index in 0..1_000_u32 {
+        manager
+            .send(AppCommand::ViewportChanged {
+                session_id,
+                backing_width: 1_800 + index % 200,
+                backing_height: 1_087,
+            })
+            .await
+            .unwrap();
+    }
+    manager
+        .send(AppCommand::RetryDynamicResolution { session_id })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    assert_eq!(
+        control.resize_requests(),
+        [size(1_600, 896)],
+        "the unanswered timed-out request still owns protocol correlation"
+    );
+
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::Rejected,
+    ));
+    poll_worker().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id
+            && snapshot.resize_status == ResizeStatus::Requested(size(1_992, 1_080))
+    })
+    .await;
+    assert_eq!(
+        control.resize_requests(),
+        [size(1_600, 896), size(1_992, 1_080)],
+        "the old rejection is consumed before only the newest explicit replacement is sent"
+    );
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_old_geometry_after_forwarded_timeout_never_applies_to_a_new_target() {
+    let control = FakeControl::default();
+    let mut manager = SessionManager::spawn(
+        app_config(),
+        FakeBackend {
+            control: control.clone(),
+        },
+    );
+    settle().await;
+    drain(&mut manager);
+    let session_id = open_ready_session(&mut manager, &control, OpenOptions::default()).await;
+    drain(&mut manager);
+
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_600,
+            backing_height: 900,
+        })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::Forwarded(size(1_600, 896)),
+    ));
+    poll_worker().await;
+    drain(&mut manager);
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    settle().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id && snapshot.resize_status == ResizeStatus::TimedOut
+    })
+    .await;
+
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_920,
+            backing_height: 1_080,
+        })
+        .await
+        .unwrap();
+    manager
+        .send(AppCommand::RetryDynamicResolution { session_id })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    assert_eq!(
+        control.resize_requests(),
+        [size(1_600, 896), size(1_920, 1_080)]
+    );
+
+    control.push_event(SessionTransportEvent::DesktopSize(size(1_600, 896)));
+    poll_worker().await;
+    let old_geometry = wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id && snapshot.guest_size == Some(size(1_600, 896))
+    })
+    .await;
+    assert_eq!(
+        old_geometry.resize_status,
+        ResizeStatus::Requested(size(1_920, 1_080)),
+        "truthful old geometry must not resolve the newer transmitted target"
+    );
+
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::Forwarded(size(1_920, 1_080)),
+    ));
+    control.push_event(SessionTransportEvent::DesktopSize(size(1_920, 1_080)));
+    poll_worker().await;
+    let applied = wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id
+            && snapshot.resize_status == ResizeStatus::Applied(size(1_920, 1_080))
+    })
+    .await;
+    assert_eq!(applied.guest_size, Some(size(1_920, 1_080)));
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_same_target_retry_requires_matching_actual_geometry() {
+    let control = FakeControl::default();
+    let mut manager = SessionManager::spawn(
+        app_config(),
+        FakeBackend {
+            control: control.clone(),
+        },
+    );
+    settle().await;
+    drain(&mut manager);
+    let session_id = open_ready_session(&mut manager, &control, OpenOptions::default()).await;
+    drain(&mut manager);
+    let target = size(1_600, 896);
+
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_600,
+            backing_height: 900,
+        })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::Forwarded(target),
+    ));
+    poll_worker().await;
+    drain(&mut manager);
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    settle().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id && snapshot.resize_status == ResizeStatus::TimedOut
+    })
+    .await;
+
+    for _ in 0..2 {
+        manager
+            .send(AppCommand::RetryDynamicResolution { session_id })
+            .await
+            .unwrap();
+    }
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    assert_eq!(control.resize_requests(), [target, target]);
+    assert_eq!(
+        latest_resize_status(drain(&mut manager), session_id),
+        Some(ResizeStatus::Requested(target))
+    );
+
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::Forwarded(target),
+    ));
+    poll_worker().await;
+    assert_ne!(
+        latest_resize_status(drain(&mut manager), session_id),
+        Some(ResizeStatus::Applied(target))
+    );
+    control.push_event(SessionTransportEvent::DesktopSize(target));
+    poll_worker().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id
+            && snapshot.guest_size == Some(target)
+            && snapshot.resize_status == ResizeStatus::Applied(target)
+    })
+    .await;
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn matching_actual_geometry_applies_but_keeps_unanswered_protocol_correlation() {
+    let control = FakeControl::default();
+    let mut manager = SessionManager::spawn(
+        app_config(),
+        FakeBackend {
+            control: control.clone(),
+        },
+    );
+    settle().await;
+    drain(&mut manager);
+    let session_id = open_ready_session(&mut manager, &control, OpenOptions::default()).await;
+    drain(&mut manager);
+    let first = size(1_600, 896);
+    let replacement = size(1_920, 1_080);
+
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_600,
+            backing_height: 900,
+        })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_920,
+            backing_height: 1_080,
+        })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+
+    control.push_event(SessionTransportEvent::DesktopSize(first));
+    poll_worker().await;
+    let applied = wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id
+            && snapshot.guest_size == Some(first)
+            && snapshot.resize_status == ResizeStatus::Applied(first)
+    })
+    .await;
+    assert_eq!(applied.guest_size, Some(first));
+    assert_eq!(
+        control.resize_requests(),
+        [first],
+        "actual geometry cannot release a replacement until the old protocol outcome is consumed"
+    );
+
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::Forwarded(first),
+    ));
+    poll_worker().await;
+    wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id
+            && snapshot.resize_status == ResizeStatus::Requested(replacement)
+    })
+    .await;
+    assert_eq!(control.resize_requests(), [first, replacement]);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn server_unsupported_geometry_updates_size_and_capability_without_an_in_flight_request() {
+    let control = FakeControl::default();
+    let mut manager = SessionManager::spawn(
+        app_config(),
+        FakeBackend {
+            control: control.clone(),
+        },
+    );
+    settle().await;
+    drain(&mut manager);
+    let session_id = open_ready_session(&mut manager, &control, OpenOptions::default()).await;
+    drain(&mut manager);
+
+    control.push_event(SessionTransportEvent::DesktopSize(size(1_600, 900)));
+    control.push_event(SessionTransportEvent::ResizeOutcome(
+        ResizeProtocolOutcome::ServerUnsupported,
+    ));
+    poll_worker().await;
+    poll_worker().await;
+    let unsupported = wait_for_snapshot(&mut manager, |snapshot| {
+        snapshot.session_id == session_id && snapshot.resize_status == ResizeStatus::Unsupported
+    })
+    .await;
+    assert_eq!(unsupported.guest_size, Some(size(1_600, 900)));
+    assert_eq!(unsupported.phase, SessionPhase::Ready);
+    assert!(control.resize_requests().is_empty());
     manager.shutdown().await.unwrap();
 }
 

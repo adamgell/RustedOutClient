@@ -121,6 +121,7 @@ impl ClipboardAdapter for SystemClipboard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiAction {
     RefreshInventory,
     Open,
@@ -144,15 +145,24 @@ pub enum UiAction {
         backing_height: u32,
     },
     Key {
+        session_id: crate::session::SessionId,
         down: bool,
         keysym: u32,
     },
     Pointer {
+        session_id: crate::session::SessionId,
         buttons: u8,
         x: u16,
         y: u16,
     },
-    FocusLost,
+    ReleasePointer {
+        session_id: crate::session::SessionId,
+        x: u16,
+        y: u16,
+    },
+    FocusLost {
+        session_id: crate::session::SessionId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,13 +325,14 @@ where
             let Some(session_id) = selected_session else {
                 return DispatchOutcome::NotAvailable;
             };
-            if state
-                .set_viewport(session_id, backing_width, backing_height)
-                .is_err()
+            if !state
+                .tabs()
+                .iter()
+                .any(|tab| tab.snapshot.session_id == session_id)
             {
                 return DispatchOutcome::NotAvailable;
             }
-            dispatch(
+            let outcome = dispatch(
                 state,
                 sink,
                 AppCommand::ViewportChanged {
@@ -329,26 +340,45 @@ where
                     backing_width,
                     backing_height,
                 },
-            )
+            );
+            if outcome == DispatchOutcome::Sent {
+                let _ = state.set_viewport(session_id, backing_width, backing_height);
+            }
+            outcome
         }
-        UiAction::Key { down, keysym } => selected_input(
+        UiAction::Key {
+            session_id,
+            down,
+            keysym,
+        } => targeted_input(
             state,
             sink,
-            availability.keyboard,
+            session_id,
+            session_accepts_fresh_input(state, session_id),
             InputAction::Key { down, keysym },
         ),
-        UiAction::Pointer { buttons, x, y } => selected_input(
+        UiAction::Pointer {
+            session_id,
+            buttons,
+            x,
+            y,
+        } => targeted_input(
             state,
             sink,
-            availability.pointer,
+            session_id,
+            session_accepts_fresh_input(state, session_id),
             InputAction::Pointer { buttons, x, y },
         ),
-        UiAction::FocusLost => selected_input(
+        UiAction::ReleasePointer { session_id, x, y } => targeted_input(
             state,
             sink,
-            availability.release_all_keys,
-            InputAction::FocusLost,
+            session_id,
+            true,
+            InputAction::ReleasePointer { x, y },
         ),
+        UiAction::FocusLost { session_id } => {
+            targeted_input(state, sink, session_id, true, InputAction::FocusLost)
+        }
     }
 }
 
@@ -371,6 +401,31 @@ where
     selected_command(state, sink, available, |session_id| AppCommand::SendInput {
         session_id,
         action,
+    })
+}
+
+fn targeted_input<S>(
+    state: &mut AppState,
+    sink: &S,
+    session_id: crate::session::SessionId,
+    available: bool,
+    action: InputAction,
+) -> DispatchOutcome
+where
+    S: AppCommandSink + ?Sized,
+{
+    if !available {
+        return DispatchOutcome::NotAvailable;
+    }
+    dispatch(state, sink, AppCommand::SendInput { session_id, action })
+}
+
+fn session_accepts_fresh_input(state: &AppState, session_id: crate::session::SessionId) -> bool {
+    state.tabs().iter().any(|tab| {
+        tab.snapshot.session_id == session_id
+            && tab.snapshot.phase == SessionPhase::Ready
+            && !tab.snapshot.view_only
+            && tab.last_error.is_none()
     })
 }
 

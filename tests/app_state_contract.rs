@@ -4,7 +4,7 @@ use rustedoutclient::{
     app::{
         apply_ui_effects, dispatch_action, ActionAvailability, AppCommandSink, AppState,
         ClipboardAdapter, ClipboardAdapterError, ClipboardStatus, CommandQueueError,
-        DispatchOutcome, UiAction,
+        DispatchOutcome, FramebufferUploadKind, UiAction,
     },
     config::{AppConfig, FavoriteVm},
     connection::FbRect,
@@ -394,6 +394,184 @@ fn framebuffer_updates_are_checked_bounded_and_transactional() {
 }
 
 #[test]
+fn framebuffer_upload_plans_are_bounded_coalesced_and_acknowledged_transactionally() {
+    let mut state = configured_state();
+    let session_id = SessionId::new();
+    let mut ready = snapshot(session_id, vmid(107), SessionPhase::Ready, false);
+    ready.guest_size = Some(DesktopSize::new(4, 3));
+    state.apply(AppEvent::SessionChanged(ready)).unwrap();
+
+    let initial = state
+        .framebuffer_upload_plan(session_id, false)
+        .unwrap()
+        .expect("creation marks the whole image dirty");
+    assert_eq!(initial.kind(), FramebufferUploadKind::Full);
+    assert_eq!(
+        (initial.x(), initial.y(), initial.width(), initial.height()),
+        (0, 0, 4, 3)
+    );
+    assert_eq!(initial.rgba().len(), 4 * 3 * 4);
+    state
+        .acknowledge_framebuffer_upload(session_id, initial.revision())
+        .unwrap();
+    assert!(state
+        .framebuffer_upload_plan(session_id, false)
+        .unwrap()
+        .is_none());
+
+    state
+        .apply(AppEvent::Framebuffer {
+            session_id,
+            rects: vec![
+                FbRect {
+                    x: 1,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                    rgba: vec![1, 2, 3, 4],
+                },
+                FbRect {
+                    x: 2,
+                    y: 2,
+                    w: 1,
+                    h: 1,
+                    rgba: vec![5, 6, 7, 8],
+                },
+            ],
+        })
+        .unwrap();
+    let coalesced = state
+        .framebuffer_upload_plan(session_id, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(coalesced.kind(), FramebufferUploadKind::Partial);
+    assert_eq!(
+        (
+            coalesced.x(),
+            coalesced.y(),
+            coalesced.width(),
+            coalesced.height(),
+        ),
+        (1, 0, 2, 3)
+    );
+    assert_eq!(
+        coalesced.rgba(),
+        [1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 6, 7, 8,],
+        "partial extraction must preserve source stride and exact clipping"
+    );
+
+    state
+        .apply(AppEvent::Framebuffer {
+            session_id,
+            rects: vec![FbRect {
+                x: 0,
+                y: 1,
+                w: 1,
+                h: 1,
+                rgba: vec![9, 10, 11, 12],
+            }],
+        })
+        .unwrap();
+    state
+        .acknowledge_framebuffer_upload(session_id, coalesced.revision())
+        .unwrap();
+    let retained = state
+        .framebuffer_upload_plan(session_id, false)
+        .unwrap()
+        .expect("acknowledging an old plan must retain a later update");
+    assert!(retained.revision() > coalesced.revision());
+    assert_eq!(retained.kind(), FramebufferUploadKind::Partial);
+}
+
+#[test]
+fn maximum_geometry_one_pixel_dirty_stages_only_four_bytes() {
+    let mut state = configured_state();
+    let session_id = SessionId::new();
+    let mut ready = snapshot(session_id, vmid(107), SessionPhase::Ready, false);
+    ready.guest_size = Some(DesktopSize::new(8_192, 4_096));
+    state.apply(AppEvent::SessionChanged(ready)).unwrap();
+    let initial_revision = state.framebuffer(session_id).unwrap().revision();
+    state
+        .acknowledge_framebuffer_upload(session_id, initial_revision)
+        .unwrap();
+
+    state
+        .apply(AppEvent::Framebuffer {
+            session_id,
+            rects: vec![FbRect {
+                x: 8_191,
+                y: 4_095,
+                w: 1,
+                h: 1,
+                rgba: vec![20, 21, 22, 23],
+            }],
+        })
+        .unwrap();
+    let upload = state
+        .framebuffer_upload_plan(session_id, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(upload.kind(), FramebufferUploadKind::Partial);
+    assert_eq!(
+        (upload.x(), upload.y(), upload.width(), upload.height()),
+        (8_191, 4_095, 1, 1)
+    );
+    assert_eq!(upload.rgba(), [20, 21, 22, 23]);
+    assert_eq!(upload.rgba().len(), 4);
+}
+
+#[test]
+fn resize_and_two_sessions_keep_full_and_partial_upload_state_independent() {
+    let mut state = configured_state();
+    let first = SessionId::new();
+    let second = SessionId::new();
+    for (session_id, vmid) in [(first, vmid(107)), (second, vmid(300))] {
+        let mut ready = snapshot(session_id, vmid, SessionPhase::Ready, false);
+        ready.guest_size = Some(DesktopSize::new(2, 2));
+        state.apply(AppEvent::SessionChanged(ready)).unwrap();
+        let revision = state.framebuffer(session_id).unwrap().revision();
+        state
+            .acknowledge_framebuffer_upload(session_id, revision)
+            .unwrap();
+    }
+    state
+        .apply(AppEvent::Framebuffer {
+            session_id: first,
+            rects: vec![FbRect {
+                x: 1,
+                y: 1,
+                w: 1,
+                h: 1,
+                rgba: vec![1, 2, 3, 4],
+            }],
+        })
+        .unwrap();
+    assert_eq!(
+        state
+            .framebuffer_upload_plan(first, false)
+            .unwrap()
+            .unwrap()
+            .kind(),
+        FramebufferUploadKind::Partial
+    );
+    assert!(state
+        .framebuffer_upload_plan(second, false)
+        .unwrap()
+        .is_none());
+
+    let mut resized = snapshot(second, vmid(300), SessionPhase::Ready, false);
+    resized.guest_size = Some(DesktopSize::new(3, 2));
+    state.apply(AppEvent::SessionChanged(resized)).unwrap();
+    let full = state
+        .framebuffer_upload_plan(second, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(full.kind(), FramebufferUploadKind::Full);
+    assert_eq!((full.width(), full.height()), (3, 2));
+    assert_eq!(full.rgba().len(), 3 * 2 * 4);
+}
+
+#[test]
 fn clipboard_payload_bypasses_state_and_diagnostics_are_strictly_redacted() {
     let mut state = configured_state();
     let session_id = SessionId::new();
@@ -463,6 +641,41 @@ struct DelayedFakeSink {
     _receiver: tokio::sync::mpsc::Receiver<AppCommand>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetedInput {
+    ReleasePointer(SessionId, u16, u16),
+    FocusLost(SessionId),
+    Key(SessionId, bool, u32),
+}
+
+#[derive(Default)]
+struct TargetedInputSink {
+    inputs: RefCell<Vec<TargetedInput>>,
+}
+
+impl AppCommandSink for TargetedInputSink {
+    fn try_send(&self, command: AppCommand) -> Result<(), CommandQueueError> {
+        if let AppCommand::SendInput { session_id, action } = command {
+            let recorded = match action {
+                rustedoutclient::session::InputAction::ReleasePointer { x, y } => {
+                    Some(TargetedInput::ReleasePointer(session_id, x, y))
+                }
+                rustedoutclient::session::InputAction::FocusLost => {
+                    Some(TargetedInput::FocusLost(session_id))
+                }
+                rustedoutclient::session::InputAction::Key { down, keysym } => {
+                    Some(TargetedInput::Key(session_id, down, keysym))
+                }
+                _ => None,
+            };
+            if let Some(recorded) = recorded {
+                self.inputs.borrow_mut().push(recorded);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DelayedFakeSink {
     fn with_capacity(capacity: usize) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
@@ -474,6 +687,59 @@ impl DelayedFakeSink {
 }
 
 impl AppCommandSink for DelayedFakeSink {
+    fn try_send(&self, command: AppCommand) -> Result<(), CommandQueueError> {
+        self.sender.try_send(command).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => CommandQueueError::Full,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => CommandQueueError::Disconnected,
+        })
+    }
+}
+
+struct RecoveringViewportSink {
+    sender: tokio::sync::mpsc::Sender<AppCommand>,
+    receiver: RefCell<tokio::sync::mpsc::Receiver<AppCommand>>,
+}
+
+impl RecoveringViewportSink {
+    fn new() -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        Self {
+            sender,
+            receiver: RefCell::new(receiver),
+        }
+    }
+
+    fn fill(&self) {
+        self.sender
+            .try_send(AppCommand::RefreshInventory)
+            .expect("test queue should accept its filler");
+    }
+
+    fn discard_one(&self) {
+        self.receiver
+            .borrow_mut()
+            .try_recv()
+            .expect("test queue should contain one command");
+    }
+
+    fn take_viewport(&self) -> (SessionId, u32, u32) {
+        match self
+            .receiver
+            .borrow_mut()
+            .try_recv()
+            .expect("viewport command should be queued")
+        {
+            AppCommand::ViewportChanged {
+                session_id,
+                backing_width,
+                backing_height,
+            } => (session_id, backing_width, backing_height),
+            _ => panic!("expected only a viewport command"),
+        }
+    }
+}
+
+impl AppCommandSink for RecoveringViewportSink {
     fn try_send(&self, command: AppCommand) -> Result<(), CommandQueueError> {
         self.sender.try_send(command).map_err(|error| match error {
             tokio::sync::mpsc::error::TrySendError::Full(_) => CommandQueueError::Full,
@@ -574,6 +840,168 @@ fn explicit_clipboard_and_bounded_command_dispatch_never_wait_for_a_worker() {
         DispatchOutcome::NotAvailable
     );
     assert_eq!(sink.sends.get(), 1_001);
+}
+
+#[test]
+fn targeted_cleanup_never_follows_the_newly_selected_session() {
+    let mut state = configured_state();
+    let outgoing = SessionId::new();
+    let incoming = SessionId::new();
+    state
+        .apply(AppEvent::SessionChanged(snapshot(
+            outgoing,
+            vmid(107),
+            SessionPhase::Ready,
+            false,
+        )))
+        .unwrap();
+    state
+        .apply(AppEvent::SessionChanged(snapshot(
+            incoming,
+            vmid(300),
+            SessionPhase::Ready,
+            false,
+        )))
+        .unwrap();
+    state
+        .apply(AppEvent::SessionChanged(snapshot(
+            outgoing,
+            vmid(107),
+            SessionPhase::Disconnected,
+            true,
+        )))
+        .unwrap();
+    assert_eq!(state.selected_session_id(), Some(incoming));
+
+    let sink = TargetedInputSink::default();
+    let mut clipboard = RecordingClipboard::default();
+    assert_eq!(
+        dispatch_action(
+            &mut state,
+            &sink,
+            &mut clipboard,
+            UiAction::ReleasePointer {
+                session_id: outgoing,
+                x: 120,
+                y: 220,
+            },
+        ),
+        DispatchOutcome::Sent
+    );
+    assert_eq!(
+        dispatch_action(
+            &mut state,
+            &sink,
+            &mut clipboard,
+            UiAction::FocusLost {
+                session_id: outgoing,
+            },
+        ),
+        DispatchOutcome::Sent
+    );
+    assert_eq!(
+        dispatch_action(
+            &mut state,
+            &sink,
+            &mut clipboard,
+            UiAction::Key {
+                session_id: outgoing,
+                down: true,
+                keysym: 0x41,
+            },
+        ),
+        DispatchOutcome::NotAvailable,
+        "fresh input remains blocked for the terminal/view-only owner"
+    );
+    assert_eq!(
+        dispatch_action(
+            &mut state,
+            &sink,
+            &mut clipboard,
+            UiAction::Key {
+                session_id: incoming,
+                down: true,
+                keysym: 0x42,
+            },
+        ),
+        DispatchOutcome::Sent
+    );
+    assert_eq!(
+        sink.inputs.borrow().as_slice(),
+        [
+            TargetedInput::ReleasePointer(outgoing, 120, 220),
+            TargetedInput::FocusLost(outgoing),
+            TargetedInput::Key(incoming, true, 0x42),
+        ]
+    );
+}
+
+#[test]
+fn viewport_acknowledgement_waits_for_queue_acceptance_and_retries_only_the_newest_value() {
+    let mut state = configured_state();
+    let session_id = SessionId::new();
+    state
+        .apply(AppEvent::SessionChanged(snapshot(
+            session_id,
+            vmid(107),
+            SessionPhase::Ready,
+            false,
+        )))
+        .unwrap();
+    let sink = RecoveringViewportSink::new();
+    let mut clipboard = RecordingClipboard::default();
+    sink.fill();
+
+    for index in 0..1_000_u32 {
+        assert_eq!(
+            dispatch_action(
+                &mut state,
+                &sink,
+                &mut clipboard,
+                UiAction::ViewportChanged {
+                    backing_width: 1_600 + index,
+                    backing_height: 900 + index,
+                },
+            ),
+            DispatchOutcome::Busy
+        );
+    }
+    assert_eq!(
+        state.selected_session().unwrap().viewport,
+        None,
+        "a Full queue must leave the acknowledged viewport unchanged"
+    );
+    assert!(state.queue_status().is_busy());
+
+    sink.discard_one();
+    assert_eq!(
+        dispatch_action(
+            &mut state,
+            &sink,
+            &mut clipboard,
+            UiAction::ViewportChanged {
+                backing_width: 2_599,
+                backing_height: 1_899,
+            },
+        ),
+        DispatchOutcome::Sent
+    );
+    assert_eq!(
+        sink.take_viewport(),
+        (session_id, 2_599, 1_899),
+        "only the latest measured viewport is retried"
+    );
+    assert_eq!(
+        state.selected_session().unwrap().viewport,
+        Some(rustedoutclient::app::BackingViewport {
+            width: 2_599,
+            height: 1_899,
+        })
+    );
+    assert_eq!(
+        state.queue_status(),
+        rustedoutclient::app::QueueStatus::Ready
+    );
 }
 
 #[test]

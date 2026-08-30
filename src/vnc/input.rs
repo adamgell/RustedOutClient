@@ -166,6 +166,10 @@ where
         self.sink.pointer(buttons, x, y)
     }
 
+    pub fn release_pointer(&mut self, x: u16, y: u16) -> Result<(), InputError> {
+        self.sink.pointer(0, x, y)
+    }
+
     pub fn ctrl_alt_delete(&mut self) -> Result<(), InputError> {
         self.require_interactive()?;
         for (down, keysym) in [

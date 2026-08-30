@@ -387,7 +387,16 @@ fn interactive_actions_are_gated_but_release_all_is_always_available() {
         InputError::NotReady
     );
     controller.release_all_keys().unwrap();
-    assert!(sink.attempts().is_empty());
+    controller.release_pointer(10, 20).unwrap();
+    assert_eq!(
+        sink.attempts(),
+        [Attempt::Pointer {
+            buttons: 0,
+            x: 10,
+            y: 20,
+        }],
+        "targeted pointer cleanup is a recovery action before Ready"
+    );
 
     controller.mark_ready();
     controller.set_view_only(true).unwrap();
@@ -412,7 +421,23 @@ fn interactive_actions_are_gated_but_release_all_is_always_available() {
         InputError::ViewOnly
     );
     controller.release_all_keys().unwrap();
-    assert!(sink.attempts().is_empty());
+    controller.release_pointer(30, 40).unwrap();
+    assert_eq!(
+        sink.attempts(),
+        [
+            Attempt::Pointer {
+                buttons: 0,
+                x: 10,
+                y: 20,
+            },
+            Attempt::Pointer {
+                buttons: 0,
+                x: 30,
+                y: 40,
+            },
+        ],
+        "targeted pointer cleanup remains available in view-only mode"
+    );
 }
 
 #[test]
@@ -523,6 +548,7 @@ fn public_input_actions_are_semantic_and_clipboard_payloads_are_not_debuggable()
         match action {
             InputAction::Key { .. }
             | InputAction::Pointer { .. }
+            | InputAction::ReleasePointer { .. }
             | InputAction::CtrlAltDelete
             | InputAction::ReleaseAllKeys
             | InputAction::FocusLost
@@ -542,6 +568,7 @@ fn public_input_actions_are_semantic_and_clipboard_payloads_are_not_debuggable()
             x: 0,
             y: 0,
         },
+        InputAction::ReleasePointer { x: 0, y: 0 },
         InputAction::CtrlAltDelete,
         InputAction::ReleaseAllKeys,
         InputAction::FocusLost,

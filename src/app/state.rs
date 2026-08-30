@@ -57,6 +57,92 @@ pub struct FramebufferImage {
     height: u16,
     rgba: Vec<u8>,
     revision: u64,
+    dirty: Option<DirtyRegion>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirtyRegion {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+}
+
+impl DirtyRegion {
+    fn full(width: u16, height: u16) -> Self {
+        Self {
+            left: 0,
+            top: 0,
+            right: u32::from(width),
+            bottom: u32::from(height),
+        }
+    }
+
+    fn from_rect(rect: &FbRect) -> Self {
+        Self {
+            left: rect.x,
+            top: rect.y,
+            right: rect.x + rect.w,
+            bottom: rect.y + rect.h,
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FramebufferUploadKind {
+    Full,
+    Partial,
+}
+
+/// Ephemeral pixel staging for one texture submission. Pixel bytes intentionally
+/// implement neither `Debug` nor `Display`.
+pub struct FramebufferUpload {
+    kind: FramebufferUploadKind,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    revision: u64,
+    rgba: Vec<u8>,
+}
+
+impl FramebufferUpload {
+    pub fn kind(&self) -> FramebufferUploadKind {
+        self.kind
+    }
+
+    pub fn x(&self) -> u16 {
+        self.x
+    }
+
+    pub fn y(&self) -> u16 {
+        self.y
+    }
+
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    pub fn height(&self) -> u16 {
+        self.height
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn rgba(&self) -> &[u8] {
+        &self.rgba
+    }
 }
 
 impl fmt::Debug for FramebufferImage {
@@ -88,6 +174,7 @@ impl FramebufferImage {
             height: size.height,
             rgba,
             revision: 0,
+            dirty: Some(DirtyRegion::full(size.width, size.height)),
         })
     }
 
@@ -169,7 +256,89 @@ impl FramebufferImage {
                 .copy_from_slice(&rect.rgba[source_start..source_end]);
         }
         self.revision = self.revision.wrapping_add(1);
+        let changed = DirtyRegion::from_rect(&rect);
+        self.dirty = Some(
+            self.dirty
+                .map_or(changed, |existing| existing.union(changed)),
+        );
         Ok(())
+    }
+
+    fn upload_plan(&self, force_full: bool) -> Result<Option<FramebufferUpload>, AppStateError> {
+        let region = if force_full {
+            DirtyRegion::full(self.width, self.height)
+        } else if let Some(region) = self.dirty {
+            region
+        } else {
+            return Ok(None);
+        };
+        let region_width = region
+            .right
+            .checked_sub(region.left)
+            .ok_or(AppStateError::InvalidFramebuffer)?;
+        let region_height = region
+            .bottom
+            .checked_sub(region.top)
+            .ok_or(AppStateError::InvalidFramebuffer)?;
+        let byte_count = u64::from(region_width)
+            .checked_mul(u64::from(region_height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or(AppStateError::InvalidFramebuffer)?;
+        let maximum = usize::try_from(ProtocolLimits::default().max_framebuffer_bytes)
+            .map_err(|_| AppStateError::InvalidFramebuffer)?;
+        if byte_count > maximum {
+            return Err(AppStateError::InvalidFramebuffer);
+        }
+        let mut rgba = Vec::new();
+        rgba.try_reserve_exact(byte_count)
+            .map_err(|_| AppStateError::Allocation)?;
+        let source_stride = usize::from(self.width)
+            .checked_mul(4)
+            .ok_or(AppStateError::InvalidFramebuffer)?;
+        let row_bytes = usize::try_from(region_width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .ok_or(AppStateError::InvalidFramebuffer)?;
+        let x_bytes = usize::try_from(region.left)
+            .ok()
+            .and_then(|x| x.checked_mul(4))
+            .ok_or(AppStateError::InvalidFramebuffer)?;
+        for row in region.top..region.bottom {
+            let start = usize::try_from(row)
+                .ok()
+                .and_then(|row| row.checked_mul(source_stride))
+                .and_then(|offset| offset.checked_add(x_bytes))
+                .ok_or(AppStateError::InvalidFramebuffer)?;
+            let end = start
+                .checked_add(row_bytes)
+                .ok_or(AppStateError::InvalidFramebuffer)?;
+            rgba.extend_from_slice(
+                self.rgba
+                    .get(start..end)
+                    .ok_or(AppStateError::InvalidFramebuffer)?,
+            );
+        }
+        let full = region == DirtyRegion::full(self.width, self.height);
+        Ok(Some(FramebufferUpload {
+            kind: if full {
+                FramebufferUploadKind::Full
+            } else {
+                FramebufferUploadKind::Partial
+            },
+            x: u16::try_from(region.left).map_err(|_| AppStateError::InvalidFramebuffer)?,
+            y: u16::try_from(region.top).map_err(|_| AppStateError::InvalidFramebuffer)?,
+            width: u16::try_from(region_width).map_err(|_| AppStateError::InvalidFramebuffer)?,
+            height: u16::try_from(region_height).map_err(|_| AppStateError::InvalidFramebuffer)?,
+            revision: self.revision,
+            rgba,
+        }))
+    }
+
+    fn acknowledge_upload(&mut self, revision: u64) {
+        if self.revision == revision {
+            self.dirty = None;
+        }
     }
 }
 
@@ -385,6 +554,33 @@ impl AppState {
             .iter()
             .find(|tab| tab.snapshot.session_id == session_id)
             .and_then(SessionTabState::framebuffer)
+    }
+
+    pub fn framebuffer_upload_plan(
+        &self,
+        session_id: SessionId,
+        force_full: bool,
+    ) -> Result<Option<FramebufferUpload>, AppStateError> {
+        self.framebuffer(session_id)
+            .ok_or(AppStateError::MissingFramebufferSize)?
+            .upload_plan(force_full)
+    }
+
+    pub fn acknowledge_framebuffer_upload(
+        &mut self,
+        session_id: SessionId,
+        revision: u64,
+    ) -> Result<(), AppStateError> {
+        let framebuffer = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.snapshot.session_id == session_id)
+            .ok_or(AppStateError::UnknownSession)?
+            .framebuffer
+            .as_mut()
+            .ok_or(AppStateError::MissingFramebufferSize)?;
+        framebuffer.acknowledge_upload(revision);
+        Ok(())
     }
 
     pub fn inventory_rows(&self) -> Vec<InventoryRow> {

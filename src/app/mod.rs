@@ -17,8 +17,8 @@ pub use actions::{
     ClipboardAdapterError, CommandQueueError, DispatchOutcome, SystemClipboard, UiAction,
 };
 pub use state::{
-    AppState, AppStateError, BackingViewport, ClipboardStatus, FramebufferImage, InventoryRow,
-    QueueStatus, SessionTabState, SetupState, UiEffect,
+    AppState, AppStateError, BackingViewport, ClipboardStatus, FramebufferImage, FramebufferUpload,
+    FramebufferUploadKind, InventoryRow, QueueStatus, SessionTabState, SetupState, UiEffect,
 };
 
 struct DisconnectedSink;
@@ -29,11 +29,78 @@ impl AppCommandSink for DisconnectedSink {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeCloseAction {
+    CancelClose,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ShutdownEnqueueState {
+    #[default]
+    NotRequested,
+    Pending,
+    Enqueued,
+    SenderDisconnected,
+}
+
+#[derive(Default)]
+struct CloseCoordinator {
+    close_started: bool,
+    manager_completed: bool,
+    final_close_issued: bool,
+    shutdown: ShutdownEnqueueState,
+}
+
+impl CloseCoordinator {
+    fn update<S>(&mut self, close_requested: bool, manager: Option<&S>) -> Vec<NativeCloseAction>
+    where
+        S: AppCommandSink + ?Sized,
+    {
+        if close_requested && !self.close_started && manager.is_some() {
+            self.close_started = true;
+            self.shutdown = ShutdownEnqueueState::Pending;
+        }
+
+        if self.close_started
+            && !self.manager_completed
+            && self.shutdown == ShutdownEnqueueState::Pending
+        {
+            if let Some(manager) = manager {
+                self.shutdown = match manager.try_send(AppCommand::Shutdown) {
+                    Ok(()) => ShutdownEnqueueState::Enqueued,
+                    Err(CommandQueueError::Full) => ShutdownEnqueueState::Pending,
+                    Err(CommandQueueError::Disconnected) => {
+                        ShutdownEnqueueState::SenderDisconnected
+                    }
+                };
+            }
+        }
+
+        if self.close_started && self.manager_completed && !self.final_close_issued {
+            self.final_close_issued = true;
+            return vec![NativeCloseAction::Close];
+        }
+        if close_requested && self.close_started {
+            return vec![NativeCloseAction::CancelClose];
+        }
+        Vec::new()
+    }
+
+    fn reconcile_manager<T>(&mut self, event_channel_disconnected: bool, manager: &mut Option<T>) {
+        if event_channel_disconnected {
+            let _ = manager.take();
+            self.manager_completed = true;
+        }
+    }
+}
+
 pub struct RustedOutClient {
     state: AppState,
     manager: Option<SessionManager>,
     clipboard: Box<dyn ClipboardAdapter>,
     view: view::ViewResources,
+    close: CloseCoordinator,
 }
 
 impl RustedOutClient {
@@ -45,12 +112,13 @@ impl RustedOutClient {
             manager,
             clipboard: Box::<SystemClipboard>::default(),
             view: view::ViewResources::default(),
+            close: CloseCoordinator::default(),
         }
     }
 
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self) -> bool {
         let Some(manager) = self.manager.as_mut() else {
-            return;
+            return false;
         };
         let mut disconnected = false;
         for _ in 0..crate::session::APP_QUEUE_CAPACITY {
@@ -74,9 +142,7 @@ impl RustedOutClient {
                 }
             }
         }
-        if disconnected {
-            self.manager = None;
-        }
+        disconnected
     }
 
     fn has_active_session(&self) -> bool {
@@ -91,7 +157,9 @@ impl RustedOutClient {
 
 impl eframe::App for RustedOutClient {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_events();
+        let manager_completed = self.drain_events();
+        self.close
+            .reconcile_manager(manager_completed, &mut self.manager);
         let actions = view::render(ctx, &mut self.state, &mut self.view);
         for action in actions {
             let was_fullscreen = self.state.fullscreen();
@@ -113,9 +181,15 @@ impl eframe::App for RustedOutClient {
             }
         }
 
-        if ctx.input(|input| input.viewport().close_requested()) {
-            if let Some(manager) = &self.manager {
-                let _ = manager.try_send(AppCommand::Shutdown);
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        for action in self.close.update(close_requested, self.manager.as_ref()) {
+            match action {
+                NativeCloseAction::CancelClose => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+                NativeCloseAction::Close => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
         if self.has_active_session() {
@@ -157,6 +231,144 @@ fn start_configured_application(
         Err(error) => {
             let _ = state.apply(crate::session::AppEvent::Error(error));
             (state, None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod close_coordinator_tests {
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        rc::Rc,
+    };
+
+    use super::{
+        AppCommand, AppCommandSink, CloseCoordinator, CommandQueueError, NativeCloseAction,
+    };
+
+    struct ScriptedSink {
+        outcomes: RefCell<VecDeque<Result<(), CommandQueueError>>>,
+        shutdown_attempts: Cell<usize>,
+    }
+
+    impl ScriptedSink {
+        fn new(outcomes: impl IntoIterator<Item = Result<(), CommandQueueError>>) -> Self {
+            Self {
+                outcomes: RefCell::new(outcomes.into_iter().collect()),
+                shutdown_attempts: Cell::new(0),
+            }
+        }
+    }
+
+    impl AppCommandSink for ScriptedSink {
+        fn try_send(&self, command: AppCommand) -> Result<(), CommandQueueError> {
+            assert!(matches!(command, AppCommand::Shutdown));
+            self.shutdown_attempts
+                .set(self.shutdown_attempts.get().saturating_add(1));
+            self.outcomes.borrow_mut().pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    #[test]
+    fn immediate_native_close_is_cancelled_and_enqueues_shutdown_once() {
+        let sink = ScriptedSink::new([Ok(())]);
+        let mut coordinator = CloseCoordinator::default();
+
+        assert_eq!(
+            coordinator.update(true, Some(&sink)),
+            vec![NativeCloseAction::CancelClose]
+        );
+        assert_eq!(coordinator.update(false, Some(&sink)), Vec::new());
+        assert_eq!(sink.shutdown_attempts.get(), 1);
+    }
+
+    #[test]
+    fn full_shutdown_queue_retains_one_intent_and_retries_on_a_later_frame() {
+        let sink = ScriptedSink::new([Err(CommandQueueError::Full), Ok(())]);
+        let mut coordinator = CloseCoordinator::default();
+
+        assert_eq!(
+            coordinator.update(true, Some(&sink)),
+            vec![NativeCloseAction::CancelClose]
+        );
+        assert_eq!(sink.shutdown_attempts.get(), 1);
+        assert_eq!(coordinator.update(false, Some(&sink)), Vec::new());
+        assert_eq!(sink.shutdown_attempts.get(), 2);
+        assert_eq!(coordinator.update(false, Some(&sink)), Vec::new());
+        assert_eq!(sink.shutdown_attempts.get(), 2);
+    }
+
+    #[test]
+    fn duplicate_close_requests_are_each_cancelled_without_duplicate_shutdown() {
+        let sink = ScriptedSink::new([Ok(())]);
+        let mut coordinator = CloseCoordinator::default();
+
+        for _ in 0..2 {
+            assert_eq!(
+                coordinator.update(true, Some(&sink)),
+                vec![NativeCloseAction::CancelClose]
+            );
+        }
+        assert_eq!(sink.shutdown_attempts.get(), 1);
+    }
+
+    #[test]
+    fn final_close_is_issued_once_only_after_event_completion_releases_manager() {
+        let sink = ScriptedSink::new([Ok(())]);
+        let mut coordinator = CloseCoordinator::default();
+        let mut manager = Some(());
+
+        assert_eq!(
+            coordinator.update(true, Some(&sink)),
+            vec![NativeCloseAction::CancelClose]
+        );
+        coordinator.reconcile_manager(false, &mut manager);
+        assert!(manager.is_some());
+        assert_eq!(coordinator.update(false, Some(&sink)), Vec::new());
+
+        coordinator.reconcile_manager(true, &mut manager);
+        assert!(manager.is_none());
+        assert_eq!(
+            coordinator.update(false, None::<&ScriptedSink>),
+            vec![NativeCloseAction::Close]
+        );
+        assert_eq!(coordinator.update(false, None::<&ScriptedSink>), Vec::new());
+    }
+
+    #[test]
+    fn disconnected_command_sender_does_not_release_manager_early() {
+        let sink = ScriptedSink::new([Err(CommandQueueError::Disconnected)]);
+        let mut coordinator = CloseCoordinator::default();
+        let drops = Rc::new(Cell::new(0));
+        let mut manager = Some(DropProbe(Rc::clone(&drops)));
+
+        assert_eq!(
+            coordinator.update(true, Some(&sink)),
+            vec![NativeCloseAction::CancelClose]
+        );
+        coordinator.reconcile_manager(false, &mut manager);
+        assert!(manager.is_some());
+        assert_eq!(drops.get(), 0);
+        assert_eq!(
+            coordinator.update(true, Some(&sink)),
+            vec![NativeCloseAction::CancelClose]
+        );
+
+        coordinator.reconcile_manager(true, &mut manager);
+        assert!(manager.is_none());
+        assert_eq!(drops.get(), 1);
+        assert_eq!(
+            coordinator.update(false, None::<&ScriptedSink>),
+            vec![NativeCloseAction::Close]
+        );
+    }
+
+    struct DropProbe(Rc<Cell<usize>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get().saturating_add(1));
         }
     }
 }
