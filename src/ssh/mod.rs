@@ -15,8 +15,8 @@ pub use inventory::{
 pub use master::{SshMaster, SshMasterError, VerifiedSshMaster};
 pub use proxy::{ProxyOpenError, ProxyTicket, TrustedSshProxy};
 pub use stream::{
-    ProxyCleanupFailure, ProxyCleanupStage, ProxyIoFailure, ProxyIoStage, ProxyStream,
-    ProxyStreamError,
+    ProxyCleanupFailure, ProxyCleanupStage, ProxyIoFailure, ProxyIoStage, ProxyReapState,
+    ProxyStream, ProxyStreamError,
 };
 
 #[cfg(test)]

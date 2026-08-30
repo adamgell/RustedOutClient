@@ -90,6 +90,15 @@ if [ "$proxy" = true ]; then
     printf '%s\n' "$$" > "${socket}.proxy.pid"
     : > "${socket}.proxy.env-valid"
     printf 'RFB 003.008\n'
+    if [ -f "${socket}.proxy_stderr_open" ]; then
+        (
+            trap 'exit 0' PIPE TERM INT HUP
+            while printf 'x' >&2; do
+                sleep 0.05
+            done
+        ) &
+        printf '%s\n' "$!" > "${socket}.proxy.stderr-holder.pid"
+    fi
     if [ -f "${socket}.proxy_eof_live" ]; then
         exec 1>&-
         while :; do
