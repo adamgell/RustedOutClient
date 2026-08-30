@@ -350,3 +350,173 @@ Cargo manifests and lockfiles are unchanged. No protected rollback artifact appe
 8. Hit testing: only the visible intersection initiates input while original image geometry maps cropped coordinates.
 
 Remaining concern/acceptance boundary: visual polish, platform-native close behavior, live Windows guest input, real QEMU/guest ExtendedDesktopSize behavior, two concurrent live sessions, real host clipboard transfer, and repeated live cleanup remain controller-run native acceptance. They were intentionally not attempted under this fix brief's safety boundaries. No known automated-test or static-analysis concern remains.
+
+# Task 11 fix round 2 report
+
+Date: 2026-08-30
+Fix brief: `task-11-fix-round-2.md`
+Required fix base: `90738a439d8d37f9d761b49d4367d467c131ed98`
+Implementation commit message: `fix: preserve console cleanup and resize state`
+Final implementation commit SHA: `c85990205da4a9a3f1a5938d033c3289bf93650f`
+
+This section supersedes the earlier Task 11 sections wherever round-2 behavior or counts differ. All round-1 behavior and tests remain present.
+
+## Round-2 starting evidence
+
+- Before editing, `git rev-parse HEAD` returned exactly `90738a439d8d37f9d761b49d4367d467c131ed98`.
+- The linked worktree was clean on `feature/proxmox-console-foundation`.
+- The complete global constraints, Task 11 brief, controller context, fix-round-1 brief, fix-round-2 brief, and controller-named design sections were read before editing.
+- No subagent or delegated task was created.
+- No stash command was run. Parked Task 8 stash 0 remained exactly `0d95b4f403abb215f8d6d9f8e21d64201d60e76a` with subject `task8-parser-qa-pending-program-access`.
+- No live endpoint, VM, guest driver, real clipboard, dependency, protected rollback artifact, or long-running GUI process was accessed or changed.
+
+## Round-2 test-first RED evidence
+
+Focused regression tests were introduced before their corresponding production changes. The actual observed failures were:
+
+1. Independent server-layout capability
+   - Exact test: `server_unsupported_geometry_does_not_consume_an_awaiting_client_request`.
+   - Result: exit 101.
+   - Actual assertion: production emitted two client requests, `[1600x896, 1920x1080]`, before the late old client response; only the original request was permitted.
+
+2. Central public resize-status projection
+   - Exact test: `disabled_status_has_priority_over_every_late_resize_event_then_reprojects_on_enable`.
+   - Result: exit 101.
+   - Actual assertion: a late event published `Pending(1600x896)` while Dynamic Resolution was off; the required status was `Disabled`.
+
+3. Forwarded-timeout replacement release
+   - Exact test: `forwarded_timeout_releases_one_armed_newest_replacement_without_a_second_click`.
+   - Result: exit 101.
+   - Actual failure: the expected Requested snapshot for the armed newest replacement was never emitted after the Forwarded request timed out.
+
+4. Unified semantic input cleanup
+   - Exact test: `release_owned_input_attempts_pointer_and_all_keys_returns_first_error_and_clears_tracking`.
+   - Result: exit 101 at compile time.
+   - Actual failure: `InputController::release_owned_input` did not exist.
+   - The app semantic contract then failed to compile because `InputAction::ReleaseOwnedInput` and `UiAction::ReleaseOwnedInput` did not exist.
+   - The legacy-split compile-fail fixture initially reported non-exhaustive semantic matches, proving the old `ReleasePointer`/`FocusLost` variants were still public. After removing them, trybuild produced the expected missing-variant errors, which became the checked `.stderr` fixture.
+
+5. Native close ordering and retry
+   - Exact coordinator regression: `native_close_waits_for_retryable_owner_cleanup_before_shutdown_fifo_and_final_close`.
+   - Result: exit 101 at compile time.
+   - Actual failure: the old close-coordinator API had no pending-owner-cleanup input and therefore could not defer Shutdown.
+   - The dispatch acknowledgement regression also failed to compile because the app had no cleanup acknowledgement hook or retained owner-cleanup APIs.
+
+6. Worker-driven ownership invalidation
+   - Focused ownership/transition regressions initially failed to compile because pending cleanup state, acknowledgement, state validation, and manager-completion hooks did not exist.
+   - A no-spin refinement then failed with exit 101 because `pending_cleanup_action()` remained `Some(...)` after a Disconnected dispatch outcome.
+   - Final self-review added `completion-before-render` coverage. It failed with exit 101 because manager completion left an owner whose non-writable state had not yet reached render validation.
+
+7. Oversized 1:1 paint clipping
+   - The geometry regression initially failed to compile because `framebuffer_paint_clip` did not exist.
+   - The shape-level render regression then failed to compile because the framebuffer paint path had not yet been extracted behind the clipped painter.
+
+The SetDesktopSize correction remains intact: both fixture vectors and production encoding are exactly 24 bytes in `type,pad,w,h,count,pad,id,x,y,w,h,flags` order. Production was not altered to match the former 26-byte fixture.
+
+## Round-2 implementation
+
+### Independent resize state and central projection
+
+- Added one bounded server-layout capability flag independent of the one client request lifecycle and one newest unsent replacement.
+- `ServerUnsupported` now advances valid server geometry through the parser path, disables automatic work, cancels unsent debounce/replacement state, and publishes Unsupported while enabled without consuming an AwaitingOutcome or Forwarded client request.
+- Retry, re-enable, and viewport changes cannot issue a second SetDesktopSize until the old client-response correlation is consumed.
+- Added a single `ResizePolicy::published_status` projection. Disabled has unconditional highest priority; late protocol, geometry, and timer activity still updates internal state safely, and re-enable exposes retained Pending, Applied, Rejected, Unsupported, TimedOut, Requested, or Waiting truth.
+- Direct worker writes to the public snapshot resize status were removed; `emit_session_snapshot` is the central publication point.
+- A Forwarded request timeout now takes and issues exactly one explicitly armed newest replacement only after the mutable session-record borrow ends and only when Dynamic Resolution is enabled, the session is Ready, and `can_issue` remains true. Without explicit Retry, automatic follow-up stays stopped.
+
+### One retryable semantic ownership cleanup
+
+- Replaced split app-level pointer and focus cleanup with `ReleaseOwnedInput { pointer_position: Option<(u16, u16)> }` in both UI and session semantic action surfaces.
+- `InputController::release_owned_input` attempts the zero-button pointer event first when coordinates exist, then attempts every tracked key release in established reverse order even if pointer release failed. It returns the first typed error and preserves the Task 10 bounded key-state clearing contract.
+- The legacy `ReleasePointer` and `FocusLost` public variants are compile-fail protected. No raw `VncCommand`, queue, task, transport, or alternate writer was added.
+- The view retains one owner/session record and one cleanup state. Busy retries at most once per later frame; Sent clears ownership and permits later FIFO controls; Disconnected retains bounded ownership without repeated sends or new input until manager completion.
+- All five held pointer buttons collapse to one zero-button semantic cleanup; modifier/key release remains inside the controller. A new session cannot claim ownership while old cleanup is pending.
+- Manager completion clears residual local ownership unconditionally, including the completion-before-render ordering where a terminal state and event-channel close arrive in the same frame.
+
+### Native close and worker-driven transitions
+
+- Native close intent is read before event draining and rendering so an existing owner is scheduled for cleanup on the first title-bar close request.
+- The pure close coordinator keeps Shutdown pending until cleanup is accepted on the same bounded command channel, preserving exact FIFO order `ReleaseOwnedInput` then `Shutdown`.
+- Full retries cleanup or Shutdown on later frames without awaiting. Duplicate close requests remain cancelled, the manager/runtime remains owned until event-channel completion, and final Close is emitted once.
+- Render-start ownership validation checks the matching owner tab for Ready, writable, error-free state. Disconnecting, Disconnected, terminal error, view-only, tab disappearance, tab selection change, focus loss, and control actions all schedule cleanup against the stored old owner ID.
+- Fresh key/pointer collection and later controls are suppressed until cleanup acknowledgement. Manager-level close cleanup remains defense in depth.
+
+### Clipped 1:1 framebuffer painting
+
+- Framebuffer painting now uses a painter clipped to `inner.intersect(parent_clip)`.
+- The full uncropped `image_rect` remains the mesh geometry and the basis for UVs and guest-coordinate mapping.
+- Pointer initiation retains the existing visible `image_rect ∩ inner ∩ clip` hit region, while releases begun inside remain targeted to the original owner.
+- A shape-level egui test verifies both the clipped shape and full original image geometry.
+
+## Focused GREEN evidence
+
+| Command/focus | Result |
+|---|---|
+| Exact independent ServerUnsupported/client-correlation regression | 1 passed |
+| Exact Disabled-priority table over Forwarded, Rejected, Unsupported, ServerUnsupported, matching DesktopSize, and timeout | 1 passed |
+| Exact Forwarded-timeout armed-replacement regression | 1 passed |
+| Exact controller pointer-plus-key cleanup/first-error regression | 1 passed |
+| Exact completion-before-render ownership regression | RED exit 101, then GREEN 1 passed after the production correction |
+| `cargo test --lib app::view::input_tests` | 11 passed |
+| `cargo test --lib app::close_coordinator_tests` | 7 passed |
+| `cargo test --test app_state_contract` | 12 passed |
+| `cargo test --test display_resize_contract` | 17 passed |
+| `cargo test --test input_contract` | 14 passed plus three nested trybuild fixtures |
+| `cargo test --test session_manager_contract` | 23 passed |
+
+During pre-gate cleanup, strict Clippy first identified one slice API expressed as `&mut Vec` and then three unnecessary mutable call-site borrows. Those were corrected, Clippy passed, and the complete required sequence was restarted from `cargo fmt` on the final source tree.
+
+## Required final gate sequence
+
+This sequence was run after the final completion-order production change:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | exit 0 |
+| `cargo test --test app_state_contract` | exit 0; 12 passed |
+| `cargo test --test display_resize_contract` | exit 0; 17 passed |
+| `cargo test --test input_contract` | exit 0; 14 passed plus three nested trybuild fixtures |
+| `cargo test --test session_manager_contract` | exit 0; 23 passed |
+| `cargo test --all-targets` | exit 0; 118 library + 164 integration = 282 passed, 0 failed; five nested trybuild fixtures also passed |
+| `cargo clippy --all-targets -- -D warnings` | exit 0; no warnings |
+| `cargo build --release` | exit 0 |
+| `git diff --check` | exit 0 |
+
+## Round-2 changed files
+
+Implementation commit `c85990205da4a9a3f1a5938d033c3289bf93650f` contains exactly these twelve files:
+
+- `src/app/actions.rs` — unified targeted semantic cleanup dispatch.
+- `src/app/mod.rs` — dispatch acknowledgement, cleanup-before-Shutdown close sequencing, and manager-completion integration.
+- `src/app/view.rs` — retained per-session cleanup state, worker-transition validation, input/control suppression, clipped framebuffer painting, and focused pure tests.
+- `src/session/events.rs` — `ReleaseOwnedInput` semantic action surface.
+- `src/session/manager.rs` — independent resize capability/outcome state, central status projection, Forwarded-timeout replacement release, and production semantic cleanup routing.
+- `src/vnc/input.rs` — ordered pointer-plus-all-keys cleanup with first typed error.
+- `tests/app_state_contract.rs` — single targeted semantic cleanup contract.
+- `tests/display_resize_contract.rs` — paused-time capability correlation, Disabled projection, and timeout replacement tests.
+- `tests/input_contract.rs` — controller cleanup semantics and public API coverage.
+- `tests/session_manager_contract.rs` — unified semantic action fake-session route.
+- `tests/ui/legacy_split_cleanup.rs` — compile-fail use of removed split cleanup actions.
+- `tests/ui/legacy_split_cleanup.stderr` — exact compiler diagnostics for that forbidden surface.
+
+This report is the only file in the permitted evidence-only follow-up commit. Cargo manifests and lockfiles are unchanged. No protected rollback artifact appears in either commit.
+
+## Round-2 self-review against all seven findings
+
+1. Server capability: server-driven unsupported geometry cannot consume, forward, reject, clear, or retarget an outstanding client wire request; one late correlated client response is required before replacement issue.
+2. Status truth: one projection helper owns public resize status, Disabled always wins, late events still update retained state, and re-enable truthfully reprojects it without disconnecting or changing Fit.
+3. Forwarded timeout: one armed newest replacement is released automatically at timeout; absent explicit Retry, automatic follow-up stays disabled and no request storm is possible.
+4. Cleanup semantic: one bounded targeted command covers pointer and every tracked key, attempts both components, preserves first typed error and reverse release order, and cannot carry nonzero buttons or raw RFB commands.
+5. Native close: first close schedules owner cleanup, Full retries without early Shutdown, accepted cleanup precedes Shutdown on the same FIFO channel, and final Close waits for manager completion.
+6. Worker transitions: matching-tab writability is checked before input; old-owner state survives Busy and Disconnected without retargeting or spin; incoming input is blocked; manager completion safely clears impossible-to-deliver residual ownership in either event ordering.
+7. Paint clip: the framebuffer mesh keeps full image geometry while its clip is exactly the instrument-bay/parent intersection, preserving cropped coordinate mapping and existing outside-release behavior.
+
+## Privacy, security, and boundary review
+
+- The app layer still exposes only semantic `UiAction`, `AppCommand`, and `InputAction` values; no raw `VncCommand` crosses into UI code.
+- The exact two-session cap, 256 command/event and tracked-key limits, framebuffer ceilings, parser bounds, strict system-SSH/known-host path, fixed remote commands, VNC-auth-over-trusted-proxy boundary, clipboard one-shot design, whole-close deadline, owned-child cleanup, private persistence, and content-free public errors remain unchanged.
+- SetDesktopSize remains exactly 24 bytes with one id-0, origin-zero, flags-zero screen.
+- Task 12 remains only the existing disabled/typed-not-available UI action. No listener, alternate process, password file, or fallback transport was implemented.
+- No live Proxmox/VM operation, guest change, real clipboard access, secret value, dependency change, stash mutation, rollback-artifact edit, subagent, push, amend, or GUI run occurred.
+
+Remaining concern/acceptance boundary: platform-native visual inspection, real Windows input/secure-attention behavior, two concurrent live sessions, real guest ExtendedDesktopSize behavior, real clipboard transfer, and repeated live close/reconnect cleanup remain controller-run native acceptance. They were intentionally not attempted under the fix-round safety boundaries. No known automated-test, static-analysis, source-boundary, or repository-integrity concern remains.
