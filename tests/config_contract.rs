@@ -1,7 +1,6 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -14,20 +13,51 @@ use rustedoutclient::{
     },
     model::{NodeName, PveProfile, SshTarget, VmId},
 };
+use tempfile::{tempdir, TempDir};
 
-fn test_directory() -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let directory = std::env::temp_dir().join(format!(
-        "rustedoutclient-config-contract-{}-{unique}",
-        std::process::id()
-    ));
-    fs::create_dir(&directory).unwrap();
+fn test_directory() -> TempDir {
+    let directory = tempdir().unwrap();
     #[cfg(unix)]
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     directory
+}
+
+#[test]
+fn concurrent_test_directories_are_unique_and_owned() {
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    const WORKERS: usize = 256;
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let handles: Vec<_> = (0..WORKERS)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                test_directory()
+            })
+        })
+        .collect();
+
+    let mut directories = Vec::with_capacity(WORKERS);
+    let mut panicked = false;
+    for handle in handles {
+        match handle.join() {
+            Ok(directory) => directories.push(directory),
+            Err(_) => panicked = true,
+        }
+    }
+
+    let unique_paths: HashSet<_> = directories
+        .iter()
+        .map(|directory| directory.path().to_owned())
+        .collect();
+
+    assert!(!panicked, "a concurrent directory creation panicked");
+    assert_eq!(unique_paths.len(), WORKERS);
 }
 
 fn fixture_config() -> AppConfig {
@@ -152,11 +182,14 @@ fn atomic_save_keeps_previous_file_readable_when_rename_fails() {
     use std::os::unix::fs::MetadataExt;
 
     let directory = test_directory();
-    let path = directory.join("config.json");
+    let path = directory.path().join("config.json");
     let initial = fixture_config();
     save_config_to_path(&initial, &path).unwrap();
 
-    assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+    assert_eq!(
+        fs::metadata(directory.path()).unwrap().mode() & 0o777,
+        0o700
+    );
     assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
 
     let mut replacement = fixture_config();
@@ -165,7 +198,6 @@ fn atomic_save_keeps_previous_file_readable_when_rename_fails() {
 
     let retained: AppConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(retained.inventory_refresh_seconds, 15);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(unix)]
@@ -174,12 +206,11 @@ fn loading_rejects_a_preexisting_non_private_configuration_directory() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = test_directory();
-    let path = directory.join("config.json");
+    let path = directory.path().join("config.json");
     save_config_to_path(&fixture_config(), &path).unwrap();
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
     assert!(load_config_from_path(&path).is_err());
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(unix)]
@@ -188,12 +219,11 @@ fn loading_rejects_a_preexisting_non_private_configuration_file() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = test_directory();
-    let path = directory.join("config.json");
+    let path = directory.path().join("config.json");
     save_config_to_path(&fixture_config(), &path).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
     assert!(load_config_from_path(&path).is_err());
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(unix)]
@@ -202,12 +232,11 @@ fn saving_rejects_a_preexisting_non_private_configuration_directory() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = test_directory();
-    let path = directory.join("config.json");
+    let path = directory.path().join("config.json");
     save_config_to_path(&fixture_config(), &path).unwrap();
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
     assert!(save_config_to_path(&fixture_config(), &path).is_err());
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(unix)]
@@ -216,10 +245,9 @@ fn saving_rejects_a_preexisting_non_private_configuration_file() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = test_directory();
-    let path = directory.join("config.json");
+    let path = directory.path().join("config.json");
     save_config_to_path(&fixture_config(), &path).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
     assert!(save_config_to_path(&fixture_config(), &path).is_err());
-    fs::remove_dir_all(directory).unwrap();
 }
