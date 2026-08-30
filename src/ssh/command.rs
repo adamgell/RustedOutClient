@@ -151,7 +151,7 @@ impl SshCommandFactory {
 
 #[cfg(test)]
 impl SshCommandFactory {
-    fn new_for_test(executable: PathBuf, control_socket: PathBuf) -> Self {
+    pub(super) fn new_for_test(executable: PathBuf, control_socket: PathBuf) -> Self {
         Self {
             executable,
             control_socket,
