@@ -1,7 +1,7 @@
-use std::{
-    fmt,
-    time::{Duration, Instant},
-};
+use std::fmt;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rand::{distributions::Alphanumeric, rngs::OsRng, Rng};
 use secrecy::{ExposeSecret, SecretString};
@@ -10,12 +10,14 @@ use thiserror::Error;
 use crate::model::VmId;
 
 use super::{
-    InventoryError, InventorySnapshot, ProxyStream, ProxyStreamError, SshMasterError,
-    VerifiedSshMaster, VmInventoryItem, VmStatus,
+    InventoryError, ProxyStream, ProxyStreamError, SshMasterError, VerifiedSshMaster,
+    VmInventoryItem, VmStatus,
 };
 
 const TICKET_LENGTH: usize = 8;
-const LIVE_INVENTORY_MAX_AGE: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+static PROXY_TICKET_GENERATIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// An eight-byte, OS-CSPRNG-generated Proxmox VNC proxy credential.
 ///
@@ -46,6 +48,17 @@ impl ProxyTicket {
     pub(crate) fn expose_for_auth(&self) -> &str {
         self.0.expose_secret()
     }
+
+    fn generate_for_proxy() -> Self {
+        #[cfg(test)]
+        PROXY_TICKET_GENERATIONS.fetch_add(1, Ordering::SeqCst);
+        Self::generate()
+    }
+
+    #[cfg(test)]
+    fn test_generation_count() -> usize {
+        PROXY_TICKET_GENERATIONS.load(Ordering::SeqCst)
+    }
 }
 
 impl fmt::Debug for ProxyTicket {
@@ -62,88 +75,17 @@ pub enum ProxyOpenError {
     Inventory(#[from] InventoryError),
     #[error(transparent)]
     Stream(#[from] ProxyStreamError),
-    #[error("live inventory is no longer fresh")]
-    InventoryStale,
     #[error("the selected VM was not present in verified live inventory")]
     VmNotFound,
     #[error("the selected VM is not running")]
     VmNotRunning,
-    #[error("templates cannot be opened as VNC sessions")]
-    VmTemplate,
-    #[error("the live inventory belongs to a different owned SSH master")]
-    WrongMaster,
-}
-
-/// Fresh inventory fetched through one verified, owned master.
-///
-/// There is no public constructor. Cached and caller-created snapshots cannot
-/// be converted into this proof.
-pub struct VerifiedInventory {
-    owner_id: u64,
-    fetched_at: Instant,
-    snapshot: InventorySnapshot,
-}
-
-impl VerifiedInventory {
-    pub(super) fn from_live_fetch(owner_id: u64, snapshot: InventorySnapshot) -> Self {
-        Self {
-            owner_id,
-            fetched_at: Instant::now(),
-            snapshot,
-        }
-    }
-
-    pub fn snapshot(&self) -> &InventorySnapshot {
-        &self.snapshot
-    }
-
-    pub fn running_vm(&self, vmid: VmId) -> Result<VerifiedRunningVm, ProxyOpenError> {
-        if self.fetched_at.elapsed() > LIVE_INVENTORY_MAX_AGE || self.snapshot.stale {
-            return Err(ProxyOpenError::InventoryStale);
-        }
-        let item = self
-            .snapshot
-            .vms
-            .iter()
-            .find(|item| item.vmid == vmid)
-            .ok_or(ProxyOpenError::VmNotFound)?;
-        validate_openable(item)?;
-        Ok(VerifiedRunningVm {
-            owner_id: self.owner_id,
-            vmid,
-            validated_at: self.fetched_at,
-        })
-    }
-
-    #[cfg(test)]
-    fn for_test(owner_id: u64, fetched_at: Instant, vms: Vec<VmInventoryItem>) -> Self {
-        Self {
-            owner_id,
-            fetched_at,
-            snapshot: InventorySnapshot {
-                observed_at_unix_ms: 1,
-                stale: false,
-                vms,
-            },
-        }
-    }
 }
 
 fn validate_openable(item: &VmInventoryItem) -> Result<(), ProxyOpenError> {
-    if item.template {
-        return Err(ProxyOpenError::VmTemplate);
-    }
     if item.status != VmStatus::Running {
         return Err(ProxyOpenError::VmNotRunning);
     }
     Ok(())
-}
-
-/// Opaque proof that one VM was running in fresh live inventory.
-pub struct VerifiedRunningVm {
-    owner_id: u64,
-    vmid: VmId,
-    validated_at: Instant,
 }
 
 /// Trusted transport input for the VNC authentication boundary.
@@ -155,18 +97,19 @@ pub struct TrustedSshProxy {
 impl TrustedSshProxy {
     pub async fn connect(
         master: &mut VerifiedSshMaster<'_>,
-        vm: VerifiedRunningVm,
+        vmid: VmId,
     ) -> Result<Self, ProxyOpenError> {
-        if master.owner_id() != vm.owner_id {
-            return Err(ProxyOpenError::WrongMaster);
-        }
-        if vm.validated_at.elapsed() > LIVE_INVENTORY_MAX_AGE {
-            return Err(ProxyOpenError::InventoryStale);
-        }
-
         master.recheck().await?;
-        let ticket = ProxyTicket::generate();
-        let spec = master.proxy_spec(vm.vmid, &ticket);
+        let inventory = master.fetch_inventory().await?;
+        let item = inventory
+            .vms
+            .iter()
+            .find(|item| item.vmid == vmid)
+            .ok_or(ProxyOpenError::VmNotFound)?;
+        validate_openable(item)?;
+
+        let ticket = ProxyTicket::generate_for_proxy();
+        let spec = master.proxy_spec(vmid, &ticket);
         let stream = ProxyStream::spawn(spec)?;
         Ok(Self { stream, ticket })
     }
@@ -181,6 +124,7 @@ impl TrustedSshProxy {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         fs,
         path::{Path, PathBuf},
         process::{Command, Stdio},
@@ -196,28 +140,38 @@ mod tests {
         time::{sleep, timeout},
     };
 
-    use super::{ProxyOpenError, ProxyTicket, TrustedSshProxy, VerifiedInventory};
+    use super::{ProxyOpenError, ProxyTicket, TrustedSshProxy};
     use crate::{
         model::{NodeName, PveProfile, SshTarget, VmId},
         runtime::RuntimeDir,
-        ssh::{SshCommandFactory, SshMaster, VmInventoryItem, VmStatus},
+        ssh::{SshCommandFactory, SshMaster},
     };
+
+    struct ParentTicketEnvironment(Option<std::ffi::OsString>);
+
+    impl ParentTicketEnvironment {
+        fn install_synthetic_sentinel() -> Self {
+            let previous = std::env::var_os("LC_PVE_TICKET");
+            std::env::set_var("LC_PVE_TICKET", "SENTINEL");
+            Self(previous)
+        }
+    }
+
+    impl Drop for ParentTicketEnvironment {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::env::set_var("LC_PVE_TICKET", previous);
+            } else {
+                std::env::remove_var("LC_PVE_TICKET");
+            }
+        }
+    }
 
     fn fixture_profile() -> PveProfile {
         PveProfile {
             name: "Synthetic Proxmox".to_owned(),
             ssh_target: SshTarget::parse("root@pve.example.invalid").unwrap(),
             node: NodeName::parse("pve2").unwrap(),
-        }
-    }
-
-    fn vm(vmid: u32, status: VmStatus, template: bool) -> VmInventoryItem {
-        VmInventoryItem {
-            vmid: VmId::new(vmid).unwrap(),
-            name: format!("SYNTHETIC-{vmid}"),
-            node: NodeName::parse("pve2").unwrap(),
-            status,
-            template,
         }
     }
 
@@ -268,6 +222,40 @@ mod tests {
         .expect("owned synthetic proxy child was not reaped");
     }
 
+    fn assert_exact_regular_artifacts_exclude_ticket(
+        directory: &Path,
+        expected_names: &[&str],
+        ticket: &ProxyTicket,
+    ) {
+        let mut observed = BTreeSet::new();
+        for entry in fs::read_dir(directory).expect("runtime directory must be readable") {
+            let entry = entry.expect("every runtime directory entry must be readable");
+            let metadata = fs::symlink_metadata(entry.path())
+                .expect("every runtime artifact must have readable metadata");
+            assert!(
+                metadata.file_type().is_file(),
+                "runtime artifacts must all be regular files"
+            );
+            let name = entry
+                .file_name()
+                .into_string()
+                .expect("runtime artifact names must be UTF-8");
+            assert!(
+                observed.insert(name),
+                "runtime artifact names must be unique"
+            );
+            let bytes = fs::read(entry.path()).expect("every runtime artifact must be readable");
+            assert!(!bytes
+                .windows(ticket.expose_for_auth().len())
+                .any(|window| window == ticket.expose_for_auth().as_bytes()));
+        }
+        let expected = expected_names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(observed, expected);
+    }
+
     #[test]
     fn generated_ticket_bytes_are_unique_without_rendering_secret_values() {
         let mut values = Vec::with_capacity(10_000);
@@ -293,6 +281,7 @@ mod tests {
     #[tokio::test]
     async fn proxy_stream_moves_native_bytes_without_ticket_files_or_argv_exposure() {
         let _process_guard = crate::ssh::process_test_guard().await;
+        let _parent_environment = ParentTicketEnvironment::install_synthetic_sentinel();
         let runtime = RuntimeDir::create().unwrap();
         let (_fixture_directory, executable) = fake_ssh();
         let factory =
@@ -301,9 +290,7 @@ mod tests {
         wait_for(&runtime.control_socket().with_extension("state")).await;
 
         let mut verified = master.verify().await.unwrap();
-        let inventory = verified.fetch_inventory().await.unwrap();
-        let running = inventory.running_vm(VmId::new(107).unwrap()).unwrap();
-        let proxy = TrustedSshProxy::connect(&mut verified, running)
+        let proxy = TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap())
             .await
             .unwrap();
         let (mut stream, ticket) = proxy.into_parts();
@@ -331,14 +318,19 @@ mod tests {
             .control_socket()
             .with_extension("proxy.env-valid")
             .exists());
-        for entry in fs::read_dir(runtime.path()).unwrap() {
-            let bytes = fs::read(entry.unwrap().path()).unwrap_or_default();
-            assert!(!bytes
-                .windows(ticket.expose_for_auth().len())
-                .any(|window| { window == ticket.expose_for_auth().as_bytes() }));
-        }
-
         master.close().await.unwrap();
+        assert_exact_regular_artifacts_exclude_ticket(
+            runtime.path(),
+            &[
+                "c.argv",
+                "c.check.pid",
+                "c.exit.pid",
+                "c.inventory.pid",
+                "c.proxy.env-valid",
+                "c.proxy.pid",
+            ],
+            &ticket,
+        );
     }
 
     #[cfg(unix)]
@@ -359,9 +351,7 @@ mod tests {
         let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
         wait_for(&runtime.control_socket().with_extension("state")).await;
         let mut verified = master.verify().await.unwrap();
-        let inventory = verified.fetch_inventory().await.unwrap();
-        let running = inventory.running_vm(VmId::new(107).unwrap()).unwrap();
-        let proxy = TrustedSshProxy::connect(&mut verified, running)
+        let proxy = TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap())
             .await
             .unwrap();
         let (mut stream, _ticket) = proxy.into_parts();
@@ -397,9 +387,7 @@ mod tests {
         let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
         wait_for(&runtime.control_socket().with_extension("state")).await;
         let mut verified = master.verify().await.unwrap();
-        let inventory = verified.fetch_inventory().await.unwrap();
-        let running = inventory.running_vm(VmId::new(107).unwrap()).unwrap();
-        let proxy = TrustedSshProxy::connect(&mut verified, running)
+        let proxy = TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap())
             .await
             .unwrap();
         let (mut stream, _ticket) = proxy.into_parts();
@@ -435,9 +423,7 @@ mod tests {
         let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
         wait_for(&runtime.control_socket().with_extension("state")).await;
         let mut verified = master.verify().await.unwrap();
-        let inventory = verified.fetch_inventory().await.unwrap();
-        let running = inventory.running_vm(VmId::new(107).unwrap()).unwrap();
-        let proxy = TrustedSshProxy::connect(&mut verified, running)
+        let proxy = TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap())
             .await
             .unwrap();
         let (stream, _ticket) = proxy.into_parts();
@@ -457,7 +443,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn stale_stopped_template_arbitrary_and_wrong_master_proofs_never_spawn_proxy() {
+    async fn connect_refetches_and_rejects_stopped_template_and_missing_vm_before_ticket_or_spawn()
+    {
         let _process_guard = crate::ssh::process_test_guard().await;
         let runtime = RuntimeDir::create().unwrap();
         let (_fixture_directory, executable) = fake_ssh();
@@ -467,55 +454,80 @@ mod tests {
         wait_for(&runtime.control_socket().with_extension("state")).await;
         let mut verified = master.verify().await.unwrap();
 
-        let stale = VerifiedInventory::for_test(
-            verified.owner_id(),
-            Instant::now() - Duration::from_secs(31),
-            vec![vm(107, VmStatus::Running, false)],
-        );
+        let payload = runtime.control_socket().with_extension("inventory_payload");
+        let generation_count = ProxyTicket::test_generation_count();
+
+        fs::write(
+            &payload,
+            br#"[{"vmid":107,"name":"SYNTHETIC-107","status":"running","template":0}]"#,
+        )
+        .unwrap();
+        let _caller_snapshot = verified.fetch_inventory().await.unwrap();
+        fs::write(
+            &payload,
+            br#"[{"vmid":107,"name":"SYNTHETIC-107","status":"stopped","template":0}]"#,
+        )
+        .unwrap();
         assert!(matches!(
-            stale.running_vm(VmId::new(107).unwrap()),
-            Err(ProxyOpenError::InventoryStale)
-        ));
-        let stopped = VerifiedInventory::for_test(
-            verified.owner_id(),
-            Instant::now(),
-            vec![vm(107, VmStatus::Stopped, false)],
-        );
-        assert!(matches!(
-            stopped.running_vm(VmId::new(107).unwrap()),
+            TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap()).await,
             Err(ProxyOpenError::VmNotRunning)
         ));
-        let template = VerifiedInventory::for_test(
-            verified.owner_id(),
-            Instant::now(),
-            vec![vm(107, VmStatus::Running, true)],
-        );
+
+        fs::write(
+            &payload,
+            br#"[{"vmid":107,"name":"SYNTHETIC-107","status":"running","template":1}]"#,
+        )
+        .unwrap();
         assert!(matches!(
-            template.running_vm(VmId::new(107).unwrap()),
-            Err(ProxyOpenError::VmTemplate)
-        ));
-        let live = VerifiedInventory::for_test(
-            verified.owner_id(),
-            Instant::now(),
-            vec![vm(107, VmStatus::Running, false)],
-        );
-        assert!(matches!(
-            live.running_vm(VmId::new(999).unwrap()),
+            TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap()).await,
             Err(ProxyOpenError::VmNotFound)
         ));
-        let wrong_master = VerifiedInventory::for_test(
-            verified.owner_id().wrapping_add(1),
-            Instant::now(),
-            vec![vm(107, VmStatus::Running, false)],
-        );
-        let running = wrong_master.running_vm(VmId::new(107).unwrap()).unwrap();
+
+        fs::write(
+            &payload,
+            br#"[{"vmid":205,"name":"SYNTHETIC-205","status":"running","template":0}]"#,
+        )
+        .unwrap();
         assert!(matches!(
-            TrustedSshProxy::connect(&mut verified, running).await,
-            Err(ProxyOpenError::WrongMaster)
+            TrustedSshProxy::connect(&mut verified, VmId::new(999).unwrap()).await,
+            Err(ProxyOpenError::VmNotFound)
         ));
 
+        assert_eq!(ProxyTicket::test_generation_count(), generation_count);
+
         let argv = fs::read_to_string(runtime.control_socket().with_extension("argv")).unwrap();
-        assert!(!argv.contains("qm vncproxy"));
+        assert!(!argv.contains("exec /usr/sbin/qm vncproxy"));
+        assert!(!runtime
+            .control_socket()
+            .with_extension("proxy.pid")
+            .exists());
+
+        master.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_rechecks_master_before_inventory_ticket_and_proxy_spawn() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&runtime.control_socket().with_extension("state")).await;
+        let mut verified = master.verify().await.unwrap();
+        fs::remove_file(runtime.control_socket().with_extension("state")).unwrap();
+        let generation_count = ProxyTicket::test_generation_count();
+
+        assert!(matches!(
+            TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap()).await,
+            Err(ProxyOpenError::Master(_))
+        ));
+        assert_eq!(ProxyTicket::test_generation_count(), generation_count);
+
+        let argv = fs::read_to_string(runtime.control_socket().with_extension("argv")).unwrap();
+        assert!(!argv.contains("pvesh get"));
+        assert!(!argv.contains("exec /usr/sbin/qm vncproxy"));
         assert!(!runtime
             .control_socket()
             .with_extension("proxy.pid")

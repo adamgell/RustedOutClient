@@ -1,9 +1,4 @@
-use std::{
-    io,
-    process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use std::{io, process::Stdio, time::Duration};
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -19,8 +14,8 @@ use tokio::{
 use crate::model::PveProfile;
 
 use super::{
-    classify_stderr, CommandSpec, InventoryClient, InventoryError, SshCommandFactory, SshFailure,
-    VerifiedInventory,
+    classify_stderr, CommandSpec, InventoryClient, InventoryError, InventorySnapshot,
+    SshCommandFactory, SshFailure,
 };
 
 const MAX_CAPTURED_STDERR_BYTES: usize = 65_536;
@@ -28,7 +23,6 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
-static NEXT_MASTER_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct ControlPolicy {
@@ -110,7 +104,6 @@ pub struct SshMaster {
     profile: PveProfile,
     child: Option<Child>,
     stderr_task: Option<JoinHandle<io::Result<Vec<u8>>>>,
-    owner_id: u64,
 }
 
 /// Proof that this exact owned master completed a successful control check.
@@ -197,7 +190,6 @@ impl SshMaster {
             profile,
             child: Some(child),
             stderr_task,
-            owner_id: NEXT_MASTER_OWNER_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -317,12 +309,8 @@ impl SshMaster {
 }
 
 impl VerifiedSshMaster<'_> {
-    pub async fn fetch_inventory(&mut self) -> Result<VerifiedInventory, InventoryError> {
-        let snapshot = InventoryClient::fetch(&self.master.factory, &self.master.profile).await?;
-        Ok(VerifiedInventory::from_live_fetch(
-            self.master.owner_id,
-            snapshot,
-        ))
+    pub async fn fetch_inventory(&mut self) -> Result<InventorySnapshot, InventoryError> {
+        InventoryClient::fetch(&self.master.factory, &self.master.profile).await
     }
 
     pub(super) async fn recheck(&mut self) -> Result<(), SshMasterError> {
@@ -338,10 +326,6 @@ impl VerifiedSshMaster<'_> {
             .factory
             .proxy(&self.master.profile, vmid, ticket)
             .unwrap()
-    }
-
-    pub(super) fn owner_id(&self) -> u64 {
-        self.master.owner_id
     }
 }
 

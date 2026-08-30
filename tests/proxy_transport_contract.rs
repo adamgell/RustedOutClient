@@ -42,7 +42,7 @@ fn only_proxy_has_one_sendenv_and_the_fixed_single_remote_argument() {
             .count(),
         1
     );
-    assert_eq!(proxy.args.last().unwrap(), "qm vncproxy 107");
+    assert_eq!(proxy.args.last().unwrap(), "exec /usr/sbin/qm vncproxy 107");
     assert_eq!(proxy.environment_variable_count(), 1);
 
     for spec in [

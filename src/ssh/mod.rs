@@ -13,9 +13,7 @@ pub use inventory::{
     VmStatus,
 };
 pub use master::{SshMaster, SshMasterError, VerifiedSshMaster};
-pub use proxy::{
-    ProxyOpenError, ProxyTicket, TrustedSshProxy, VerifiedInventory, VerifiedRunningVm,
-};
+pub use proxy::{ProxyOpenError, ProxyTicket, TrustedSshProxy};
 pub use stream::{ProxyStream, ProxyStreamError};
 
 #[cfg(test)]

@@ -39,7 +39,10 @@ impl CommandSpec {
     }
 
     /// Builds an OpenSSH process directly from separate program, argument, and
-    /// environment values. It never invokes a command interpreter.
+    /// environment values. It removes any inherited proxy ticket before
+    /// applying this spec's approved environment and never invokes a command
+    /// interpreter. The standard process builder necessarily owns an internal
+    /// OS-string copy of explicit environment values until spawn or drop.
     ///
     /// Task 4 consumes this crate-private execution boundary when it owns the
     /// child lifecycle.
@@ -47,6 +50,7 @@ impl CommandSpec {
     pub(crate) fn to_command(&self) -> Command {
         let mut command = Command::new(&self.program);
         command.args(&self.args);
+        command.env_remove("LC_PVE_TICKET");
         for (key, value) in &self.env {
             command.env(key, value.expose_secret());
         }
@@ -115,8 +119,10 @@ impl SshCommandFactory {
         ]);
         self.with_control_socket(&mut spec);
         self.with_target(&mut spec, profile);
-        spec.args
-            .push(OsString::from(format!("qm vncproxy {}", vmid.get())));
+        spec.args.push(OsString::from(format!(
+            "exec /usr/sbin/qm vncproxy {}",
+            vmid.get()
+        )));
         spec.env.push((
             OsString::from("LC_PVE_TICKET"),
             SecretString::from(ticket.expose_for_auth()),
@@ -209,7 +215,27 @@ mod tests {
                 .map(OsString::as_os_str)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(command.get_envs().count(), 0);
+        let environments = command.get_envs().collect::<Vec<_>>();
+        assert_eq!(environments.len(), 1);
+        assert_eq!(environments[0].0, "LC_PVE_TICKET");
+        assert!(environments[0].1.is_none());
+    }
+
+    #[test]
+    fn proxy_replaces_the_inherited_ticket_with_exactly_one_explicit_value() {
+        let ticket = ProxyTicket::generate();
+        let spec = SshCommandFactory::new(PathBuf::from(SOCKET))
+            .proxy(&fixture_profile(), VmId::new(107).unwrap(), &ticket)
+            .unwrap();
+        let command = spec.to_command();
+        let ticket_entries = command
+            .get_envs()
+            .filter(|(key, _)| *key == "LC_PVE_TICKET")
+            .collect::<Vec<_>>();
+
+        assert_eq!(ticket_entries.len(), 1);
+        assert!(ticket_entries[0].1.is_some());
+        assert_eq!(spec.environment_variable_count(), 1);
     }
 
     #[test]

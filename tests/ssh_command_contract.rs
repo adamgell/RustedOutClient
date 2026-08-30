@@ -112,7 +112,7 @@ fn every_operation_has_exact_strict_shell_free_argv() {
         "-S",
         SOCKET,
         TARGET,
-        "qm vncproxy 107",
+        "exec /usr/sbin/qm vncproxy 107",
     ]);
     assert_eq!(proxy.program, PathBuf::from("/usr/bin/ssh"));
     assert!(proxy.capture_stderr);
@@ -135,7 +135,7 @@ fn inventory_and_proxy_keep_the_allowlisted_remote_commands_as_single_arguments(
     let proxy = factory
         .proxy(&profile, VmId::new(107).unwrap(), &ticket)
         .unwrap();
-    assert_eq!(proxy.args.last().unwrap(), "qm vncproxy 107");
+    assert_eq!(proxy.args.last().unwrap(), "exec /usr/sbin/qm vncproxy 107");
     assert_eq!(
         proxy
             .args

@@ -16,13 +16,17 @@ for argument in "$@"; do
         master=true
     fi
     case "$argument" in
-        "qm vncproxy "*) proxy=true ;;
+        "exec /usr/sbin/qm vncproxy "*) proxy=true ;;
     esac
     previous=$argument
 done
 
 if [ -z "$socket" ]; then
     exit 70
+fi
+
+if [ "$proxy" != true ] && [ "${LC_PVE_TICKET+x}" = x ]; then
+    exit 73
 fi
 
 {
@@ -86,10 +90,20 @@ if [ "$proxy" = true ]; then
     printf '%s\n' "$$" > "${socket}.proxy.pid"
     : > "${socket}.proxy.env-valid"
     printf 'RFB 003.008\n'
+    if [ -f "${socket}.proxy_eof_live" ]; then
+        exec 1>&-
+        while :; do
+            sleep 0.05
+        done
+    fi
     if [ -f "${socket}.proxy_large_stderr" ]; then
         awk 'BEGIN { for (i = 0; i < 100; i++) printf "%01024d", 0 }' >&2
     fi
     dd bs=1 count=1 of=/dev/null 2>/dev/null || true
+    if [ -f "${socket}.proxy_auth_failure" ]; then
+        printf '%s\n' 'synthetic@pve.example.invalid: Permission denied (publickey).' >&2
+        exit 255
+    fi
     if [ -f "${socket}.hang_proxy" ]; then
         while :; do
             sleep 0.05
