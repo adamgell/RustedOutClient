@@ -1,6 +1,5 @@
 /// RFB pixel format as negotiated during ServerInit.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct PixelFormat {
     pub bits_per_pixel: u8,
     pub depth: u8,
@@ -24,8 +23,6 @@ impl PixelFormat {
     }
 }
 
-/// RFB encoding type constants (full spec set; some reserved for future encodings).
-#[allow(dead_code)]
 pub mod encoding {
     pub const RAW: i32 = 0;
     pub const COPY_RECT: i32 = 1;
@@ -37,8 +34,6 @@ pub mod encoding {
     pub const DESKTOP_SIZE: i32 = -223;
 }
 
-/// Client → Server message type bytes.
-#[allow(dead_code)]
 pub mod client_msg {
     pub const SET_PIXEL_FORMAT: u8 = 0;
     pub const SET_ENCODINGS: u8 = 2;
@@ -48,7 +43,6 @@ pub mod client_msg {
     pub const CLIENT_CUT_TEXT: u8 = 6;
 }
 
-/// Server → Client message type bytes.
 pub mod server_msg {
     pub const FB_UPDATE: u8 = 0;
     pub const SET_COLOUR_MAP_ENTRIES: u8 = 1;
@@ -56,8 +50,6 @@ pub mod server_msg {
     pub const SERVER_CUT_TEXT: u8 = 3;
 }
 
-/// A single rectangle in a FramebufferUpdate (available for future use).
-#[allow(dead_code)]
 pub struct Rectangle {
     pub x: u16,
     pub y: u16,

@@ -1,15 +1,10 @@
-use crate::protocol::client::VncClient;
-use crossbeam_channel::{Receiver, Sender};
-use std::thread;
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 
-#[derive(Clone, Debug)]
-pub struct ConnectionParams {
-    pub host: String,
-    pub port: u16,
-    pub password: Option<String>,
-}
+use crate::vnc::RfbError;
 
-/// A single changed rectangle: tightly-packed `w*h*4` RGBA bytes at (x, y).
+pub const VNC_QUEUE_CAPACITY: usize = 256;
+
+/// A single changed rectangle: tightly-packed `w*h*4` RGBA bytes at `(x, y)`.
 pub struct FbRect {
     pub x: u32,
     pub y: u32,
@@ -18,87 +13,73 @@ pub struct FbRect {
     pub rgba: Vec<u8>,
 }
 
-/// Messages sent from the VNC background thread to the UI thread.
+/// Messages sent from the VNC task to the UI.
 pub enum VncEvent {
     DesktopSize(u32, u32),
-    /// Only the rectangles that changed this update — applied as partial
-    /// texture updates so we never re-upload the whole framebuffer.
     FramebufferRects(Vec<FbRect>),
     DesktopName(String),
-    /// Server sent clipboard text.
     ClipboardText(String),
-    /// Server requires VNC authentication — UI should prompt for password.
-    NeedPassword,
-    Error(String),
+    Error(RfbError),
     Disconnected,
 }
 
-/// Commands sent from the UI thread to the VNC background thread.
+/// Commands sent from the UI to the VNC task.
 pub enum VncCommand {
-    KeyEvent {
-        down: bool,
-        keysym: u32,
-    },
-    PointerEvent {
-        buttons: u8,
-        x: u16,
-        y: u16,
-    },
-    /// Send clipboard text to the server.
+    KeyEvent { down: bool, keysym: u32 },
+    PointerEvent { buttons: u8, x: u16, y: u16 },
     SetClipboard(String),
-    /// Response to NeedPassword: provide the password to the waiting auth step.
-    ProvidePassword(String),
     Disconnect,
 }
 
+/// UI-owned ends of one bounded VNC session's queues.
 pub struct VncConnection {
     pub event_rx: Receiver<VncEvent>,
-    pub cmd_tx: Sender<VncCommand>,
+    pub command_tx: Sender<VncCommand>,
+}
+
+/// Runtime-owned ends passed to [`crate::vnc::VncClient::run`].
+pub struct VncSessionChannels {
+    pub event_tx: Sender<VncEvent>,
+    pub command_rx: Receiver<VncCommand>,
+}
+
+/// Creates the only supported command/event queue shape.
+pub fn bounded_vnc_channels() -> (VncConnection, VncSessionChannels) {
+    let (event_tx, event_rx) = crossbeam_channel::bounded(VNC_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = crossbeam_channel::bounded(VNC_QUEUE_CAPACITY);
+    (
+        VncConnection {
+            event_rx,
+            command_tx,
+        },
+        VncSessionChannels {
+            event_tx,
+            command_rx,
+        },
+    )
 }
 
 impl VncConnection {
-    pub fn connect(params: ConnectionParams) -> Self {
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<VncEvent>();
-        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<VncCommand>();
-
-        thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-
-            rt.block_on(async {
-                match VncClient::connect(&params, event_tx.clone(), cmd_rx).await {
-                    Ok(()) => {
-                        let _ = event_tx.send(VncEvent::Disconnected);
-                    }
-                    Err(e) => {
-                        let _ = event_tx.send(VncEvent::Error(e.to_string()));
-                    }
-                }
-            });
-        });
-
-        Self { event_rx, cmd_tx }
+    pub fn send_key(&self, down: bool, keysym: u32) -> Result<(), TrySendError<VncCommand>> {
+        self.command_tx
+            .try_send(VncCommand::KeyEvent { down, keysym })
     }
 
-    pub fn send_key(&self, down: bool, keysym: u32) {
-        let _ = self.cmd_tx.send(VncCommand::KeyEvent { down, keysym });
+    pub fn send_pointer(
+        &self,
+        buttons: u8,
+        x: u16,
+        y: u16,
+    ) -> Result<(), TrySendError<VncCommand>> {
+        self.command_tx
+            .try_send(VncCommand::PointerEvent { buttons, x, y })
     }
 
-    pub fn send_pointer(&self, buttons: u8, x: u16, y: u16) {
-        let _ = self.cmd_tx.send(VncCommand::PointerEvent { buttons, x, y });
+    pub fn send_clipboard(&self, text: String) -> Result<(), TrySendError<VncCommand>> {
+        self.command_tx.try_send(VncCommand::SetClipboard(text))
     }
 
-    pub fn send_clipboard(&self, text: String) {
-        let _ = self.cmd_tx.send(VncCommand::SetClipboard(text));
-    }
-
-    pub fn provide_password(&self, pw: String) {
-        let _ = self.cmd_tx.send(VncCommand::ProvidePassword(pw));
-    }
-
-    pub fn disconnect(&self) {
-        let _ = self.cmd_tx.send(VncCommand::Disconnect);
+    pub fn disconnect(&self) -> Result<(), TrySendError<VncCommand>> {
+        self.command_tx.try_send(VncCommand::Disconnect)
     }
 }

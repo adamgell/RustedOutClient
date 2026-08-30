@@ -1,5 +1,5 @@
 use crate::framebuffer::Framebuffer;
-use crate::protocol::messages::PixelFormat;
+use crate::vnc::messages::PixelFormat;
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncReadExt};
 

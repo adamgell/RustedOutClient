@@ -3,7 +3,7 @@
 /// Uses up to 4 independent stateful zlib streams.
 use crate::framebuffer::Framebuffer;
 use crate::protocol::encoding::raw::read_pixel;
-use crate::protocol::messages::PixelFormat;
+use crate::vnc::messages::PixelFormat;
 use anyhow::{bail, Result};
 use flate2::{Decompress, FlushDecompress};
 use tokio::io::{AsyncRead, AsyncReadExt};

@@ -7,6 +7,7 @@ pub mod config;
 pub mod connection;
 pub mod framebuffer;
 pub mod model;
-pub mod protocol;
+mod protocol;
 pub mod runtime;
 pub mod ssh;
+pub mod vnc;

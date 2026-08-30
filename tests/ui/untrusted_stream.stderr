@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/ui/untrusted_stream.rs:10:9
+   |
+ 9 |     let _ = VncClient::run(
+   |             -------------- arguments to this function are incorrect
+10 |         stream,
+   |         ^^^^^^ expected `TrustedSshProxy`, found `ProxyStream`
+   |
+note: associated function defined here
+  --> src/vnc/client.rs
+   |
+   |     pub async fn run(
+   |                  ^^^

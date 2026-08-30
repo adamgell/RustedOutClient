@@ -23,8 +23,9 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 thiserror = "2"
 flate2 = "1"
-des = "0.8"
+des = { version = "0.8", features = ["zeroize"] }
 cipher = "0.4"
+zeroize = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5"
@@ -39,6 +40,9 @@ tempfile = "3"
 rustix = { version = "1.1", features = ["fs"] }
 getrandom = "0.4"
 rand = "0.8.7"
+
+[dev-dependencies]
+trybuild = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
