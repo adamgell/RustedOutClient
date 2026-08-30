@@ -91,10 +91,6 @@ struct Evidence {
     active_sessions: usize,
     master_active: bool,
     saves: usize,
-    exact_owned_processes: usize,
-    exact_owned_tasks: usize,
-    exact_owned_listeners: usize,
-    exact_owned_artifacts: usize,
 }
 
 struct SyntheticSession {
@@ -463,10 +459,6 @@ async fn cache_live_revalidation_reconnect_duplicate_focus_and_two_sessions_are_
     let locked = evidence.lock().unwrap();
     assert_eq!(locked.active_sessions, 0);
     assert!(!locked.master_active);
-    assert_eq!(locked.exact_owned_processes, 0);
-    assert_eq!(locked.exact_owned_tasks, 0);
-    assert_eq!(locked.exact_owned_listeners, 0);
-    assert_eq!(locked.exact_owned_artifacts, 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -626,6 +618,27 @@ async fn dynamic_resolution_acceptance_exceeds_1280_and_preserves_pending_applie
         .lock()
         .unwrap()
         .push_back(SessionTransportEvent::ResizeOutcome(
+            ResizeProtocolOutcome::Rejected,
+        ));
+    let rejected = wait_resize_status(&mut manager, session_id, |status| {
+        status == ResizeStatus::Rejected
+    })
+    .await;
+
+    manager
+        .send(AppCommand::RetryDynamicResolution { session_id })
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_millis(251)).await;
+    wait_resize_status(&mut manager, session_id, |status| {
+        status == ResizeStatus::Requested(large)
+    })
+    .await;
+    control
+        .events
+        .lock()
+        .unwrap()
+        .push_back(SessionTransportEvent::ResizeOutcome(
             ResizeProtocolOutcome::Unsupported,
         ));
     let unsupported = wait_resize_status(&mut manager, session_id, |status| {
@@ -655,50 +668,22 @@ async fn dynamic_resolution_acceptance_exceeds_1280_and_preserves_pending_applie
     .await;
 
     let mut state = AppState::from_config(&config());
-    state.apply(AppEvent::SessionChanged(unsupported)).unwrap();
-    state.apply(AppEvent::SessionChanged(timed_out)).unwrap();
     let mut clipboard = NoClipboard;
-    assert_eq!(
-        dispatch_action(&mut state, &NoSink, &mut clipboard, UiAction::FitToWindow),
-        DispatchOutcome::AppliedLocally
-    );
-    assert_eq!(state.selected_session().unwrap().scale_mode, ScaleMode::Fit);
+    for snapshot in [rejected, unsupported, timed_out] {
+        assert_eq!(snapshot.phase, SessionPhase::Ready);
+        state.apply(AppEvent::SessionChanged(snapshot)).unwrap();
+        assert_eq!(
+            dispatch_action(&mut state, &NoSink, &mut clipboard, UiAction::FitToWindow),
+            DispatchOutcome::AppliedLocally
+        );
+        assert_eq!(state.selected_session().unwrap().scale_mode, ScaleMode::Fit);
+        assert_eq!(
+            state.selected_session().unwrap().snapshot.phase,
+            SessionPhase::Ready
+        );
+    }
 
     close_disconnected(&mut manager, session_id).await;
     manager.shutdown().await.unwrap();
     assert_eq!(evidence.lock().unwrap().active_sessions, 0);
-}
-
-#[tokio::test]
-async fn ten_connect_disconnect_cycles_leave_zero_exact_owned_residue() {
-    let (backend, evidence) = SyntheticBackend::new(
-        None,
-        [snapshot(2, false, ["LIVE-107", "LIVE-205", "LIVE-301"])],
-    );
-    let mut manager = SessionManager::spawn(config(), backend);
-    recv_matching(&mut manager, |event| {
-        matches!(event, AppEvent::LiveInventory(_))
-    })
-    .await;
-
-    for cycle in 0..10 {
-        let session_id = open_ready(&mut manager, vmid(107)).await;
-        close_disconnected(&mut manager, session_id).await;
-        let locked = evidence.lock().unwrap();
-        assert_eq!(
-            locked.active_sessions, 0,
-            "cycle {cycle} retained a session owner"
-        );
-        assert_eq!(locked.exact_owned_processes, 0, "cycle {cycle}");
-        assert_eq!(locked.exact_owned_tasks, 0, "cycle {cycle}");
-        assert_eq!(locked.exact_owned_listeners, 0, "cycle {cycle}");
-        assert_eq!(locked.exact_owned_artifacts, 0, "cycle {cycle}");
-    }
-
-    manager.shutdown().await.unwrap();
-    let locked = evidence.lock().unwrap();
-    assert_eq!(locked.authorization_generations.len(), 10);
-    assert_eq!(locked.revalidations.len(), 10);
-    assert_eq!(locked.active_sessions, 0);
-    assert!(!locked.master_active);
 }

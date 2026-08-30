@@ -341,7 +341,16 @@ impl ProbeReport {
         if rects.is_empty() || rects.len() > usize::from(limits.max_rectangles) {
             return Err(PublicError::new(PublicErrorKind::RfbLimit));
         }
-        let mut non_black_pixels = 0_u64;
+        let framebuffer_pixels = u64::from(size.width)
+            .checked_mul(u64::from(size.height))
+            .and_then(|pixels| usize::try_from(pixels).ok())
+            .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))?;
+        let mut final_non_black = Vec::new();
+        final_non_black
+            .try_reserve_exact(framebuffer_pixels)
+            .map_err(|_| PublicError::new(PublicErrorKind::RfbLimit))?;
+        final_non_black.resize(framebuffer_pixels, 0_u8);
+        let framebuffer_width = usize::from(size.width);
         for rect in rects {
             let right = rect
                 .x
@@ -368,15 +377,57 @@ impl ProbeReport {
             {
                 return Err(PublicError::new(PublicErrorKind::RfbLimit));
             }
-            let count = rect
-                .rgba
-                .chunks_exact(4)
-                .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
-                .count();
-            non_black_pixels = non_black_pixels
-                .checked_add(u64::try_from(count).unwrap_or(u64::MAX))
-                .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))?;
+            let rect_width =
+                usize::try_from(rect.w).map_err(|_| PublicError::new(PublicErrorKind::RfbLimit))?;
+            let rect_x =
+                usize::try_from(rect.x).map_err(|_| PublicError::new(PublicErrorKind::RfbLimit))?;
+            for row in 0..rect.h {
+                let framebuffer_y = rect
+                    .y
+                    .checked_add(row)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))?;
+                let destination = framebuffer_y
+                    .checked_mul(framebuffer_width)
+                    .and_then(|offset| offset.checked_add(rect_x))
+                    .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))?;
+                let source = usize::try_from(row)
+                    .ok()
+                    .and_then(|row| row.checked_mul(rect_width))
+                    .and_then(|offset| offset.checked_mul(4))
+                    .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))?;
+                for column in 0..rect_width {
+                    let pixel_offset = source
+                        .checked_add(
+                            column
+                                .checked_mul(4)
+                                .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))?,
+                        )
+                        .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))?;
+                    let pixel_end = pixel_offset
+                        .checked_add(4)
+                        .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))?;
+                    let pixel = rect
+                        .rgba
+                        .get(pixel_offset..pixel_end)
+                        .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))?;
+                    let coordinate = destination
+                        .checked_add(column)
+                        .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))?;
+                    *final_non_black
+                        .get_mut(coordinate)
+                        .ok_or_else(|| PublicError::new(PublicErrorKind::RfbLimit))? =
+                        u8::from(pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0);
+                }
+            }
         }
+        let non_black_pixels = u64::try_from(
+            final_non_black
+                .into_iter()
+                .filter(|non_black| *non_black != 0)
+                .count(),
+        )
+        .map_err(|_| PublicError::new(PublicErrorKind::RfbLimit))?;
         Ok(Self {
             vmid: vmid.get(),
             first_frame_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
@@ -420,5 +471,32 @@ impl ProbeReport {
             self.non_black_pixels,
             result
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiagnosticFailure, DiagnosticRecord};
+    use crate::{
+        model::{NodeName, VmId},
+        session::{PublicError, PublicErrorKind},
+    };
+
+    #[test]
+    fn internal_diagnostic_conversion_preserves_cleanup_failure_truth() {
+        let failure = DiagnosticFailure::from_public(
+            PublicError::new(PublicErrorKind::Inventory).with_cleanup_failure(),
+        );
+        let record = DiagnosticRecord::new(
+            "Synthetic profile".to_owned(),
+            NodeName::parse("pve2").unwrap(),
+            Some(VmId::new(107).unwrap()),
+            Vec::new(),
+            None,
+            Some(failure),
+        );
+        let json: serde_json::Value = serde_json::from_str(&record.to_json().unwrap()).unwrap();
+        assert_eq!(json["error_category"], "inventory");
+        assert_eq!(json["cleanup_failed"], true);
     }
 }

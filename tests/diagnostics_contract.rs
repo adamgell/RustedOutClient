@@ -62,8 +62,7 @@ fn diagnostic_json_is_an_exact_typed_allowlist_and_never_accepts_raw_failure_mat
         host_fingerprint: "SHA256:synthetic-host-fingerprint",
         vm_name: "VM-NAME-SENTINEL",
         public: PublicError::new(PublicErrorKind::RfbProtocol)
-            .with_public_context(session_id, vmid(107))
-            .with_cleanup_failure(),
+            .with_public_context(session_id, vmid(107)),
     };
     let phases = vec![
         PhaseTiming::new(SessionPhase::Opening, Duration::from_millis(7)),
@@ -110,7 +109,7 @@ fn diagnostic_json_is_an_exact_typed_allowlist_and_never_accepts_raw_failure_mat
     assert_eq!(json["vmid"], 107);
     assert_eq!(json["child_exit_status"], 23);
     assert_eq!(json["error_category"], "rfb_protocol");
-    assert_eq!(json["cleanup_failed"], true);
+    assert_eq!(json["cleanup_failed"], false);
     assert_eq!(
         json["phases"],
         serde_json::json!([
@@ -212,6 +211,106 @@ fn probe_json_has_exact_keys_counts_rgb_only_and_has_safe_typed_failure_output()
     }
 }
 
+fn probe_non_black_pixels(rects: &[FbRect], size: DesktopSize) -> u64 {
+    let report = ProbeReport::from_frame(vmid(107), Duration::from_millis(1), size, rects)
+        .expect("synthetic framebuffer geometry should be valid");
+    serde_json::from_str::<serde_json::Value>(&report.to_json().unwrap()).unwrap()
+        ["non_black_pixels"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn probe_counts_distinct_final_pixels_with_last_write_wins() {
+    let size = DesktopSize::new(3, 2);
+    let overlapping_non_black = [
+        FbRect {
+            x: 1,
+            y: 1,
+            w: 1,
+            h: 1,
+            rgba: vec![1, 2, 3, 255],
+        },
+        FbRect {
+            x: 1,
+            y: 1,
+            w: 1,
+            h: 1,
+            rgba: vec![4, 5, 6, 255],
+        },
+    ];
+    assert_eq!(probe_non_black_pixels(&overlapping_non_black, size), 1);
+
+    let overwritten_with_black = [
+        FbRect {
+            x: 1,
+            y: 0,
+            w: 2,
+            h: 1,
+            rgba: vec![7, 8, 9, 255, 10, 11, 12, 255],
+        },
+        FbRect {
+            x: 2,
+            y: 0,
+            w: 1,
+            h: 1,
+            rgba: vec![0, 0, 0, 255],
+        },
+    ];
+    assert_eq!(probe_non_black_pixels(&overwritten_with_black, size), 1);
+
+    let partial = [FbRect {
+        x: 1,
+        y: 1,
+        w: 2,
+        h: 1,
+        rgba: vec![0, 0, 0, 255, 13, 14, 15, 0],
+    }];
+    assert_eq!(probe_non_black_pixels(&partial, size), 1);
+}
+
+#[test]
+fn probe_rejects_out_of_bounds_and_overflowing_rectangle_geometry() {
+    for rect in [
+        FbRect {
+            x: 2,
+            y: 0,
+            w: 2,
+            h: 1,
+            rgba: vec![0; 8],
+        },
+        FbRect {
+            x: u32::MAX,
+            y: 0,
+            w: 2,
+            h: 1,
+            rgba: vec![0; 8],
+        },
+        FbRect {
+            x: 0,
+            y: u32::MAX,
+            w: 1,
+            h: 2,
+            rgba: vec![0; 8],
+        },
+    ] {
+        let error = ProbeReport::from_frame(
+            vmid(107),
+            Duration::from_millis(1),
+            DesktopSize::new(3, 2),
+            &[rect],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), PublicErrorKind::RfbLimit);
+    }
+}
+
+#[test]
+fn cleanup_failure_mutator_is_not_public_api() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui/public_cleanup_mutator.rs");
+}
+
 #[derive(Default)]
 struct RecordingClipboard {
     writes: Vec<String>,
@@ -237,7 +336,7 @@ impl AppCommandSink for NoCommands {
 }
 
 #[test]
-fn gui_text_and_copy_use_the_same_typed_record_with_ordered_phase_and_cleanup_truth() {
+fn gui_text_and_copy_use_the_same_typed_record_with_ordered_phase_and_failure_truth() {
     let mut state = AppState::from_config(&AppConfig::new(profile()));
     state
         .apply(AppEvent::LiveInventory(InventorySnapshot::new(
@@ -282,9 +381,7 @@ fn gui_text_and_copy_use_the_same_typed_record_with_ordered_phase_and_cleanup_tr
         .unwrap();
     state
         .apply(AppEvent::Error(
-            PublicError::new(PublicErrorKind::Decoder)
-                .with_public_context(session_id, vmid(107))
-                .with_cleanup_failure(),
+            PublicError::new(PublicErrorKind::Decoder).with_public_context(session_id, vmid(107)),
         ))
         .unwrap();
 
@@ -295,7 +392,7 @@ fn gui_text_and_copy_use_the_same_typed_record_with_ordered_phase_and_cleanup_tr
     assert!(rendered.contains("starting_proxy: 5 ms"));
     assert!(rendered.contains("Child exit status: 9"));
     assert!(rendered.contains("Error category: decoder"));
-    assert!(rendered.contains("Cleanup failure: true"));
+    assert!(rendered.contains("Cleanup failure: false"));
     assert!(!rendered.contains("VM-NAME-SENTINEL"));
     assert!(!rendered.contains("64x64"));
 

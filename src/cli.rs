@@ -1,7 +1,7 @@
 use std::{future::Future, io::Write, path::Path, pin::Pin, time::Duration};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use tokio::time::{sleep_until, timeout_at, Instant};
+use tokio::time::{timeout_at, Instant};
 
 use crate::{
     config::{default_config_path, load_config_from_path},
@@ -16,6 +16,9 @@ use crate::{
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PROBE_TIMEOUT_SECONDS: u64 = 30;
+const MIN_PROBE_TIMEOUT_SECONDS: u64 = 1;
+const MAX_PROBE_TIMEOUT_SECONDS: u64 = 300;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,14 +38,24 @@ pub enum Command {
         selector: String,
         #[arg(long)]
         fullscreen: bool,
-        #[arg(long)]
-        view_only: bool,
+        #[arg(
+            long,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_parser = parse_view_only_presence
+        )]
+        view_only: Option<bool>,
         #[arg(long, value_enum, default_value_t = ViewerMode::Native)]
         viewer: ViewerMode,
     },
     Probe {
         selector: String,
-        #[arg(long, default_value_t = 30)]
+        #[arg(
+            long,
+            default_value_t = DEFAULT_PROBE_TIMEOUT_SECONDS,
+            value_parser = parse_probe_timeout_seconds
+        )]
         timeout_seconds: u64,
         #[arg(long)]
         json: bool,
@@ -79,7 +92,7 @@ pub enum ViewerMode {
 pub struct StartupRequest {
     selector: String,
     fullscreen: bool,
-    view_only: bool,
+    view_only: Option<bool>,
     viewer: ViewerMode,
 }
 
@@ -92,12 +105,31 @@ impl StartupRequest {
         self.fullscreen
     }
 
-    pub fn view_only(&self) -> bool {
+    pub fn view_only(&self) -> Option<bool> {
         self.view_only
     }
 
     pub fn viewer(&self) -> ViewerMode {
         self.viewer
+    }
+}
+
+fn parse_probe_timeout_seconds(value: &str) -> Result<u64, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "timeout must be an integer number of seconds".to_owned())?;
+    if !(MIN_PROBE_TIMEOUT_SECONDS..=MAX_PROBE_TIMEOUT_SECONDS).contains(&seconds) {
+        return Err(format!(
+            "timeout must be between {MIN_PROBE_TIMEOUT_SECONDS} and {MAX_PROBE_TIMEOUT_SECONDS} seconds"
+        ));
+    }
+    Ok(seconds)
+}
+
+fn parse_view_only_presence(value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        _ => Err("--view-only is a presence-only flag".to_owned()),
     }
 }
 
@@ -223,22 +255,24 @@ where
     R: CliRuntime,
     W: Write,
 {
-    let deadline = Instant::now() + LIST_TIMEOUT;
-    let operation = wait_for_live_inventory(&mut runtime, deadline)
-        .await
-        .and_then(|snapshot| {
-            for item in snapshot.vms {
-                let status = match item.status {
-                    VmStatus::Running => "running",
-                    VmStatus::Stopped => "stopped",
-                };
-                writeln!(output, "{}\t{status}\t{}", item.vmid, item.name)
-                    .map_err(|_| PublicError::new(PublicErrorKind::Queue))?;
-            }
-            Ok(())
-        });
+    let operation = match checked_deadline(Instant::now(), LIST_TIMEOUT) {
+        Some(deadline) => wait_for_live_inventory(&mut runtime, deadline)
+            .await
+            .and_then(|snapshot| {
+                for item in snapshot.vms {
+                    let status = match item.status {
+                        VmStatus::Running => "running",
+                        VmStatus::Stopped => "stopped",
+                    };
+                    writeln!(output, "{}\t{status}\t{}", item.vmid, item.name)
+                        .map_err(|_| PublicError::new(PublicErrorKind::Queue))?;
+                }
+                Ok(())
+            }),
+        None => Err(PublicError::new(PublicErrorKind::Queue)),
+    };
     let cleanup = runtime.shutdown().await;
-    match operation.and(cleanup) {
+    match compose_operation_cleanup(operation, cleanup) {
         Ok(()) => CliExit::ok(),
         Err(error) => CliExit::failed(error),
     }
@@ -256,10 +290,7 @@ where
             Ok(Some(AppEvent::LiveInventory(snapshot))) => return Ok(snapshot),
             Ok(Some(AppEvent::Error(error))) => return Err(error),
             Ok(Some(_)) => {}
-            Ok(None) => {
-                sleep_until(deadline).await;
-                return Err(PublicError::new(PublicErrorKind::Queue));
-            }
+            Ok(None) => return Err(PublicError::new(PublicErrorKind::Queue)),
             Err(_) => return Err(PublicError::new(PublicErrorKind::Queue)),
         }
     }
@@ -282,8 +313,11 @@ where
     W: Write,
 {
     let timeout_duration = Duration::from_secs(timeout_seconds);
-    let selection_deadline = Instant::now() + timeout_duration;
-    let selection = wait_for_live_inventory_for_probe(&mut runtime, selection_deadline).await;
+    let selection_deadline = checked_deadline(Instant::now(), timeout_duration);
+    let selection = match selection_deadline {
+        Some(deadline) => wait_for_live_inventory_for_probe(&mut runtime, deadline).await,
+        None => Err(ProbeResult::Queue),
+    };
     let (selected, mut observation) = match selection {
         Ok(snapshot) => match select_running(&snapshot, selector) {
             Ok(selected) => (
@@ -351,10 +385,7 @@ where
             Ok(Some(AppEvent::LiveInventory(snapshot))) => return Ok(snapshot),
             Ok(Some(AppEvent::Error(error))) => return Err(error.kind().into()),
             Ok(Some(_)) => {}
-            Ok(None) => {
-                sleep_until(deadline).await;
-                return Err(ProbeResult::Timeout);
-            }
+            Ok(None) => return Err(ProbeResult::Queue),
             Err(_) => return Err(ProbeResult::Timeout),
         }
     }
@@ -379,7 +410,12 @@ where
     R: CliRuntime,
 {
     let started = Instant::now();
-    let deadline = started + timeout_duration;
+    let Some(deadline) = checked_deadline(started, timeout_duration) else {
+        return ProbeObservation {
+            session_id: None,
+            report: Err(ProbeResult::Queue),
+        };
+    };
     if let Err(error) = runtime
         .send(AppCommand::Open {
             vmid: selected,
@@ -399,11 +435,10 @@ where
         let event = match timeout_at(deadline, runtime.recv()).await {
             Ok(Some(event)) => event,
             Ok(None) => {
-                sleep_until(deadline).await;
                 return ProbeObservation {
                     session_id,
-                    report: Err(ProbeResult::Timeout),
-                };
+                    report: Err(ProbeResult::Queue),
+                }
             }
             Err(_) => {
                 return ProbeObservation {
@@ -466,7 +501,8 @@ where
     R: CliRuntime,
 {
     runtime.send(AppCommand::Close { session_id }).await?;
-    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    let deadline = checked_deadline(Instant::now(), CLEANUP_TIMEOUT)
+        .ok_or_else(|| PublicError::new(PublicErrorKind::Cleanup))?;
     loop {
         match timeout_at(deadline, runtime.recv()).await {
             Ok(Some(AppEvent::SessionChanged(snapshot)))
@@ -488,4 +524,32 @@ where
 
 fn report_is_success(report: &ProbeReport) -> bool {
     report.result() == ProbeResult::Success
+}
+
+fn checked_deadline(start: Instant, duration: Duration) -> Option<Instant> {
+    start.checked_add(duration)
+}
+
+fn compose_operation_cleanup<T>(
+    operation: Result<T, PublicError>,
+    cleanup: Result<(), PublicError>,
+) -> Result<T, PublicError> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(_)) => Err(primary.with_cleanup_failure()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_deadline;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn checked_deadline_rejects_unrepresentable_duration() {
+        assert!(checked_deadline(Instant::now(), Duration::MAX).is_none());
+    }
 }

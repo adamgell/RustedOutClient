@@ -6,13 +6,13 @@ use std::{
 
 use assert_cmd::Command as AssertCommand;
 use rustedoutclient::{
-    app::StartupCoordinator,
+    app::{StartupAction, StartupCoordinator},
     cli::{execute_headless, Cli, CliFuture, CliRuntime, Command, ViewerMode},
     connection::{DesktopSize, FbRect},
     model::{NodeName, VmId},
     session::{
-        AppCommand, AppEvent, OpenOptions, PublicError, PublicErrorKind, ResizeStatus, SessionId,
-        SessionPhase, SessionSnapshot,
+        AppCommand, AppEvent, PublicError, PublicErrorKind, ResizeStatus, SessionId, SessionPhase,
+        SessionSnapshot,
     },
     ssh::{InventorySnapshot, VmInventoryItem, VmStatus},
 };
@@ -65,6 +65,7 @@ struct SyntheticRuntime {
     events: VecDeque<AppEvent>,
     evidence: Arc<Mutex<RuntimeEvidence>>,
     shutdown_error: Option<PublicError>,
+    pending_when_empty: bool,
 }
 
 impl SyntheticRuntime {
@@ -75,9 +76,27 @@ impl SyntheticRuntime {
                 events: events.into_iter().collect(),
                 evidence: Arc::clone(&evidence),
                 shutdown_error: None,
+                pending_when_empty: false,
             },
             evidence,
         )
+    }
+
+    fn pending_after(
+        events: impl IntoIterator<Item = AppEvent>,
+    ) -> (Self, Arc<Mutex<RuntimeEvidence>>) {
+        let (mut runtime, evidence) = Self::new(events);
+        runtime.pending_when_empty = true;
+        (runtime, evidence)
+    }
+
+    fn with_shutdown_error(
+        events: impl IntoIterator<Item = AppEvent>,
+        error: PublicError,
+    ) -> (Self, Arc<Mutex<RuntimeEvidence>>) {
+        let (mut runtime, evidence) = Self::new(events);
+        runtime.shutdown_error = Some(error);
+        (runtime, evidence)
     }
 }
 
@@ -94,7 +113,14 @@ impl CliRuntime for SyntheticRuntime {
 
     fn recv(&mut self) -> CliFuture<'_, Option<AppEvent>> {
         let event = self.events.pop_front();
-        Box::pin(async move { event })
+        let pending_when_empty = self.pending_when_empty;
+        Box::pin(async move {
+            match event {
+                Some(event) => Some(event),
+                None if pending_when_empty => std::future::pending().await,
+                None => None,
+            }
+        })
     }
 
     fn shutdown(self) -> CliFuture<'static, Result<(), PublicError>> {
@@ -192,8 +218,9 @@ async fn probe_uses_live_selection_observes_one_frame_closes_exact_session_then_
 
 #[tokio::test(start_paused = true)]
 async fn probe_timeout_is_typed_safe_nonzero_and_still_shuts_down() {
-    let (runtime, evidence) =
-        SyntheticRuntime::new([AppEvent::LiveInventory(inventory(false, VmStatus::Stopped))]);
+    let (runtime, evidence) = SyntheticRuntime::pending_after([AppEvent::LiveInventory(
+        inventory(false, VmStatus::Stopped),
+    )]);
     let mut output = Vec::new();
 
     let exit = execute_headless(
@@ -223,6 +250,148 @@ async fn probe_timeout_is_typed_safe_nonzero_and_still_shuts_down() {
         assert!(!rendered.contains(forbidden));
     }
     assert_eq!(evidence.lock().unwrap().shutdowns, 1);
+}
+
+#[test]
+fn probe_timeout_parser_accepts_only_the_approved_finite_range() {
+    use clap::Parser;
+
+    for accepted in [1_u64, 30, 300] {
+        assert!(Cli::try_parse_from([
+            "rustedoutclient",
+            "probe",
+            "107",
+            "--timeout-seconds",
+            &accepted.to_string(),
+        ])
+        .is_ok());
+    }
+    for rejected in [0_u64, 301, u64::MAX] {
+        assert!(Cli::try_parse_from([
+            "rustedoutclient",
+            "probe",
+            "107",
+            "--timeout-seconds",
+            &rejected.to_string(),
+        ])
+        .is_err());
+    }
+}
+
+#[tokio::test]
+async fn closed_inventory_channel_fails_promptly_and_still_shuts_down() {
+    let (runtime, evidence) = SyntheticRuntime::new([]);
+    let mut output = Vec::new();
+
+    let exit = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        execute_headless(Command::List, runtime, &mut output),
+    )
+    .await
+    .expect("closed inventory channel must not wait for the 30-second deadline");
+
+    assert_eq!(exit.error().unwrap().kind(), PublicErrorKind::Queue);
+    assert_eq!(evidence.lock().unwrap().shutdowns, 1);
+}
+
+#[tokio::test]
+async fn closed_probe_channel_fails_promptly_attempts_exact_close_and_shuts_down() {
+    let session_id = SessionId::new();
+    let (runtime, evidence) = SyntheticRuntime::new([
+        AppEvent::LiveInventory(inventory(false, VmStatus::Stopped)),
+        AppEvent::SessionChanged(snapshot(session_id, SessionPhase::Opening)),
+    ]);
+    let mut output = Vec::new();
+
+    let exit = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        execute_headless(
+            Command::Probe {
+                selector: "107".to_owned(),
+                timeout_seconds: 30,
+                json: true,
+            },
+            runtime,
+            &mut output,
+        ),
+    )
+    .await
+    .expect("closed probe channel must not wait for the 30-second deadline");
+
+    assert!(!exit.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output).unwrap()["result"],
+        "cleanup"
+    );
+    let evidence = evidence.lock().unwrap();
+    assert_eq!(
+        evidence.commands,
+        [CommandFact::Open(vmid(107)), CommandFact::Close(session_id)]
+    );
+    assert_eq!(evidence.shutdowns, 1);
+}
+
+#[tokio::test]
+async fn direct_runtime_timeout_overflow_is_typed_instead_of_panicking() {
+    let (runtime, evidence) = SyntheticRuntime::new([]);
+    let task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        let exit = execute_headless(
+            Command::Probe {
+                selector: "107".to_owned(),
+                timeout_seconds: u64::MAX,
+                json: true,
+            },
+            runtime,
+            &mut output,
+        )
+        .await;
+        (exit, output)
+    });
+
+    let (exit, output) = tokio::time::timeout(std::time::Duration::from_millis(250), task)
+        .await
+        .expect("checked timeout defense must be prompt")
+        .expect("checked timeout defense must not panic");
+    assert!(!exit.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output).unwrap()["result"],
+        "queue"
+    );
+    assert_eq!(evidence.lock().unwrap().shutdowns, 1);
+}
+
+#[tokio::test]
+async fn list_composes_primary_and_cleanup_results_without_losing_truth() {
+    let live = || AppEvent::LiveInventory(inventory(false, VmStatus::Stopped));
+    let primary = || AppEvent::Error(PublicError::new(PublicErrorKind::Inventory));
+    let cleanup = || PublicError::new(PublicErrorKind::Cleanup);
+
+    let (runtime, _) = SyntheticRuntime::new([live()]);
+    let mut output = Vec::new();
+    let exit = execute_headless(Command::List, runtime, &mut output).await;
+    assert!(exit.success());
+
+    let (runtime, _) = SyntheticRuntime::new([primary()]);
+    let mut output = Vec::new();
+    let exit = execute_headless(Command::List, runtime, &mut output).await;
+    let error = exit.error().unwrap();
+    assert_eq!(error.kind(), PublicErrorKind::Inventory);
+    assert!(!error.has_cleanup_failure());
+
+    let (runtime, _) = SyntheticRuntime::with_shutdown_error([live()], cleanup());
+    let mut output = Vec::new();
+    let exit = execute_headless(Command::List, runtime, &mut output).await;
+    let error = exit.error().unwrap();
+    assert_eq!(error.kind(), PublicErrorKind::Cleanup);
+    assert!(!error.has_cleanup_failure());
+
+    let (runtime, _) = SyntheticRuntime::with_shutdown_error([primary()], cleanup());
+    let mut output = Vec::new();
+    let exit = execute_headless(Command::List, runtime, &mut output).await;
+    let error = exit.error().unwrap();
+    assert_eq!(error.kind(), PublicErrorKind::Inventory);
+    assert!(error.has_cleanup_failure());
 }
 
 #[test]
@@ -266,20 +435,21 @@ fn native_and_explicit_fallback_startup_intents_wait_for_live_inventory_and_neve
             .expect("live inventory must resolve the startup request")
             .unwrap();
         match command {
-            AppCommand::Open {
+            StartupAction::Native {
                 vmid: selected,
-                options,
+                view_only,
             } if !tiger => {
                 assert_eq!(selected, vmid(107));
-                assert_eq!(options, OpenOptions::default());
+                assert_eq!(view_only, None);
             }
-            AppCommand::OpenInTigerVnc {
+            StartupAction::TigerVnc {
                 vmid: selected,
-                preferences,
+                fullscreen,
+                view_only,
             } if tiger => {
                 assert_eq!(selected, vmid(107));
-                assert!(preferences.fullscreen);
-                assert!(preferences.view_only);
+                assert!(fullscreen);
+                assert_eq!(view_only, Some(true));
             }
             _ => panic!("startup intent changed transport or fell back automatically"),
         }
@@ -294,7 +464,7 @@ fn native_and_explicit_fallback_startup_intents_wait_for_live_inventory_and_neve
     let command = Command::Open {
         selector: "205".to_owned(),
         fullscreen: false,
-        view_only: false,
+        view_only: None,
         viewer: ViewerMode::Native,
     };
     let mut coordinator = StartupCoordinator::new(command.startup_request().unwrap());

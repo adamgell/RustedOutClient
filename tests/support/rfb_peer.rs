@@ -88,9 +88,17 @@ pub enum ClientMessageFact {
     },
     ClipboardLength(u32),
     SetDesktopSize {
-        width: u16,
-        height: u16,
-        screens: u8,
+        message_padding: u8,
+        desktop_width: u16,
+        desktop_height: u16,
+        screen_count: u8,
+        screen_padding: u8,
+        screen_id: u32,
+        screen_x: u16,
+        screen_y: u16,
+        screen_width: u16,
+        screen_height: u16,
+        screen_flags: u32,
     },
 }
 
@@ -135,7 +143,7 @@ pub fn non_black_rgba(encoding: EncodingCase) -> Vec<u8> {
         EncodingCase::CopyRect => [4, 5, 6],
         EncodingCase::Hextile => [7, 8, 9],
         EncodingCase::Zrle => [10, 11, 12],
-        EncodingCase::Tight => [13, 14, 15],
+        EncodingCase::Tight => [15, 14, 13],
     };
     vec![rgb[0], rgb[1], rgb[2], 255]
 }
@@ -421,11 +429,11 @@ where
             capture.record(ClientMessageFact::ClipboardLength(length))
         }
         251 => {
-            let _padding = stream.read_u8().await?;
+            let message_padding = stream.read_u8().await?;
             let width = stream.read_u16().await?;
             let height = stream.read_u16().await?;
             let screens = stream.read_u8().await?;
-            let _padding = stream.read_u8().await?;
+            let screen_padding = stream.read_u8().await?;
             if screens != 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -434,8 +442,12 @@ where
             }
             let mut screen = [0_u8; 16];
             stream.read_exact(&mut screen).await?;
+            let screen_id = u32::from_be_bytes([screen[0], screen[1], screen[2], screen[3]]);
+            let screen_x = u16::from_be_bytes([screen[4], screen[5]]);
+            let screen_y = u16::from_be_bytes([screen[6], screen[7]]);
             let screen_width = u16::from_be_bytes([screen[8], screen[9]]);
             let screen_height = u16::from_be_bytes([screen[10], screen[11]]);
+            let screen_flags = u32::from_be_bytes([screen[12], screen[13], screen[14], screen[15]]);
             if screen_width != width || screen_height != height {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -443,9 +455,17 @@ where
                 ));
             }
             capture.record(ClientMessageFact::SetDesktopSize {
-                width,
-                height,
-                screens,
+                message_padding,
+                desktop_width: width,
+                desktop_height: height,
+                screen_count: screens,
+                screen_padding,
+                screen_id,
+                screen_x,
+                screen_y,
+                screen_width,
+                screen_height,
+                screen_flags,
             })?;
             match resize_reply {
                 ResizeReply::Apply => {
@@ -456,7 +476,7 @@ where
                     write_extended_desktop_size(stream, 1, 1, width, height).await
                 }
                 ResizeReply::Unsupported => {
-                    write_extended_desktop_size(stream, 1, 2, width, height).await
+                    write_extended_desktop_size(stream, 1, 3, width, height).await
                 }
                 ResizeReply::None => Ok(()),
             }

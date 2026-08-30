@@ -25,6 +25,10 @@ if [ -z "$socket" ]; then
     exit 70
 fi
 
+if [ -f "${socket}.track_all_pids" ]; then
+    printf '%s\n' "$$" >> "${socket}.children"
+fi
+
 if [ "$proxy" != true ] && [ "${LC_PVE_TICKET+x}" = x ]; then
     exit 73
 fi

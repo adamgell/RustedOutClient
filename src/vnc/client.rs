@@ -2256,10 +2256,17 @@ mod tests {
             ));
 
             let rects = wait_for_non_black_frame(&connection).await;
-            assert!(
-                !rects.is_empty(),
-                "{encoding:?} produced no dirty rectangle"
-            );
+            assert_eq!(rects.len(), 1, "{encoding:?} dirty-region count");
+            let rect = &rects[0];
+            assert_eq!((rect.x, rect.y), (0, 0), "{encoding:?} origin");
+            if encoding == rfb_peer::EncodingCase::CopyRect {
+                assert_eq!((rect.w, rect.h), (2, 1));
+                let pixel = rfb_peer::non_black_rgba(encoding);
+                assert_eq!(rect.rgba, [pixel.as_slice(), pixel.as_slice()].concat());
+            } else {
+                assert_eq!((rect.w, rect.h), (1, 1));
+                assert_eq!(rect.rgba, rfb_peer::non_black_rgba(encoding));
+            }
             assert!(
                 capture.auth_valid(),
                 "{encoding:?} did not validate DES auth"
@@ -2270,6 +2277,71 @@ mod tests {
                 rfb_peer::ClientMessageFact::SetEncodings(encodings)
                     if encodings == &[16, 5, 1, 0, -223, -308, 7]
             )));
+
+            let _ = cancel.send(());
+            timeout(Duration::from_secs(2), client)
+                .await
+                .expect("client task retained after cancellation")
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(2), peer)
+                .await
+                .expect("peer task retained after cancellation")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn private_peer_distinguishes_applied_rejected_and_unsupported_resize_replies() {
+        for (reply, expected) in [
+            (
+                rfb_peer::ResizeReply::Apply,
+                ResizeProtocolOutcome::Forwarded(DesktopSize::new(1600, 896)),
+            ),
+            (
+                rfb_peer::ResizeReply::Reject,
+                ResizeProtocolOutcome::Rejected,
+            ),
+            (
+                rfb_peer::ResizeReply::Unsupported,
+                ResizeProtocolOutcome::Unsupported,
+            ),
+        ] {
+            let (client_stream, peer_stream) = duplex(2 * 1024 * 1024);
+            let (connection, channels) = bounded_vnc_channels();
+            let peer = tokio::spawn(rfb_peer::run_peer(
+                peer_stream,
+                rfb_peer::PeerBehavior::Valid {
+                    encoding: rfb_peer::EncodingCase::Raw,
+                    resize_reply: reply,
+                },
+                rfb_peer::PeerCapture::default(),
+            ));
+            let (cancel, cancelled) = oneshot::channel();
+            let client = tokio::spawn(VncClient::run_test_stream(
+                client_stream,
+                fixed_test_ticket(),
+                VncOptions::default(),
+                channels,
+                false,
+                cancelled,
+            ));
+            wait_for_non_black_frame(&connection).await;
+            connection
+                .request_desktop_size(DesktopSize::new(1600, 896))
+                .unwrap();
+
+            let observed = timeout(Duration::from_secs(2), async {
+                loop {
+                    if let VncEvent::ResizeOutcome(outcome) = next_event(&connection).await {
+                        break outcome;
+                    }
+                }
+            })
+            .await
+            .expect("private peer did not produce a resize outcome");
+            assert_eq!(observed, expected, "reply {reply:?}");
 
             let _ = cancel.send(());
             timeout(Duration::from_secs(2), client)
@@ -2416,20 +2488,38 @@ mod tests {
         assert!(facts.iter().any(|fact| matches!(
             fact,
             Fact::UpdateRequest {
+                incremental: false,
+                x: 0,
+                y: 0,
                 width: 64,
                 height: 64,
-                ..
             }
         )));
         assert!(facts.contains(&Fact::SetDesktopSize {
-            width: 1600,
-            height: 896,
-            screens: 1,
+            message_padding: 0,
+            desktop_width: 1600,
+            desktop_height: 896,
+            screen_count: 1,
+            screen_padding: 0,
+            screen_id: 0,
+            screen_x: 0,
+            screen_y: 0,
+            screen_width: 1600,
+            screen_height: 896,
+            screen_flags: 0,
         }));
         assert!(facts.contains(&Fact::SetDesktopSize {
-            width: 1920,
-            height: 1080,
-            screens: 1,
+            message_padding: 0,
+            desktop_width: 1920,
+            desktop_height: 1080,
+            screen_count: 1,
+            screen_padding: 0,
+            screen_id: 0,
+            screen_x: 0,
+            screen_y: 0,
+            screen_width: 1920,
+            screen_height: 1080,
+            screen_flags: 0,
         }));
         assert!(facts.len() <= 128);
         assert!(!format!("{facts:?}").contains("bounded synthetic clipboard"));

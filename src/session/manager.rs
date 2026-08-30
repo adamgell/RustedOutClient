@@ -2679,6 +2679,122 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn ten_connect_disconnect_cycles_leave_zero_exact_owned_residue() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+
+        for cycle in 0..10 {
+            let runtime = RuntimeDir::create().unwrap();
+            let runtime_path = runtime.path().to_owned();
+            let children_path = runtime.control_socket().with_extension("children");
+            let (_fixture_directory, executable) = fake_ssh();
+            fs::write(
+                runtime.control_socket().with_extension("track_all_pids"),
+                b"synthetic fixture control\n",
+            )
+            .unwrap();
+            fs::write(
+                runtime
+                    .control_socket()
+                    .with_extension("proxy_rfb_input_capture"),
+                b"synthetic fixture control\n",
+            )
+            .unwrap();
+
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let listener_address = listener.local_addr().unwrap();
+            let (stop_listener, listener_stopped) = oneshot::channel::<()>();
+            let listener_task = tokio::spawn(async move {
+                tokio::select! {
+                    _ = listener.accept() => {}
+                    _ = listener_stopped => {}
+                }
+            });
+
+            let (mut manager, opens, proxy_pid) =
+                production_wire_manager(&runtime, executable).await;
+            let ready = timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(AppEvent::SessionChanged(snapshot)) = manager.recv().await {
+                        if snapshot.phase == SessionPhase::Ready {
+                            break snapshot.session_id;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            manager
+                .send(AppCommand::SendInput {
+                    session_id: ready,
+                    action: InputAction::Key {
+                        down: true,
+                        keysym: 0xffe3,
+                    },
+                })
+                .await
+                .unwrap();
+            wait_for_fixture_marker(
+                &runtime
+                    .control_socket()
+                    .with_extension("proxy.key-down-read"),
+            )
+            .await;
+            manager
+                .send(AppCommand::Close { session_id: ready })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(AppEvent::SessionChanged(snapshot)) = manager.recv().await {
+                        if snapshot.session_id == ready
+                            && snapshot.phase == SessionPhase::Disconnected
+                        {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            manager.shutdown().await.unwrap();
+            assert_eq!(opens.load(Ordering::SeqCst), 1, "cycle {cycle}");
+            assert_exact_pid_is_gone(proxy_pid).await;
+
+            stop_listener.send(()).unwrap();
+            listener_task.await.unwrap();
+            let rebound = tokio::net::TcpListener::bind(listener_address)
+                .await
+                .expect("exact test listener remained bound");
+            drop(rebound);
+
+            let exact_children = fs::read_to_string(&children_path)
+                .expect("fake SSH did not record exact child identities")
+                .lines()
+                .map(|line| line.parse::<u32>().unwrap())
+                .collect::<Vec<_>>();
+            assert!(exact_children.len() >= 5, "cycle {cycle}");
+            for pid in exact_children {
+                assert_exact_pid_is_gone(pid).await;
+            }
+
+            let exact_artifacts = fs::read_dir(&runtime_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            assert!(!exact_artifacts.is_empty(), "cycle {cycle}");
+            drop(runtime);
+            assert!(!runtime_path.exists(), "cycle {cycle}");
+            assert!(
+                exact_artifacts.iter().all(|path| !path.exists()),
+                "cycle {cycle} retained an exact runtime artifact"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn real_production_close_reconnect_and_shutdown_write_modifier_release_before_completion()
     {
         let _process_guard = crate::ssh::process_test_guard().await;

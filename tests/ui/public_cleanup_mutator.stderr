@@ -1,0 +1,10 @@
+error[E0624]: method `with_cleanup_failure` is private
+ --> tests/ui/public_cleanup_mutator.rs:4:56
+  |
+4 |     let _ = PublicError::new(PublicErrorKind::Cleanup).with_cleanup_failure();
+  |                                                        ^^^^^^^^^^^^^^^^^^^^ private method
+  |
+ ::: src/session/model.rs
+  |
+  |     pub(crate) fn with_cleanup_failure(mut self) -> Self {
+  |     ---------------------------------------------------- private method defined here

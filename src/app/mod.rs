@@ -28,6 +28,19 @@ pub struct StartupCoordinator {
     request: Option<StartupRequest>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StartupAction {
+    Native {
+        vmid: crate::model::VmId,
+        view_only: Option<bool>,
+    },
+    TigerVnc {
+        vmid: crate::model::VmId,
+        fullscreen: bool,
+        view_only: Option<bool>,
+    },
+}
+
 impl StartupCoordinator {
     pub fn new(request: StartupRequest) -> Self {
         Self {
@@ -39,7 +52,7 @@ impl StartupCoordinator {
         &mut self,
         event: &crate::session::AppEvent,
         fallback_configured: bool,
-    ) -> Option<Result<AppCommand, PublicError>> {
+    ) -> Option<Result<StartupAction, PublicError>> {
         let crate::session::AppEvent::LiveInventory(snapshot) = event else {
             return None;
         };
@@ -52,39 +65,43 @@ impl StartupCoordinator {
             return Some(Err(PublicError::new(PublicErrorKind::VmNotRunning)));
         }
         match request.viewer() {
-            ViewerMode::Native => {
-                let options = crate::session::OpenOptions {
-                    view_only: request.view_only(),
-                    ..crate::session::OpenOptions::default()
-                };
-                Some(Ok(AppCommand::Open {
-                    vmid: selected.vmid,
-                    options,
-                }))
-            }
-            ViewerMode::TigerVnc if fallback_configured => Some(Ok(AppCommand::OpenInTigerVnc {
+            ViewerMode::Native => Some(Ok(StartupAction::Native {
                 vmid: selected.vmid,
-                preferences: FallbackPreferences {
-                    fullscreen: request.fullscreen(),
-                    view_only: request.view_only(),
-                },
+                view_only: request.view_only(),
+            })),
+            ViewerMode::TigerVnc if fallback_configured => Some(Ok(StartupAction::TigerVnc {
+                vmid: selected.vmid,
+                fullscreen: request.fullscreen(),
+                view_only: request.view_only(),
             })),
             ViewerMode::TigerVnc => Some(Err(PublicError::new(PublicErrorKind::ViewerFallback))),
         }
     }
 }
 
-fn configured_startup_command(state: &AppState, command: AppCommand) -> AppCommand {
-    match command {
-        AppCommand::Open { vmid, options } => {
+fn configured_startup_command(state: &AppState, action: StartupAction) -> AppCommand {
+    match action {
+        StartupAction::Native { vmid, view_only } => {
             let mut configured = state.open_options(vmid);
-            configured.view_only = options.view_only;
+            if let Some(view_only) = view_only {
+                configured.view_only = view_only;
+            }
             AppCommand::Open {
                 vmid,
                 options: configured,
             }
         }
-        command => command,
+        StartupAction::TigerVnc {
+            vmid,
+            fullscreen,
+            view_only,
+        } => AppCommand::OpenInTigerVnc {
+            vmid,
+            preferences: FallbackPreferences {
+                fullscreen,
+                view_only: view_only.unwrap_or_else(|| state.open_options(vmid).view_only),
+            },
+        },
     }
 }
 
@@ -412,11 +429,11 @@ mod close_coordinator_tests {
     use super::{
         configured_startup_command, dispatch_rendered_actions, AppCommand, AppCommandSink,
         AppState, ClipboardAdapter, ClipboardAdapterError, CloseCoordinator, CommandQueueError,
-        NativeCloseAction, UiAction,
+        NativeCloseAction, StartupAction, UiAction,
     };
 
     #[test]
-    fn native_startup_preserves_configured_clipboard_while_honoring_explicit_view_only() {
+    fn native_startup_preserves_configured_clipboard_and_absent_view_only_policy() {
         let mut config = AppConfig::new(PveProfile {
             name: "Synthetic lab".to_owned(),
             ssh_target: SshTarget::parse("root@pve.example.invalid").unwrap(),
@@ -429,9 +446,9 @@ mod close_coordinator_tests {
 
         let command = configured_startup_command(
             &state,
-            AppCommand::Open {
+            StartupAction::Native {
                 vmid: selected,
-                options: crate::session::OpenOptions::default(),
+                view_only: None,
             },
         );
 
@@ -439,10 +456,77 @@ mod close_coordinator_tests {
             AppCommand::Open { vmid, options } => {
                 assert_eq!(vmid, selected);
                 assert!(options.clipboard_enabled);
-                assert!(!options.view_only);
+                assert!(options.view_only);
                 assert!(options.dynamic_resolution);
             }
             _ => panic!("native startup command changed transport"),
+        }
+    }
+
+    #[test]
+    fn startup_view_only_override_preserves_global_and_favorite_policy_for_both_modes() {
+        use crate::{config::FavoriteVm, model::ScaleMode};
+
+        let favorite = VmId::new(107).unwrap();
+        let global = VmId::new(108).unwrap();
+        let mut config = AppConfig::new(PveProfile {
+            name: "Synthetic lab".to_owned(),
+            ssh_target: SshTarget::parse("root@pve.example.invalid").unwrap(),
+            node: NodeName::parse("pve2").unwrap(),
+        });
+        config.display.view_only = true;
+        config.favorites.push(FavoriteVm {
+            vmid: favorite,
+            alias: None,
+            scale_mode: ScaleMode::Fit,
+            view_only: false,
+            sort_position: 0,
+        });
+        let state = AppState::from_config(&config);
+
+        for (vmid, configured) in [(favorite, false), (global, true)] {
+            for action in [
+                StartupAction::Native {
+                    vmid,
+                    view_only: None,
+                },
+                StartupAction::TigerVnc {
+                    vmid,
+                    fullscreen: true,
+                    view_only: None,
+                },
+            ] {
+                match configured_startup_command(&state, action) {
+                    AppCommand::Open { options, .. } => {
+                        assert_eq!(options.view_only, configured)
+                    }
+                    AppCommand::OpenInTigerVnc { preferences, .. } => {
+                        assert_eq!(preferences.view_only, configured);
+                        assert!(preferences.fullscreen);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            for action in [
+                StartupAction::Native {
+                    vmid,
+                    view_only: Some(true),
+                },
+                StartupAction::TigerVnc {
+                    vmid,
+                    fullscreen: false,
+                    view_only: Some(true),
+                },
+            ] {
+                match configured_startup_command(&state, action) {
+                    AppCommand::Open { options, .. } => assert!(options.view_only),
+                    AppCommand::OpenInTigerVnc { preferences, .. } => {
+                        assert!(preferences.view_only)
+                    }
+                    _ => unreachable!(),
+                }
+            }
         }
     }
     use crate::{
