@@ -77,6 +77,22 @@ fn source_policy_script(workflow: &str) -> String {
     matching.into_iter().next().unwrap()
 }
 
+fn pinned_tool_install_script(workflow: &str) -> String {
+    let matching = workflow_run_blocks(workflow)
+        .into_iter()
+        .filter(|block| {
+            block.contains("cargo install cargo-audit")
+                && block.contains("cargo install cargo-deny")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "workflow must have one pinned-tool installation block"
+    );
+    matching.into_iter().next().unwrap()
+}
+
 fn native_verification_block(checklist: &str) -> String {
     let matching = checklist
         .split("```bash\n")
@@ -188,6 +204,63 @@ esac
         .unwrap()
 }
 
+fn run_tool_bootstrap_then_source_policy(install_script: &str, source_script: &str) -> Output {
+    let workspace = tempfile::tempdir().unwrap();
+    let bin = workspace.path().join("bin");
+    let source = workspace.path().join("src");
+    let cargo_state = workspace.path().join("cargo-state");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(&cargo_state, "0\n").unwrap();
+    fs::write(source.join("synthetic.rs"), "fn synthetic() {}\n").unwrap();
+
+    let cargo = bin.join("cargo");
+    fs::write(
+        &cargo,
+        r#"#!/bin/sh
+set -u
+IFS= read -r state < "$FAKE_CARGO_STATE" || exit 96
+case "$*" in
+  "install cargo-audit --version 0.22.2 --locked")
+    [ "$state" = 0 ] || exit 95
+    printf '%s\n' 1 > "$FAKE_CARGO_STATE"
+    ;;
+  "install cargo-deny --version 0.19.0 --locked")
+    [ "$state" = 1 ] || exit 95
+    printf '%s\n' 2 > "$FAKE_CARGO_STATE"
+    ;;
+  "install ripgrep --version 15.2.0 --locked")
+    [ "$state" = 2 ] || exit 95
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'case "$*" in' \
+      '  *sftp*) exit 1 ;;' \
+      '  *StrictHostKeyChecking*) exit 1 ;;' \
+      '  *) exit 97 ;;' \
+      'esac' > "$FAKE_CARGO_BIN/rg" || exit 94
+    /bin/chmod 755 "$FAKE_CARGO_BIN/rg" || exit 94
+    printf '%s\n' 3 > "$FAKE_CARGO_STATE"
+    ;;
+  *) exit 97 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    Command::new("/bin/bash")
+        .arg("-e")
+        .arg("-c")
+        .arg(format!("{install_script}\n{source_script}"))
+        .current_dir(workspace.path())
+        .env_clear()
+        .env("PATH", &bin)
+        .env("FAKE_CARGO_BIN", &bin)
+        .env("FAKE_CARGO_STATE", &cargo_state)
+        .output()
+        .unwrap()
+}
+
 fn run_advisory_guard(script: &str, cargo_mode: &str, matcher_mode: MatcherMode) -> Output {
     let workspace = tempfile::tempdir().unwrap();
     let bin = workspace.path().join("bin");
@@ -290,6 +363,25 @@ fn ci_checkout_is_sha_pinned_without_persisted_credentials() {
     assert!(workflow.contains(&format!(
         "uses: {CHECKOUT_PIN} # v4\n        with:\n          persist-credentials: false"
     )));
+}
+
+#[test]
+fn ci_bootstraps_exact_pinned_source_matcher_before_source_policy() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let install_script = pinned_tool_install_script(&workflow);
+    let source_script = source_policy_script(&workflow);
+
+    let output = run_tool_bootstrap_then_source_policy(&install_script, &source_script);
+
+    assert!(
+        output.status.success(),
+        "the pinned-tool block must bootstrap the exact matcher before source policy; stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
