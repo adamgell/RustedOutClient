@@ -2,15 +2,18 @@
 
 ## Outcome
 
-Task 14A is complete as the non-fuzz governance and documentation tranche.
-The supported macOS ARM64 dependency graph has no active vulnerability, every
-configured cargo-deny component passes, the local locked Rust gates pass, and
-the required security/operator documentation is present. Hosted CI, live
-native acceptance, TigerVNC fallback acceptance, rollback execution, and
-rollout were not performed and are not claimed.
+The Task 14A non-fuzz governance/documentation tranche and its review-fix
+round 1 are implemented locally. Independent round 1 returned `Identity: PASS`,
+`Spec: FAIL`, and `Quality: CHANGES REQUIRED`, with no Critical findings. The
+three Important and two Minor findings are remediated by the exact commit and
+evidence below. Independent round-2 review is pending and is not claimed as
+approved. Hosted CI, live native acceptance, TigerVNC fallback acceptance,
+rollback execution, and rollout were not performed and are not claimed.
 
 Task 14B remains the sole deferred parser-smoke/fuzz target, script, corpus, and
-workflow scope. No fuzz artifact was created or run in this task.
+workflow scope. No tracked Task 14B target, script, workflow, corpus, or parser
+input was introduced or run. The two pre-existing ignored empty directories
+under `fuzz/artifacts` remained untouched and contain zero files.
 
 ## Exact heads and commits
 
@@ -19,12 +22,18 @@ workflow scope. No fuzz artifact was created or run in this task.
 - Dependency policy/CI commit:
   `6f4e935241181bc1439900a0e41656e03a638be9`
   (`chore: harden RustedOutClient dependency policy`)
-- Final implementation/documentation head used for every complete gate:
+- Original implementation/documentation head:
   `6300c977eb092b455c15bf49fe97efce335bf1d6`
   (`docs: define RustedOutClient security and acceptance`)
-- This report is committed separately as the evidence-only third commit. Its
-  commit SHA is intentionally reported by the controller-facing completion
-  response rather than embedded self-referentially in its own contents.
+- Original evidence report and exact review-fix base:
+  `73ffcef5940488117ca7367855f183294e35076f`
+  (`docs: record Task 14A evidence`)
+- Round-1 remediation implementation head:
+  `5ff4be0c9db3855c06e3bc9c379dabaa392b6670`
+  (`fix: close Task 14A review findings`)
+- This updated report is committed separately. Its new commit SHA and the
+  required post-report-commit gate results are reported by the controller-facing
+  completion response rather than embedded self-referentially here.
 
 The named branch and shared worktree are preserved. No push, amend, rebase,
 merge, or worktree cleanup was performed.
@@ -49,9 +58,25 @@ Commit `6300c977eb092b455c15bf49fe97efce335bf1d6` contains only:
 - `docs/threat-model.md`
 - `docs/upstream.md`
 
-The third commit contains only this report. No production Rust source, test,
-manifest other than `Cargo.toml`, protected rollback artifact, dependency other
-than the reviewed lock refresh, or out-of-scope workflow changed.
+The original third commit contains only this report. Round-1 remediation commit
+`5ff4be0c9db3855c06e3bc9c379dabaa392b6670` contains exactly:
+
+- `.github/workflows/ci.yml`
+- `README.md`
+- `SECURITY.md`
+- `deny.toml`
+- `docs/configuration.md`
+- `docs/native-acceptance.md`
+- `docs/threat-model.md`
+- `src/ssh/command.rs`
+- `tests/ssh_command_contract.rs`
+- `tests/surface_policy.rs`
+
+The review boundary expanded to production SSH construction and two existing
+contract-test files because the reviewer found an authentication-mode gap and
+required executable workflow regressions. No manifest, lockfile, dependency,
+CLI source/test, VNC/fallback implementation, protected rollback artifact, or
+out-of-scope workflow changed. The round-1 report commit changes only this file.
 
 ## RED / baseline evidence
 
@@ -81,6 +106,41 @@ These are the actual RED gates used to drive the dependency, policy, CI, and
 documentation changes. No parser/fuzz RED input was created because that work
 is expressly parked.
 
+## Round-1 review findings and RED/GREEN evidence
+
+The five independently reported finding classes were:
+
+1. Important: the advisory guard was fail-open because the graph retained tree
+   prefixes, omitted `--locked` and `--all-features`, and treated graph-command
+   failure like package absence.
+2. Important: the SSH option set disabled password and keyboard-interactive
+   authentication but did not prevent configured GSSAPI or hostbased fallback.
+3. Important: `actions/checkout@v4` was mutable and persisted Git credentials.
+4. Minor: the `syn@2.0.118` duplicate exception did not name both concrete
+   dependency paths.
+5. Minor: the `quick-xml` and `ttf-parser` threat-model claims cited only leaf
+   package stanzas and omitted material lock edges.
+
+Focused tests were added before the implementation changes. Actual RED results
+at exact base `73ffcef5940488117ca7367855f183294e35076f` were:
+
+- `every_operation_has_exact_strict_shell_free_argv` exited 101 because
+  `PreferredAuthentications=publickey` was absent from the production argv;
+- `ci_checkout_is_sha_pinned_without_persisted_credentials` exited 101 against
+  mutable `actions/checkout@v4`; and
+- `ci_advisory_guard_fails_closed_and_precedes_the_exact_audit` exited 101 with
+  `cargo tree failure must fail the guard`, proving the old condition was
+  fail-open.
+
+Focused GREEN at the remediation tree was 4/4 in
+`tests/ssh_command_contract.rs` and 3/3 in `tests/surface_policy.rs`. The latter
+executes the extracted workflow guard against exact-argv fake graph generation
+for command failure, active `quick-xml`, a clean graph, and a missing matcher,
+and proves temporary-file cleanup and graph-before-audit ordering. The
+controller later withdrew its proposed explicit-false documentation add-on:
+the source and `tests/cli_contract.rs` intentionally retain the accurate
+presence-only true flag, and neither file nor its documentation was changed.
+
 ## Dependency correction and target evidence
 
 The minimum feature corrections were:
@@ -99,14 +159,17 @@ The refreshed lockfile contains 346 packages, a reduction of 169. `paste`,
 `quick-xml` 0.39.4 remains only in all-target metadata through:
 
 ```text
-quick-xml 0.39.4
-└── wayland-scanner
-    └── smithay-client-toolkit / wayland-client
-        └── smithay-clipboard
-            └── egui-winit
-                └── eframe
-                    └── rustedoutclient
+rustedoutclient -> eframe -> egui-winit -> smithay-clipboard
+-> smithay-client-toolkit -> wayland-scanner -> quick-xml 0.39.4
 ```
+
+The declared lock edges are established by `Cargo.lock:2007-2037`,
+`Cargo.lock:578-610`, `Cargo.lock:628-644`, `Cargo.lock:2255-2263`,
+`Cargo.lock:2228-2252`, `Cargo.lock:2849-2857`, and
+`Cargo.lock:1894-1900`. Cargo.lock records the all-target package relationship;
+it does not prove target activation. The actual command controls below prove
+that the all-target graph contains exactly `quick-xml v0.39.4` while the
+supported macOS ARM64 all-feature graph contains none.
 
 The exact supported-target assertion produced
 `supported_target_quick_xml=absent`. It immediately preceded:
@@ -120,12 +183,13 @@ vulnerabilities. Its sole allowed warning is `RUSTSEC-2026-0192`, unmaintained
 `ttf-parser` 0.25.1. That package is target-active through:
 
 ```text
-ttf-parser 0.25.1
-└── owned_ttf_parser
-    └── ab_glyph
-        └── epaint
-            └── egui
+rustedoutclient -> egui -> epaint -> ab_glyph
+-> owned_ttf_parser -> ttf-parser 0.25.1
 ```
+
+Every material lock edge is recorded by `Cargo.lock:2007-2037`,
+`Cargo.lock:613-625`, `Cargo.lock:673-688`, `Cargo.lock:5-13`,
+`Cargo.lock:1710-1716`, and `Cargo.lock:2598-2602`.
 
 No compatible maintained replacement exists on the accepted egui/eframe 0.31
 line. Both the `quick-xml` target-inactive exception and `ttf-parser`
@@ -168,7 +232,8 @@ exact target-active skips, each reviewed to 2027-02-28, are:
 - `objc2@0.5.2` (eframe/winit versus 0.6.4 in arboard/glutin/webbrowser);
 - `objc2-app-kit@0.2.2` (eframe/winit versus 0.3.2);
 - `objc2-foundation@0.2.2` (eframe/winit versus 0.3.2); and
-- `syn@2.0.118` (Rust derive ecosystem versus 3.0.4 in clap derive).
+- `syn@2.0.118` (direct `serde -> serde_derive` versus direct
+  `clap -> clap_derive -> syn@3.0.4`).
 
 Inverse target trees were run for each skipped package, both advisory paths,
 `webbrowser@1.2.2`, `ttf-parser@0.25.1`, and the font-license exception.
@@ -182,6 +247,19 @@ timeout on `macos-26`. It asserts ARM64, installs Rust 1.92.0 and exact locked
 all-target test, warnings-denied lint, source-policy, target graph, exact audit,
 deny, and locked release gates.
 
+Checkout is pinned to
+`actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4` with
+`persist-credentials: false`. The advisory guard first requires `rg`, creates a
+bounded temporary graph file with exit cleanup, and explicitly fails graph
+generation from this exact command:
+
+```text
+cargo tree --locked --target aarch64-apple-darwin --all-features --format '{p}' --prefix none
+```
+
+Only a successfully generated complete graph is checked for `^quick-xml v`.
+The exact two-ID audit runs afterward in a separate ordered step.
+
 The workflow has no fuzzing, artifact upload, secret, live endpoint, service,
 or elevated-permission step. Local PyYAML parsing returned `ci_yaml=valid`.
 The exact CI `rg` checks found no SFTP/SCP source surface and no
@@ -194,7 +272,9 @@ Compiled policy gates passed separately:
 
 - `tests/fallback_contract.rs`: 15 passed, proving the single approved
   loopback-bind/listener boundary and fallback source contract;
-- `tests/surface_policy.rs`: 1 passed, proving excluded product/CLI surfaces.
+- `tests/surface_policy.rs`: 3 passed, proving excluded product/CLI surfaces,
+  SHA-pinned checkout without persisted credentials, and executable fail-closed
+  advisory-guard behavior.
 
 ## Security policy, threat model, and operator docs
 
@@ -213,10 +293,10 @@ acceptance.
 The standalone threat model has the required four sections, component and
 effective-resource tables, a Mermaid trust-boundary diagram, explicit facts,
 assumptions, open questions, residual risks, and eight attacker-story
-hypotheses. Automated citation validation found 173 source citations (99 unique
-path/range tuples); every referenced file and line range exists. The sole
-implementation agent then reviewed the cited source ranges against each claim.
-This is source-backed self-review, not independent review.
+hypotheses. Round-1 automated citation validation found 189 source citations
+(108 unique path/range tuples); every referenced file and line range exists.
+The sole implementation agent then reviewed the cited source ranges against
+each claim. This is source-backed self-review, not independent review.
 
 All local Markdown links resolve. The exact sensitive-keyword command:
 
@@ -224,18 +304,18 @@ All local Markdown links resolve. The exact sensitive-keyword command:
 git grep -nEi 'password|ticket|private key|ssh_target|clipboard' -- docs README.md SECURITY.md
 ```
 
-returned 96 lines. Every match was manually classified as one of: explanatory
-security policy, a synthetic `example.invalid` schema key/value, a source/type
-identifier, a prohibited-field statement, or a blank acceptance field. No
-match contains an actual password, ticket, private key, host clipboard value,
-or private configuration value.
+returned 100 lines after round-1 documentation correction. Every match was
+manually classified as one of: explanatory security policy, a synthetic
+`example.invalid` schema key/value, a source/type identifier, a prohibited-field
+statement, or a blank acceptance field. No match contains an actual password,
+ticket, private key, host clipboard value, or private configuration value.
 
 A separate real-data scan returned zero matches for personal filesystem paths,
 lab identifiers, private/RFC1918 addresses, non-synthetic email targets, SSH
 key material, fingerprints, or credential assignments. The docs contain no
 guest pixels, clipboard contents, stderr bodies, or environment snapshots.
 
-## Complete implementation-head verification
+## Original Task 14A implementation-head verification
 
 All commands below ran at exact head
 `6300c977eb092b455c15bf49fe97efce335bf1d6`:
@@ -263,7 +343,7 @@ All commands below ran at exact head
 | `git diff --check` | Pass |
 | implementation-head tracked status | Clean |
 | exact implementation changed-file boundary | 12/12 expected files only |
-| forbidden fuzz artifacts | All absent |
+| Task 14B artifacts | No tracked target/script/workflow/corpus/input; two pre-existing ignored empty directories untouched with zero files |
 
 The 353 tests are the sum of the following test-binary results:
 
@@ -271,6 +351,50 @@ The 353 tests are the sum of the following test-binary results:
 151 + 0 + 13 + 3 + 12 + 14 + 7 + 17 + 39 + 3 + 15 + 7 + 14 + 3 +
 16 + 23 + 4 + 11 + 1 = 353
 ```
+
+## Round-1 remediation verification
+
+The baseline full suite at exact fix base
+`73ffcef5940488117ca7367855f183294e35076f` was 353 passed, 0 failed, and 0
+ignored. After focused RED/GREEN, the complete pre-commit sequence passed with
+355 tests. Every required gate was then rerun at exact committed remediation
+head `5ff4be0c9db3855c06e3bc9c379dabaa392b6670`:
+
+| Gate | Actual committed-head result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Pass |
+| `cargo test --all-targets --all-features --locked` | 355 passed; 0 failed; 0 ignored |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | Pass |
+| `cargo build --release --locked` | Pass |
+| `actionlint .github/workflows/ci.yml` | Pass |
+| supported locked ARM64 all-feature unprefixed graph | Pass; `quick-xml` absent |
+| locked all-target all-feature unprefixed positive control | Pass; exactly `quick-xml v0.39.4` |
+| 10 supported inverse trees plus all-target `quick-xml` inverse | Pass |
+| exact two-ID `cargo audit` | Pass; 346 dependencies, 0 vulnerabilities, 1 allowed maintenance warning |
+| `cargo deny list` | Pass |
+| all four cargo-deny components | Pass; reviewed `ttf-parser` and unused MPL-2.0 warnings visible |
+| aggregate cargo-deny | Pass |
+| exact source-policy checks | Pass |
+| official security-policy resolution | Exactly `["SECURITY.md"]`; root and `src` resolve it |
+| threat citations | 189/189 valid; 108 unique ranges reviewed against claims |
+| local Markdown links | 24/24 valid |
+| sensitive-keyword classification | 100/100 explanatory or synthetic |
+| real-data documentation scan | 0 matches |
+| exact remediation changed-file boundary | 10/10 expected files; CLI source/tests untouched |
+| protected metadata and SHA-256 | All four exactly match the required baseline |
+| Task 14B artifact boundary | 0 tracked artifacts; two pre-existing ignored directories untouched, 0 files |
+| `git diff --check` and tracked status | Pass; clean |
+
+The 355 tests are:
+
+```text
+151 + 0 + 13 + 3 + 12 + 14 + 7 + 17 + 39 + 3 + 15 + 7 + 14 + 3 +
+16 + 23 + 4 + 11 + 3 = 355
+```
+
+The updated report is committed next as the required report-only commit. The
+same full offline sequence is rerun after that commit; those post-report SHA and
+results are necessarily supplied in the controller-facing response.
 
 ## Protected rollback artifacts and parked stash
 
@@ -292,9 +416,10 @@ claim is made. It was neither applied, edited, dropped, recreated, nor touched.
 
 ## Self-review and remaining boundaries
 
-- The source diff changes dependency features/lock data only; no production
-  behavior, test, public API, SSH/VNC boundary, fallback implementation, or
-  cleanup lifecycle was edited.
+- The original Task 14A source diff changes dependency features/lock data only.
+  Round-1 remediation adds only four fixed public-key SSH options and their
+  exact argv contracts; no public API, CLI contract, remote command, VNC,
+  fallback, ticket, transport ownership, or cleanup lifecycle was changed.
 - CI's only advisory ignores are the two exact target-inactive `quick-xml`
   IDs, ordered after the ARM64 graph assertion. Active `webbrowser` is upgraded
   and never ignored.
@@ -306,7 +431,9 @@ claim is made. It was neither applied, edited, dropped, recreated, nor touched.
 - No live Proxmox/VM, real clipboard, configuration contents, TigerVNC process,
   private credential, host address, fingerprint, guest pixel, or stderr body
   was accessed.
-- No fuzz target, workflow, script, corpus, or parser input was created or run.
+- No tracked fuzz target, workflow, script, corpus, or parser input was created
+  or run. The two pre-existing ignored empty artifact directories remained
+  untouched and contained zero files at each boundary check.
 
 Remaining concerns are explicit rather than accepted silently:
 
@@ -317,7 +444,8 @@ Remaining concerns are explicit rather than accepted silently:
    remains green, and it expires for review by 2027-02-28.
 3. Hosted CI has not run at this head and branch protection was not inspected or
    changed.
-4. Independent review and every live/native/fallback/rollback/rollout gate
-   remain unexecuted.
+4. Independent round-1 review is complete with the five findings remediated;
+   round-2 review is pending and not approved. Every live/native/fallback/
+   rollback/rollout gate remains unexecuted.
 5. Complete acceptance remains blocked on the parked Task 14B parser-smoke and
    merge-workflow tranche.
