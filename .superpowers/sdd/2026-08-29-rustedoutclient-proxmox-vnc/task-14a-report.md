@@ -2,15 +2,15 @@
 
 ## Outcome
 
-The Task 14A non-fuzz governance/documentation tranche, review-fix rounds 1 and
-2, and the controller's post-round-2 cleanup-proof correction are implemented
-locally. Independent round 2 returned `Identity: PASS`, `Spec: FAIL`, and
-`Quality: CHANGES REQUIRED`, with no Critical or Minor findings. Its one
-Important fail-open matcher finding and the subsequent native cleanup-proof gap
-are remediated by the exact commits and evidence below. Independent round-3
-review is pending and is not claimed as approved. Hosted CI, live native
-acceptance, TigerVNC fallback acceptance, rollback execution, and rollout were
-not performed and are not claimed.
+The Task 14A non-fuzz governance/documentation tranche, review-fix rounds 1
+through 3, and the controller's post-round-2 cleanup-proof correction are
+implemented locally. Independent round 3 returned `Identity: PASS`,
+`Spec: FAIL`, and `Quality: CHANGES REQUIRED`, with no Critical findings, one
+Important source-policy status-handling finding, and one Minor stale-citation
+finding. Both round-3 findings are remediated by the exact implementation and
+evidence below. Independent round-4 review is pending and is not claimed as
+approved. Hosted CI, live native acceptance, TigerVNC fallback acceptance,
+rollback execution, and rollout were not performed and are not claimed.
 
 Task 14B remains the sole deferred parser-smoke/fuzz target, script, corpus, and
 workflow scope. No tracked Task 14B target, script, workflow, corpus, or parser
@@ -45,6 +45,12 @@ under `fuzz/artifacts` remained untouched and contain zero files.
 - Native cleanup-proof correction:
   `0200cd8b618ed2d117f3d82c52aa9c3fd4a5e4c7`
   (`fix: verify native dependency graph cleanup`)
+- Cleanup-proof evidence report and exact round-3 fix base:
+  `6c1be76c726128ae13db7d4e2c27d3ae31720e74`
+  (`docs: correct Task 14A round 2 cleanup evidence`)
+- Round-3 remediation implementation head:
+  `70fef1d6aabf373c2d96f0c83b8c88129f636501`
+  (`fix: fail closed on source policy errors`)
 - This updated report is committed separately. Its new commit SHA and the
   required post-report-commit gate results are reported by the controller-facing
   completion response rather than embedded self-referentially here.
@@ -114,6 +120,18 @@ It changes no workflow, Rust production source, manifest, lock data,
 dependency, CLI/SSH/VNC/fallback/parser behavior, fuzz scope, live-acceptance
 state, or protected rollback artifact. Its evidence correction commit changes
 only this report.
+
+Round-3 remediation commit
+`70fef1d6aabf373c2d96f0c83b8c88129f636501` contains exactly:
+
+- `.github/workflows/ci.yml`
+- `docs/threat-model.md`
+- `tests/surface_policy.rs`
+
+The round-3 range changes no Rust production source, native acceptance recipe,
+manifest, lock data, dependency, CLI/SSH/VNC/fallback/parser behavior, fuzz
+scope, live-acceptance state, or protected rollback artifact. The round-3
+report commit changes only this report.
 
 ## RED / baseline evidence
 
@@ -557,6 +575,108 @@ was added. The correction report is committed separately; the complete offline
 gate set is rerun at that final report-only head and supplied in the
 controller-facing completion response.
 
+## Round-3 source-policy and citation correction
+
+Independent round 3 reviewed exact clean base
+`6c1be76c726128ae13db7d4e2c27d3ae31720e74` (tree
+`d2e8a14e6d71e4a5801bd33853f60d95d2cd1258`) on
+`feature/proxmox-console-foundation`. It returned `Identity: PASS`,
+`Spec: FAIL`, and `Quality: CHANGES REQUIRED`. There were no Critical
+findings. The one Important finding was that both matchers in the workflow's
+`Enforce source policy` block interpreted every nonzero `rg` result as absence,
+so matcher execution failure could authorize CI. The one Minor finding was that
+all eight threat-model citations into that workflow still ended at the old
+line numbers after the earlier dependency-policy expansion.
+
+The executable regression was added before the workflow changed. It extracts
+the actual source-policy shell block and runs six independent synthetic
+scenarios: clean source, a file-transfer match, a weakened-trust match, a
+file-transfer matcher status 2, a trust matcher status 2 after the first
+matcher returns status 1, and a missing matcher. Both status-2 cases execute
+before the test makes either assertion. Actual RED was exit 101 with:
+
+```text
+present matcher errors must fail independently: file_transfer_success=true, trust_success=true
+```
+
+That failure proves the old block authorized both matcher-error paths. The
+separate citation semantic check also failed before documentation changed. Its
+actual workflow-range sequence was:
+
+```text
+16-96,52-66,16-96,16-96,68-90,92-93,52-66,68-90
+```
+
+The required sequence for the final workflow layout was:
+
+```text
+16-128,52-88,16-128,16-128,90-122,124-125,52-88,90-122
+```
+
+The implementation now captures each matcher's output and status separately.
+Status 0 prints the captured matching source locations plus the existing
+generic policy message and fails; status 1 alone means absence and continues;
+every other status discards partial matcher output, suppresses raw matcher
+standard error, prints one content-free generic evaluation error, and fails.
+The transfer and trust statuses remain independent, including when the first
+returns 1 and the second returns 2. The dependency-graph advisory guard is
+unchanged.
+
+All eight workflow citations were then updated to the final semantic ranges.
+The three broad citations cover the complete macOS job through the locked
+release build, both source citations cover both explicit status branches, both
+graph/audit citations cover generation plus three-way matching and the exact
+audit, and the deny citation covers the exact deny step. No source claim or
+control was changed merely to fit a citation.
+
+Focused GREEN was 4/4 in `tests/surface_policy.rs`; the round-3 focused
+fallback/surface/SSH set was 23/23. Every required gate below was then rerun at
+exact committed implementation head
+`70fef1d6aabf373c2d96f0c83b8c88129f636501` (tree
+`9e7285515a55eba55a01c1a4018ce15ccb9a3557`):
+
+| Gate | Actual committed-head result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Pass |
+| `cargo test --all-targets --all-features --locked` | 356 passed; 0 failed; 0 ignored |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | Pass |
+| `cargo build --release --locked` | Pass |
+| `actionlint .github/workflows/ci.yml` | Pass |
+| focused fallback/surface/SSH contracts | 23 passed; 0 failed |
+| exact production source-policy scans | Pass; both matchers returned status 1 |
+| supported locked ARM64 all-feature unprefixed graph | Pass; `quick-xml` absent |
+| locked all-target all-feature unprefixed positive control | Pass; exactly one `quick-xml v0.39.4` |
+| 10 supported inverse selectors plus all-target `quick-xml` inverse | Pass |
+| exact two-ID `cargo audit` | Pass; 346 dependencies, 0 vulnerabilities, 1 allowed maintenance warning |
+| `cargo deny list` | Pass |
+| all four cargo-deny components | Pass; reviewed `ttf-parser` and unused MPL-2.0 warnings visible |
+| aggregate cargo-deny | Pass |
+| local PyYAML parse | `ci_yaml=valid` |
+| official security-policy resolution | Exactly `["SECURITY.md"]`; root and `src` resolve the root policy |
+| threat citation ranges | 189/189 valid; 108 unique path/range tuples |
+| workflow citation semantics | 8/8 valid against the final workflow controls |
+| local Markdown links | 24/24 valid |
+| sensitive-keyword classification | 100/100 explanatory or synthetic |
+| real-data documentation scan | 0 matches |
+| exact round-3 implementation boundary | 3/3 allowed files only |
+| cumulative Task 14A boundary | 16/16 expected files only |
+| protected metadata and SHA-256 | All four exactly match the required baseline |
+| Task 14B artifact boundary | 0 tracked artifacts; two pre-existing ignored directories remain empty |
+| `git diff --check` and tracked status | Pass; clean |
+
+The 356 tests are:
+
+```text
+151 + 0 + 13 + 3 + 12 + 14 + 7 + 17 + 39 + 3 + 15 + 7 + 14 + 3 +
+16 + 23 + 4 + 11 + 4 = 356
+```
+
+The one-test increase is the executable six-scenario source-policy regression.
+This report is committed separately. The same complete offline sequence is
+rerun at that final report-only head and supplied in the controller-facing
+completion response. Independent round-4 review is pending and is not claimed
+as approved.
+
 ## Protected rollback artifacts and parked stash
 
 Only metadata and SHA-256 were read for the four rollback artifacts; no file
@@ -581,16 +701,19 @@ claim is made. It was neither applied, edited, dropped, recreated, nor touched.
   Round-1 remediation adds only four fixed public-key SSH options and their
   exact argv contracts. Round-2 remediation changes only the two graph-policy
   recipes and their executable/documentation contract test. The controller
-  correction makes native trap clearing structurally success-only. No public
-  API, CLI contract, remote command, VNC, fallback, ticket, transport ownership,
-  or cleanup lifecycle was changed.
+  correction makes native trap clearing structurally success-only. Round-3
+  remediation changes only CI source-policy status handling, its executable
+  test, and the eight workflow citation ranges. No public API, CLI contract,
+  remote command, VNC, fallback, ticket, transport ownership, or cleanup
+  lifecycle was changed.
 - CI's only advisory ignores are the two exact target-inactive `quick-xml`
   IDs, ordered after the ARM64 graph assertion. Active `webbrowser` is upgraded
   and never ignored.
 - Cargo-deny has exact source/license/duplicate controls with dated exceptions;
   no broad skip tree, Git source, wildcard, or active-target advisory ignore is
   present.
-- Documentation is source-backed and deliberately labels hosted, live,
+- Documentation is source-backed; all 189 source citations and all eight
+  workflow-citation semantics validate. It deliberately labels hosted, live,
   fallback, rollback, and rollout evidence as unexecuted.
 - No live Proxmox/VM, real clipboard, configuration contents, TigerVNC process,
   private credential, host address, fingerprint, guest pixel, or stderr body
@@ -608,8 +731,8 @@ Remaining concerns are explicit rather than accepted silently:
    remains green, and it expires for review by 2027-02-28.
 3. Hosted CI has not run at this head and branch protection was not inspected or
    changed.
-4. Independent round-2 review is complete with its one Important finding
-   remediated; round-3 review is pending and not approved. Every live/native/
+4. Independent round-3 review is complete with its Important and Minor findings
+   remediated; round-4 review is pending and not approved. Every live/native/
    fallback/rollback/rollout gate remains unexecuted.
 5. Complete acceptance remains blocked on the parked Task 14B parser-smoke and
    merge-workflow tranche.
