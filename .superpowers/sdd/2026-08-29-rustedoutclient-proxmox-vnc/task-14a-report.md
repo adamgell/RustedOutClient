@@ -2,14 +2,15 @@
 
 ## Outcome
 
-The Task 14A non-fuzz governance/documentation tranche and review-fix rounds 1
-and 2 are implemented locally. Independent round 2 returned `Identity: PASS`,
-`Spec: FAIL`, and `Quality: CHANGES REQUIRED`, with no Critical or Minor
-findings. Its one Important fail-open matcher finding is remediated by the exact
-commit and evidence below. Independent round-3 review is pending and is not
-claimed as approved. Hosted CI, live native acceptance, TigerVNC fallback
-acceptance, rollback execution, and rollout were not performed and are not
-claimed.
+The Task 14A non-fuzz governance/documentation tranche, review-fix rounds 1 and
+2, and the controller's post-round-2 cleanup-proof correction are implemented
+locally. Independent round 2 returned `Identity: PASS`, `Spec: FAIL`, and
+`Quality: CHANGES REQUIRED`, with no Critical or Minor findings. Its one
+Important fail-open matcher finding and the subsequent native cleanup-proof gap
+are remediated by the exact commits and evidence below. Independent round-3
+review is pending and is not claimed as approved. Hosted CI, live native
+acceptance, TigerVNC fallback acceptance, rollback execution, and rollout were
+not performed and are not claimed.
 
 Task 14B remains the sole deferred parser-smoke/fuzz target, script, corpus, and
 workflow scope. No tracked Task 14B target, script, workflow, corpus, or parser
@@ -38,6 +39,12 @@ under `fuzz/artifacts` remained untouched and contain zero files.
 - Round-2 remediation implementation head:
   `48bb0cc1ee52ed237183652282c9404cfdee4102`
   (`fix: fail closed on dependency matcher errors`)
+- Initial round-2 evidence report:
+  `e0937b1790fbe8b088916539158f6ef169c25ae5`
+  (`docs: record Task 14A review round 2 fixes`)
+- Native cleanup-proof correction:
+  `0200cd8b618ed2d117f3d82c52aa9c3fd4a5e4c7`
+  (`fix: verify native dependency graph cleanup`)
 - This updated report is committed separately. Its new commit SHA and the
   required post-report-commit gate results are reported by the controller-facing
   completion response rather than embedded self-referentially here.
@@ -96,6 +103,17 @@ The round-2 range changes no Rust production source, manifest, lock data,
 dependency, CLI/SSH/VNC/fallback/parser behavior, fuzz scope, live-acceptance
 state, or protected rollback artifact. The round-2 report commit changes only
 this report.
+
+Cleanup-proof correction commit
+`0200cd8b618ed2d117f3d82c52aa9c3fd4a5e4c7` contains exactly:
+
+- `docs/native-acceptance.md`
+- `tests/surface_policy.rs`
+
+It changes no workflow, Rust production source, manifest, lock data,
+dependency, CLI/SSH/VNC/fallback/parser behavior, fuzz scope, live-acceptance
+state, or protected rollback artifact. Its evidence correction commit changes
+only this report.
 
 ## RED / baseline evidence
 
@@ -507,6 +525,38 @@ claimed as approved. Hosted GitHub Actions, Task 14B parser smoke, live native
 acceptance, fallback acceptance, rollback execution, and rollout remain
 separate and unperformed.
 
+## Controller native-cleanup proof correction
+
+After the initial round-2 evidence commit, controller self-review identified
+that the native recipe has no global `set -e`; therefore an unchecked graph
+removal followed by `trap - EXIT` could authorize audit and leave residue. At
+initial report head `e0937b1790fbe8b088916539158f6ef169c25ae5`, the recipe
+already used an explicit failing-removal branch, but its documentation contract
+asserted only token presence and ordering relative to audit. That evidence did
+not structurally bind trap clearing to the successful-removal branch, so the
+report's cleanup-proof claim was stronger than the shipped regression.
+
+The focused contract was strengthened first at the exact clean initial report
+head. Actual RED was exit 101 with `checked successful graph removal`, proving
+that the prior recipe did not have the required success-branch shape. Commit
+`0200cd8b618ed2d117f3d82c52aa9c3fd4a5e4c7` then changed only the native
+recipe and its existing contract test. The recipe now performs:
+
+```text
+if graph removal succeeds
+  clear the EXIT cleanup trap
+else
+  emit a content-free cleanup error and exit 1 with the trap still installed
+```
+
+The test proves the exact ordering: graph generation, checked removal,
+success-only `trap - EXIT`, failure branch, explicit failure exit, then audit.
+It does not execute the parked parser-smoke command. Focused GREEN was 3/3 in
+`tests/surface_policy.rs`, and the total remains 355 because no test function
+was added. The correction report is committed separately; the complete offline
+gate set is rerun at that final report-only head and supplied in the
+controller-facing completion response.
+
 ## Protected rollback artifacts and parked stash
 
 Only metadata and SHA-256 were read for the four rollback artifacts; no file
@@ -530,9 +580,10 @@ claim is made. It was neither applied, edited, dropped, recreated, nor touched.
 - The original Task 14A source diff changes dependency features/lock data only.
   Round-1 remediation adds only four fixed public-key SSH options and their
   exact argv contracts. Round-2 remediation changes only the two graph-policy
-  recipes and their executable/documentation contract test. No public API, CLI
-  contract, remote command, VNC, fallback, ticket, transport ownership, or
-  cleanup lifecycle was changed.
+  recipes and their executable/documentation contract test. The controller
+  correction makes native trap clearing structurally success-only. No public
+  API, CLI contract, remote command, VNC, fallback, ticket, transport ownership,
+  or cleanup lifecycle was changed.
 - CI's only advisory ignores are the two exact target-inactive `quick-xml`
   IDs, ordered after the ARM64 graph assertion. Active `webbrowser` is upgraded
   and never ignored.
