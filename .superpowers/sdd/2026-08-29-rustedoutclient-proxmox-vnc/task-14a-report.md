@@ -2,13 +2,14 @@
 
 ## Outcome
 
-The Task 14A non-fuzz governance/documentation tranche and its review-fix
-round 1 are implemented locally. Independent round 1 returned `Identity: PASS`,
-`Spec: FAIL`, and `Quality: CHANGES REQUIRED`, with no Critical findings. The
-three Important and two Minor findings are remediated by the exact commit and
-evidence below. Independent round-2 review is pending and is not claimed as
-approved. Hosted CI, live native acceptance, TigerVNC fallback acceptance,
-rollback execution, and rollout were not performed and are not claimed.
+The Task 14A non-fuzz governance/documentation tranche and review-fix rounds 1
+and 2 are implemented locally. Independent round 2 returned `Identity: PASS`,
+`Spec: FAIL`, and `Quality: CHANGES REQUIRED`, with no Critical or Minor
+findings. Its one Important fail-open matcher finding is remediated by the exact
+commit and evidence below. Independent round-3 review is pending and is not
+claimed as approved. Hosted CI, live native acceptance, TigerVNC fallback
+acceptance, rollback execution, and rollout were not performed and are not
+claimed.
 
 Task 14B remains the sole deferred parser-smoke/fuzz target, script, corpus, and
 workflow scope. No tracked Task 14B target, script, workflow, corpus, or parser
@@ -31,6 +32,12 @@ under `fuzz/artifacts` remained untouched and contain zero files.
 - Round-1 remediation implementation head:
   `5ff4be0c9db3855c06e3bc9c379dabaa392b6670`
   (`fix: close Task 14A review findings`)
+- Round-1 evidence report and exact round-2 fix base:
+  `1996cf7fceb4bf314625c83758e967d3d9f775e2`
+  (`docs: record Task 14A review round 1 fixes`)
+- Round-2 remediation implementation head:
+  `48bb0cc1ee52ed237183652282c9404cfdee4102`
+  (`fix: fail closed on dependency matcher errors`)
 - This updated report is committed separately. Its new commit SHA and the
   required post-report-commit gate results are reported by the controller-facing
   completion response rather than embedded self-referentially here.
@@ -77,6 +84,18 @@ contract-test files because the reviewer found an authentication-mode gap and
 required executable workflow regressions. No manifest, lockfile, dependency,
 CLI source/test, VNC/fallback implementation, protected rollback artifact, or
 out-of-scope workflow changed. The round-1 report commit changes only this file.
+
+Round-2 remediation commit
+`48bb0cc1ee52ed237183652282c9404cfdee4102` contains exactly:
+
+- `.github/workflows/ci.yml`
+- `docs/native-acceptance.md`
+- `tests/surface_policy.rs`
+
+The round-2 range changes no Rust production source, manifest, lock data,
+dependency, CLI/SSH/VNC/fallback/parser behavior, fuzz scope, live-acceptance
+state, or protected rollback artifact. The round-2 report commit changes only
+this report.
 
 ## RED / baseline evidence
 
@@ -396,6 +415,98 @@ The updated report is committed next as the required report-only commit. The
 same full offline sequence is rerun after that commit; those post-report SHA and
 results are necessarily supplied in the controller-facing response.
 
+## Round-2 matcher correction and RED/GREEN evidence
+
+Independent round 2 returned `Identity: PASS`, `Spec: FAIL`, and
+`Quality: CHANGES REQUIRED`, with no Critical or Minor findings. Its one
+Important finding was that the CI and native-acceptance graph checks treated
+every nonzero `rg` result as package absence. Status 1 is absence, while status
+2 or greater is a matcher execution, I/O, syntax, or related failure that must
+not authorize the exact advisory ignores.
+
+Tests were changed before either policy recipe at exact clean base
+`1996cf7fceb4bf314625c83758e967d3d9f775e2`. Actual RED evidence was:
+
+- the executable workflow-contract test supplied a present fake `rg` that
+  returned status 2; the old workflow returned success, so the test exited 101
+  with `a present matcher error must fail instead of proving package absence`;
+- the initial native-checklist assertion exited 101 because the old recipe had
+  no matcher preflight; and
+- the strengthened native cleanup assertion exited 101 until successful
+  temporary-file removal was explicitly proved before clearing the trap.
+
+The shipped regression keeps the test total unchanged by consolidating both
+policy boundaries in
+`dependency_advisory_guards_fail_closed_and_precede_the_exact_audit`. It
+executes the extracted CI shell with `bash -e`, exact fake Cargo argv, and
+working, absent, and status-2 matchers. It proves graph-generation failure,
+target-active failure, clean absence success, missing-matcher failure,
+present-matcher failure, content-free output, temporary cleanup, and
+graph-before-audit ordering. The non-executing native assertion checks the
+parked-parser-safe documentation boundary without running the complete Step 2
+recipe. Focused GREEN was 3/3 in `tests/surface_policy.rs`.
+
+Both recipes now use the exact three-way contract:
+
+- status 0 prints the existing target-active message and fails;
+- status 1 alone proves absence and may continue; and
+- every other status prints a content-free matcher-evaluation error and fails.
+
+Both use quiet matching so neither a package line nor the full graph is
+printed. CI preserves its matcher preflight, exact locked ARM64 all-feature
+unprefixed graph, explicit generation failure, bounded temporary file, cleanup
+trap, and graph-before-audit ordering. Native Step 2 adds the same preflight,
+fails closed if temporary creation or removal fails, retains the cleanup trap
+on every failure, removes the graph on success, clears the persistent trap, and
+only then reaches the exact two-ID audit.
+
+## Round-2 remediation verification
+
+Every required gate below was rerun at exact committed implementation head
+`48bb0cc1ee52ed237183652282c9404cfdee4102`:
+
+| Gate | Actual committed-head result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Pass |
+| `cargo test --all-targets --all-features --locked` | 355 passed; 0 failed; 0 ignored |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | Pass |
+| `cargo build --release --locked` | Pass |
+| `actionlint .github/workflows/ci.yml` | Pass |
+| supported locked ARM64 all-feature unprefixed graph | Pass; `quick-xml` absent |
+| locked all-target all-feature unprefixed positive control | Pass; exact `quick-xml v0.39.4` present |
+| exact two-ID `cargo audit` | Pass; 346 dependencies, 0 vulnerabilities, 1 allowed maintenance warning |
+| `cargo deny check advisories --warn unmaintained` | Pass; reviewed `ttf-parser` warning visible |
+| `cargo deny check licenses` | Pass; required unused MPL-2.0 baseline warning visible |
+| `cargo deny check bans` | Pass |
+| `cargo deny check sources` | Pass |
+| `cargo deny check --warn unmaintained` | Pass; all four components green |
+| focused fallback/surface/SSH contracts | 22 passed; 0 failed |
+| exact source-policy checks | Pass |
+| local PyYAML parse | `ci_yaml=valid` |
+| official security-policy resolution | Exactly `["SECURITY.md"]`; root and `src` resolve the root policy |
+| threat citations | 189/189 valid; 108 unique path/range tuples |
+| local Markdown links | 24/24 valid |
+| sensitive-keyword classification | 100/100 explanatory or synthetic |
+| real-data documentation scan | 0 matches |
+| exact round-2 implementation boundary | 3/3 allowed files only |
+| protected metadata and SHA-256 | All four exactly match the required baseline |
+| Task 14B artifact boundary | 0 tracked artifacts; two pre-existing ignored empty directories untouched |
+| `git diff --check` and tracked status | Pass; clean |
+
+The full total remains exactly 355 tests:
+
+```text
+151 + 0 + 13 + 3 + 12 + 14 + 7 + 17 + 39 + 3 + 15 + 7 + 14 + 3 +
+16 + 23 + 4 + 11 + 3 = 355
+```
+
+The updated report is committed separately. The same complete offline gate set
+is rerun at that report-only head and supplied in the controller-facing
+completion response. Independent round-3 review remains pending and is not
+claimed as approved. Hosted GitHub Actions, Task 14B parser smoke, live native
+acceptance, fallback acceptance, rollback execution, and rollout remain
+separate and unperformed.
+
 ## Protected rollback artifacts and parked stash
 
 Only metadata and SHA-256 were read for the four rollback artifacts; no file
@@ -418,8 +529,10 @@ claim is made. It was neither applied, edited, dropped, recreated, nor touched.
 
 - The original Task 14A source diff changes dependency features/lock data only.
   Round-1 remediation adds only four fixed public-key SSH options and their
-  exact argv contracts; no public API, CLI contract, remote command, VNC,
-  fallback, ticket, transport ownership, or cleanup lifecycle was changed.
+  exact argv contracts. Round-2 remediation changes only the two graph-policy
+  recipes and their executable/documentation contract test. No public API, CLI
+  contract, remote command, VNC, fallback, ticket, transport ownership, or
+  cleanup lifecycle was changed.
 - CI's only advisory ignores are the two exact target-inactive `quick-xml`
   IDs, ordered after the ARM64 graph assertion. Active `webbrowser` is upgraded
   and never ignored.
@@ -444,8 +557,8 @@ Remaining concerns are explicit rather than accepted silently:
    remains green, and it expires for review by 2027-02-28.
 3. Hosted CI has not run at this head and branch protection was not inspected or
    changed.
-4. Independent round-1 review is complete with the five findings remediated;
-   round-2 review is pending and not approved. Every live/native/fallback/
-   rollback/rollout gate remains unexecuted.
+4. Independent round-2 review is complete with its one Important finding
+   remediated; round-3 review is pending and not approved. Every live/native/
+   fallback/rollback/rollout gate remains unexecuted.
 5. Complete acceptance remains blocked on the parked Task 14B parser-smoke and
    merge-workflow tranche.
