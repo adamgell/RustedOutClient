@@ -3,19 +3,27 @@
 ## Outcome
 
 The Task 14A non-fuzz governance/documentation tranche, review-fix rounds 1
-through 4, and the controller's post-round-2 cleanup-proof correction are
-implemented locally. Independent round 4 returned `Identity: PASS`,
-`Spec: FAIL`, and `Quality: CHANGES REQUIRED`, with no Critical or Important
-findings and one Minor proxy-ticket-lifetime documentation finding. The
-round-4 finding is remediated by the exact documentation and evidence below.
-Independent round-5 review is pending and is not claimed as approved. Hosted
-CI, live native acceptance, TigerVNC fallback acceptance, rollback execution,
-and rollout were not performed and are not claimed.
+through 4, the controller's post-round-2 cleanup-proof correction, and the
+focused hosted-CI source-matcher remediation are implemented locally.
+Independent round 4 returned `Identity: PASS`, `Spec: FAIL`, and
+`Quality: CHANGES REQUIRED`, with no Critical or Important findings and one
+Minor proxy-ticket-lifetime documentation finding; that finding was remediated
+before the first hosted run.
+
+Hosted run `33401426994`, job `99518395823`, executed exact head
+`1f8384adfd0c254b346db09f0d9b9915efd7c8d7`. It passed checkout,
+architecture, pinned Rust/tool installation, formatting, all 356 tests, and
+warnings-denied Clippy, then failed closed in `Enforce source policy` because
+the `macos-26` image did not provide `rg`. The pinned matcher bootstrap is now
+implemented and tested locally, but no fresh hosted run has observed it and
+hosted CI is not claimed green. Live native acceptance, TigerVNC fallback
+acceptance, rollback execution, and rollout were not performed and are not
+claimed.
 
 Task 14B remains the sole deferred parser-smoke/fuzz target, script, corpus, and
-workflow scope. No tracked Task 14B target, script, workflow, corpus, or parser
-input was introduced or run. The two pre-existing ignored empty directories
-under `fuzz/artifacts` remained untouched and contain zero files.
+workflow scope. This focused repair did not create, inspect, or run any Task 14B
+target, script, workflow, corpus, parser input, smoke test, or ignored fuzz
+directory, so it makes no fresh artifact-count claim.
 
 ## Exact heads and commits
 
@@ -57,8 +65,15 @@ under `fuzz/artifacts` remained untouched and contain zero files.
 - Round-4 documentation correction head:
   `5527325f9dfcbd21e9c5e50087f01cae2e0ad6b7`
   (`docs: correct proxy ticket lifetime`)
-- This updated report is committed separately. Its new commit SHA and the
-  required post-report-commit gate results are reported by the controller-facing
+- Round-4 evidence report and exact hosted-CI fix base:
+  `1f8384adfd0c254b346db09f0d9b9915efd7c8d7`
+  (`docs: record Task 14A review round 4 fix`)
+- Hosted-CI matcher remediation implementation head:
+  `6d9444d4e1597dccbad5265b3023150454cc4858`
+  (`fix: install pinned CI source matcher`)
+- The hosted-CI evidence and citation repair are committed separately with
+  `docs: record hosted CI matcher remediation`. Its SHA and the required
+  post-report-commit gate results are reported by the controller-facing
   completion response rather than embedded self-referentially here.
 
 The named branch and shared worktree are preserved. No push, amend, rebase,
@@ -148,6 +163,22 @@ It replaces only the VNC proxy ticket resource row. It changes no runtime Rust,
 test, CI, policy, configuration, acceptance behavior, dependency, manifest,
 lock data, parser/fuzz scope, live state, or protected rollback artifact. The
 round-4 evidence commit changes only this report.
+
+Hosted-CI remediation implementation commit
+`6d9444d4e1597dccbad5265b3023150454cc4858` contains exactly:
+
+- `.github/workflows/ci.yml`
+- `tests/surface_policy.rs`
+
+The follow-up evidence commit contains only:
+
+- `docs/threat-model.md`
+- `.superpowers/sdd/2026-08-29-rustedoutclient-proxmox-vnc/task-14a-report.md`
+- `.superpowers/sdd/2026-08-29-rustedoutclient-proxmox-vnc/task-14a-hosted-ci-fix-report.md`
+
+No Rust production source, manifest, lock data, dependency policy, CLI,
+SSH/VNC/fallback behavior, private artifact, parser/fuzz scope, or live state
+changes in either hosted-CI remediation commit.
 
 ## RED / baseline evidence
 
@@ -314,9 +345,9 @@ Inverse target trees were run for each skipped package, both advisory paths,
 `.github/workflows/ci.yml` runs for pull requests and pushes to `main` with
 read-only contents permission, concurrency cancellation, and a 45-minute
 timeout on `macos-26`. It asserts ARM64, installs Rust 1.92.0 and exact locked
-`cargo-audit` 0.22.2 / `cargo-deny` 0.19.0, then runs the formatting, locked
-all-target test, warnings-denied lint, source-policy, target graph, exact audit,
-deny, and locked release gates.
+`cargo-audit` 0.22.2, `cargo-deny` 0.19.0, and `ripgrep` 15.2.0, then runs the
+formatting, locked all-target test, warnings-denied lint, source-policy, target
+graph, exact audit, deny, and locked release gates.
 
 Checkout is pinned to
 `actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4` with
@@ -331,20 +362,31 @@ cargo tree --locked --target aarch64-apple-darwin --all-features --format '{p}' 
 Only a successfully generated complete graph is checked for `^quick-xml v`.
 The exact two-ID audit runs afterward in a separate ordered step.
 
-The workflow has no fuzzing, artifact upload, secret, live endpoint, service,
-or elevated-permission step. Local PyYAML parsing returned `ci_yaml=valid`.
-The exact CI `rg` checks found no SFTP/SCP source surface and no
-`StrictHostKeyChecking=no`, `StrictHostKeyChecking=accept-new`, or
-`UserKnownHostsFile=/dev/null` weakening. Hosted GitHub Actions execution was
-not performed and is not claimed; branch-protection enforcement remains a
-repository-host setting outside this local task.
+The pinned tool block now installs exact locked `ripgrep` 15.2.0 after
+`cargo-audit` 0.22.2 and `cargo-deny` 0.19.0. Ripgrep 15.2.0 requires Rust 1.85,
+so it is compatible with the workflow's already-selected Rust 1.92.0. The
+workflow has no fuzzing, artifact upload, secret, live endpoint, service, or
+elevated-permission step. The exact local source-policy block found no SFTP/SCP
+source surface and no `StrictHostKeyChecking=no`,
+`StrictHostKeyChecking=accept-new`, or `UserKnownHostsFile=/dev/null`
+weakening.
+
+The first hosted run at exact pre-fix head
+`1f8384adfd0c254b346db09f0d9b9915efd7c8d7` failed closed only after the
+earlier hosted steps passed because the official `macos-26` image inventory did
+not list ripgrep and the workflow had not installed it. The local developer Mac
+already had ripgrep 15.2.0, which is why prior local matcher execution did not
+reproduce the missing-tool state. No hosted execution has run at the remediation
+head, and branch-protection enforcement remains a repository-host setting
+outside this local task.
 
 Compiled policy gates passed separately:
 
 - `tests/fallback_contract.rs`: 15 passed, proving the single approved
   loopback-bind/listener boundary and fallback source contract;
-- `tests/surface_policy.rs`: 3 passed, proving excluded product/CLI surfaces,
-  SHA-pinned checkout without persisted credentials, and executable fail-closed
+- `tests/surface_policy.rs`: 5 passed, proving excluded product/CLI surfaces,
+  SHA-pinned checkout without persisted credentials, the exact pinned matcher
+  bootstrap, executable fail-closed source matchers, and executable fail-closed
   advisory-guard behavior.
 
 ## Security policy, threat model, and operator docs
@@ -783,6 +825,128 @@ rerun at that final report-only head and supplied in the controller-facing
 completion response. Independent round-5 review is pending and is not claimed
 as approved.
 
+## Hosted-CI pinned source-matcher remediation
+
+### Hosted evidence and root cause
+
+The first hosted macOS ARM64 run was GitHub Actions run `33401426994`, job
+`99518395823`, at exact branch head
+`1f8384adfd0c254b346db09f0d9b9915efd7c8d7`. Checkout, the ARM64 assertion,
+Rust 1.92.0 setup, pinned `cargo-audit`/`cargo-deny` installation, formatting,
+all 356 tests, and warnings-denied Clippy passed. The next step, `Enforce source
+policy`, failed with the exact content-free output:
+
+```text
+Required source-policy matcher is unavailable
+```
+
+The workflow correctly failed closed because its preflight could not find
+`rg`, but it incorrectly assumed that the official `macos-26` runner image
+provided the matcher. The runner-image inventory did not list ripgrep and the
+workflow did not install it. Earlier local verification did not reproduce the
+missing-tool state because the developer Mac already had ripgrep 15.2.0.
+
+### Strict RED/GREEN regression
+
+The new
+`ci_bootstraps_exact_pinned_source_matcher_before_source_policy` contract was
+added before the workflow changed. It extracts and executes the real pinned
+tool-install block followed by the real source-policy block. The test clears
+the inherited environment, starts with a test-owned `PATH` containing a
+specific fake `cargo` and no `rg`, and uses a synthetic clean `src` tree. The
+fake install boundary accepts the two existing exact pinned tool commands in
+order and creates an executable clean matcher only for this exact third call:
+
+```text
+install ripgrep --version 15.2.0 --locked
+```
+
+Deletion, misspelling, reordering, unpinning, or removing `--locked` therefore
+prevents matcher creation or fails the fake install. The untouched workflow's
+actual RED run exited 101 with 0 passed, 1 failed, and 4 filtered tests. Its
+synthetic standard output was exactly:
+
+```text
+Required source-policy matcher is unavailable
+```
+
+Synthetic standard error was empty. The minimum implementation added exactly:
+
+```text
+cargo install ripgrep --version 15.2.0 --locked
+```
+
+to the existing pinned supply-chain tool block after the two existing tool
+installs and before every matcher-dependent step. Focused GREEN was 1/1 and
+the complete `surface_policy` suite was 5/5. The pre-existing executable test
+continued to prove missing matcher, status 0, status 1, independent status-2
+errors, partial-output suppression, standard-error suppression, and both
+source matchers. The supported-graph test continued to prove generation
+failure, matcher absence/error, target-active failure, clean absence, and
+temporary-file cleanup.
+
+Ripgrep 15.2.0 is pinned and locked. Its declared minimum Rust is 1.85, so it
+is compatible with the workflow's earlier exact Rust 1.92.0 selection. No
+Homebrew, mutable latest install, cache, download script, artifact, secret, or
+permission was added.
+
+### Citation repair and local verification
+
+The one workflow line changes its final length from 128 to 129. All eight
+threat-model workflow citations were recalculated and semantically reviewed:
+
+- broad job ranges are `16-129` (three citations);
+- complete source-policy ranges are `53-89` (two citations);
+- supported-graph through exact-audit ranges are `91-123` (two citations); and
+- the exact cargo-deny range is `125-126` (one citation).
+
+The final threat-model inventory remains 192/192 valid citations with 112
+unique path/range tuples. All 8/8 workflow citations contain the control each
+claim names, and all 24/24 local Markdown links resolve.
+
+The complete pre-evidence-commit offline sequence passed on the final source,
+test, workflow, and threat-model content:
+
+| Gate | Actual result |
+| --- | --- |
+| focused workflow bootstrap contract | 1 passed; 0 failed |
+| all `surface_policy` contracts | 5 passed; 0 failed |
+| `cargo fmt --all -- --check` | Pass |
+| `cargo test --all-targets --all-features --locked` | 357 passed; 0 failed; 0 ignored |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | Pass |
+| `cargo build --release --locked` | Pass |
+| `actionlint .github/workflows/ci.yml` | Pass |
+| extracted actual source-policy block | Pass; both clean matchers returned absence |
+| extracted actual supported-target graph block | Pass; `quick-xml` absent and test-owned temporary directory empty |
+| exact two-ID `cargo audit` | Pass; 346 dependencies, 0 vulnerabilities, 1 allowed `ttf-parser` maintenance warning |
+| `cargo deny list` | Pass |
+| all four cargo-deny components and aggregate | Pass; reviewed `ttf-parser` and unused MPL-2.0 warnings visible |
+| threat citation ranges | 192/192 valid; 112 unique tuples |
+| workflow citation semantics | 8/8 valid |
+| local Markdown links | 24/24 valid |
+| protected artifact starting metadata and SHA-256 | All four matched the required baseline; contents were not read or printed |
+
+The 357 tests are:
+
+```text
+151 + 0 + 13 + 3 + 12 + 14 + 7 + 17 + 39 + 3 + 15 + 7 + 14 + 3 +
+16 + 23 + 4 + 11 + 5 = 357
+```
+
+The final evidence commit is report/documentation only. The same required
+offline sequence, protected metadata/hash comparison, exact diff boundary, and
+clean tracked status are rerun at that commit and supplied in the concise
+controller-facing completion response.
+
+Task 8 and Task 14B parser/fuzz work, fuzzing, live native acceptance, real
+TigerVNC/fallback launch or acceptance, rollback execution, and rollout remain
+unexecuted. No parked stash or parser/fuzz artifact was inspected. No live
+endpoint, private configuration content, credential, address, fingerprint,
+pixel, clipboard value, raw environment snapshot, or private standard error
+was accessed. The implementation was not pushed and the PR was not read or
+modified. A fresh hosted run must be observed by the controller after
+independent review, so hosted CI is not claimed green.
+
 ## Protected rollback artifacts and parked stash
 
 Only metadata and SHA-256 were read for the four rollback artifacts; no file
@@ -822,14 +986,15 @@ claim is made. It was neither applied, edited, dropped, recreated, nor touched.
   present.
 - Documentation is source-backed; all 192 source citations, 112 unique ranges,
   all eight workflow-citation semantics, and all 15 ticket-lifetime semantics
-  validate. It deliberately labels hosted, live, fallback, rollback, and
-  rollout evidence as unexecuted.
+  validate. It distinguishes the failed first hosted run from the unobserved
+  remediation run and labels live, fallback, rollback, and rollout evidence as
+  unexecuted.
 - No live Proxmox/VM, real clipboard, configuration contents, TigerVNC process,
   private credential, host address, fingerprint, guest pixel, or stderr body
   was accessed.
-- No tracked fuzz target, workflow, script, corpus, or parser input was created
-  or run. The two pre-existing ignored empty artifact directories remained
-  untouched and contained zero files at each boundary check.
+- No fuzz target, workflow, script, corpus, parser input, smoke test, or ignored
+  fuzz directory was created, inspected, or run by this focused repair. Per the
+  brief, no fresh Task 14B artifact or directory count was taken.
 
 Remaining concerns are explicit rather than accepted silently:
 
@@ -838,8 +1003,9 @@ Remaining concerns are explicit rather than accepted silently:
 2. `quick-xml` 0.39.4 remains in unsupported Linux/Wayland lock metadata; the
    exact audit exception is safe only while the preceding ARM64 graph assertion
    remains green, and it expires for review by 2027-02-28.
-3. Hosted CI has not run at this head and branch protection was not inspected or
-   changed.
+3. Hosted CI failed closed at the pre-fix head because `rg` was absent. The
+   pinned remediation has not yet been pushed or observed in a fresh hosted run,
+   and branch protection was not inspected or changed.
 4. Independent round-4 review is complete with its one Minor finding
    remediated; round-5 review is pending and not approved. Every live/native/
    fallback/rollback/rollout gate remains unexecuted.
