@@ -20,7 +20,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Assert runner architecture
         shell: bash
@@ -50,6 +52,10 @@ jobs:
       - name: Enforce source policy
         shell: bash
         run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            echo "Required source-policy matcher is unavailable"
+            exit 1
+          fi
           if rg -n -i '\bsftp\b|\bscp\b' src; then
             echo "Disallowed file-transfer surface found in repository source"
             exit 1
@@ -62,7 +68,20 @@ jobs:
       - name: Assert target-inactive advisory packages
         shell: bash
         run: |
-          if cargo tree --target aarch64-apple-darwin --format '{p}' | rg '^quick-xml v'; then
+          if ! command -v rg >/dev/null 2>&1; then
+            echo "Required dependency-policy matcher is unavailable"
+            exit 1
+          fi
+          graph_file="$(mktemp "${TMPDIR:-/tmp}/rustedoutclient-supported-graph.XXXXXX")" || {
+            echo "Could not create the supported dependency graph file"
+            exit 1
+          }
+          trap 'rm -f "$graph_file"' EXIT
+          if ! cargo tree --locked --target aarch64-apple-darwin --all-features --format '{p}' --prefix none > "$graph_file"; then
+            echo "Could not generate the supported macOS ARM64 dependency graph"
+            exit 1
+          fi
+          if rg '^quick-xml v' "$graph_file"; then
             echo "quick-xml unexpectedly entered the supported macOS ARM64 graph"
             exit 1
           fi

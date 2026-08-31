@@ -59,11 +59,13 @@ either `null` or an absolute path to the viewer executable.
 
 The application never stores an SSH password, private key, VNC ticket, VNC
 password, host fingerprint, guest pixels, clipboard contents, or raw process
-output. Authentication comes from the system OpenSSH key or agent. Establish
-the intended host key in the user's OpenSSH `known_hosts` through a trusted
-external process before using the app. Runtime SSH uses strict host-key
-checking and fails closed for unknown or changed keys; RustedOutClient does not
-offer an accept-new or trust-bypass switch.
+output. Authentication comes from a system OpenSSH public key or agent. Fixed
+runtime options enable only public-key authentication and disable GSSAPI,
+hostbased, password, and keyboard-interactive authentication. Establish the
+intended host key in the user's OpenSSH `known_hosts` through a trusted external
+process before using the app. Runtime SSH uses strict host-key checking and
+fails closed for unknown or changed keys; RustedOutClient does not offer an
+accept-new or trust-bypass switch.
 
 ### Legacy import boundary
 
@@ -73,6 +75,26 @@ not import a password or ticket. The application does not automatically run
 that importer at startup. Until an operator-facing import flow is accepted,
 create or review the new configuration explicitly and keep the old file
 read-only as described in [Migration and rollback](migration.md).
+
+### Inventory preload boundary
+
+The application keeps a non-secret `inventory-v1.json` cache beside
+`config.json`. The shared application directory must remain mode `0700`, and an
+existing cache must be a regular mode-`0600` file; replacement uses a private
+mode-`0600` temporary file and atomic rename. Inventory still identifies private
+infrastructure, so do not print or publish the cache.
+
+At configured startup, a valid cached inventory is marked stale and displayed
+immediately. The session manager then starts or verifies its one owned OpenSSH
+ControlMaster, performs a live inventory refresh, replaces the cache, and marks
+the new inventory live. Loading or refreshing this inventory does not run `qm
+vncproxy`, create a VNC ticket, or start an RFB/framebuffer session in the
+background.
+
+Opening a VM is a separate explicit action. Before ticket creation, the owned
+master is rechecked, fresh inventory is fetched, and the selected VM is proved
+present and running. A stale preload therefore improves workspace startup but
+never authorizes a console or supplies the final VM state used to open one.
 
 ## Commands
 

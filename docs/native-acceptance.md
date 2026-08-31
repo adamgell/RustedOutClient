@@ -28,7 +28,16 @@ Run and record:
 cargo fmt --all -- --check
 cargo test --all-targets --all-features --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo tree --target aarch64-apple-darwin --all-features -i quick-xml
+graph_file="$(mktemp "${TMPDIR:-/tmp}/rustedoutclient-supported-graph.XXXXXX")"
+if ! cargo tree --locked --target aarch64-apple-darwin --all-features --format '{p}' --prefix none > "$graph_file"; then
+  rm -f "$graph_file"
+  exit 1
+fi
+if rg '^quick-xml v' "$graph_file"; then
+  rm -f "$graph_file"
+  exit 1
+fi
+rm -f "$graph_file"
 cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 cargo deny check --warn unmaintained
 ./scripts/fuzz-smoke.sh 30
@@ -79,9 +88,8 @@ selector, run the protected old route:
 ```
 
 Observe inventory, viewer connection, framebuffer, pointer, and normal
-keyboard behavior. Record operator-Open to visible-guest timing by stopwatch or
-temporary screen-recording timestamps; delete the recording after transcribing
-timings.
+keyboard behavior. Record operator-Open to visible-guest timing by stopwatch,
+retaining only the content-free elapsed values.
 
 ### Step 7: Perform native RustedOutClient acceptance
 

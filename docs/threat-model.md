@@ -22,14 +22,14 @@ relay one loopback connection to the same verified SSH proxy.
 | --- | --- | --- |
 | Profile/configuration | Validates the stored schema, SSH target, node, VM IDs, private modes, and atomic replacement | `src/config.rs:20-40`, `src/config.rs:93-125`, `src/model.rs:24-35`, `src/model.rs:65-79`, `src/model.rs:109-115`, `src/config.rs:161-180`, `src/config.rs:200-225` |
 | CLI and GUI | Admit only semantic inventory/session actions and a narrow host clipboard adapter | `src/cli.rs:23-89`, `src/session/events.rs:53-86`, `src/app/actions.rs:86-125`, `src/app/actions.rs:127-150` |
-| SSH transport | Pins system OpenSSH, strict trust options, reviewed command shapes, and exact owned child lifecycles | `src/ssh/command.rs:20-29`, `src/ssh/command.rs:49-68`, `src/ssh/command.rs:86-198`, `src/ssh/master.rs:196-275`, `src/ssh/stream.rs:824-960` |
+| SSH transport | Pins system OpenSSH, public-key-only authentication and strict trust options, reviewed command shapes, and exact owned child lifecycles | `src/ssh/command.rs:20-33`, `src/ssh/command.rs:53-73`, `src/ssh/command.rs:90-203`, `src/ssh/master.rs:196-275`, `src/ssh/stream.rs:824-960` |
 | Proxmox proxy ticket | Generates a short-lived eight-byte OS-CSPRNG secret, keeps it redacted, and couples it to a live revalidated VM | `src/ssh/proxy.rs:20-105`, `src/ssh/proxy.rs:122-188` |
 | Native RFB | Requires `TrustedSshProxy`, permits only VNC Auth type 2, bounds parsing/allocation, and owns bounded queues | `src/vnc/client.rs:591-664`, `src/vnc/security.rs:122-187`, `src/vnc/limits.rs:3-41`, `src/connection.rs:8-9`, `src/connection.rs:118-135` |
 | Framebuffer/UI delivery | Bounds RGBA allocation and keeps pixel-bearing uploads out of `Debug`/`Display` | `src/vnc/limits.rs:53-100`, `src/app/state.rs:107-158`, `src/app/state.rs:161-223` |
 | Clipboard | Defaults off, requires an explicit direction-specific action, enforces one MiB, and retains at most one one-shot remote value | `src/config.rs:77-90`, `src/app/actions.rs:291-337`, `src/vnc/input.rs:8-74`, `src/vnc/input.rs:225-253`, `src/connection.rs:70-101` |
 | Dynamic Resolution | Normalizes backing pixels, debounces 250 ms, permits one in-flight request, and classifies bounded outcomes | `src/vnc/client.rs:198-235`, `src/session/manager.rs:45-50`, `src/session/manager.rs:337-435`, `src/session/manager.rs:700-785`, `src/session/manager.rs:942-1039` |
 | Manual TigerVNC fallback | Owns one loopback listener, private viewer/password snapshots, fixed arguments/environment, relay, and cleanup | `src/fallback/relay.rs:32-34`, `src/fallback/relay.rs:49-82`, `src/fallback/mod.rs:241-297`, `src/fallback/mod.rs:333-485`, `src/fallback/mod.rs:499-540`, `src/fallback/password_file.rs:146-235` |
-| Supply chain/CI | Restricts the supported target, sources, licenses, duplicates, toolchain, audit exception, tests, and source policies | `deny.toml:1-59`, `.github/workflows/ci.yml:16-77` |
+| Supply chain/CI | Restricts the supported target, sources, licenses, duplicates, toolchain, fail-closed audit exception, tests, and source policies; checkout is SHA-pinned without persisted credentials | `deny.toml:1-59`, `.github/workflows/ci.yml:16-96` |
 
 ### Effective resources and ownership
 
@@ -38,7 +38,7 @@ relay one loopback connection to the same verified SSH proxy.
 | Configuration and inventory cache | Private application directory; mode-0600 files replaced through private temporary files and atomic rename | Persistent non-secret topology still reveals private infrastructure and must remain user-private (`src/config.rs:200-225`, `src/cache.rs:67-120`) |
 | SSH control socket/runtime directory | One process-owned mode-0700 temporary directory under `/tmp`; removed by `TempDir` | Keeps socket paths short/private but does not protect against compromise of the same user (`src/runtime.rs:11-40`) |
 | SSH master, inventory, and proxy children | Exact child handles with bounded wait/kill/reap/drain paths | Prevents broad process killing and makes cleanup failure explicit (`src/ssh/master.rs:218-275`, `src/ssh/master.rs:332-404`, `src/ssh/stream.rs:824-960`) |
-| VNC proxy ticket | Eight-byte secret in Rust/process/OpenSSH environment memory until authentication or fallback handoff completes | Same-user process inspection remains a residual risk; the value is excluded from public traits and `Debug` (`src/ssh/proxy.rs:25-105`, `src/ssh/command.rs:31-68`) |
+| VNC proxy ticket | Eight-byte secret in Rust/process/OpenSSH environment memory until authentication or fallback handoff completes | Same-user process inspection remains a residual risk; the value is excluded from public traits and `Debug` (`src/ssh/proxy.rs:25-105`, `src/ssh/command.rs:135-156`) |
 | Framebuffer and clipboard | Process memory only; framebuffer events are bounded/coalesced and remote clipboard is one replacing slot | Local memory compromise can disclose content despite no persistence (`src/app/state.rs:107-158`, `src/connection.rs:70-101`) |
 | Fallback viewer/password artifacts | Mode-0500 executable snapshot and mode-0600 obfuscated password file inside the private runtime; one fallback owner | Temporary on-disk material exists only for the explicit fallback and must be cleaned on every path (`src/fallback/viewer.rs:146-238`, `src/fallback/password_file.rs:146-293`) |
 | Fallback listener | One ephemeral IPv4 loopback listener, dropped after the first accept | Local same-host processes can race to connect; peer loopback checks and VNC Auth mitigate but do not create a sandbox (`src/fallback/relay.rs:32-34`, `src/fallback/relay.rs:63-101`) |
@@ -122,17 +122,18 @@ clipboard memory and the UI/OS. The fallback adds a same-host loopback boundary.
   sends semantic app/session actions through nonblocking bounded sinks
   (`src/app/actions.rs:80-97`, `src/session/events.rs:33-86`).
 - **OpenSSH trust and command execution.** Production is pinned to
-  `/usr/bin/ssh`; `StrictHostKeyChecking=yes`, batch mode, and disabled password
-  and keyboard-interactive authentication are fixed (`src/ssh/command.rs:20-29`,
-  `src/ssh/command.rs:92-110`). Local process creation uses separate program,
+  `/usr/bin/ssh`; strict host verification, batch mode, and public-key-only
+  authentication are fixed. GSSAPI, hostbased, password, and keyboard-
+  interactive authentication are disabled (`src/ssh/command.rs:20-33`,
+  `src/ssh/command.rs:96-115`). Local process creation uses separate program,
   argument, and environment values, clears inherited `LC_PVE_TICKET`, and never
-  invokes a local command interpreter (`src/ssh/command.rs:31-68`). Only control
+  invokes a local command interpreter (`src/ssh/command.rs:35-73`). Only control
   master/check/exit, read-only `pvesh` inventory, and `qm vncproxy <validated
-  VMID>` shapes are produced (`src/ssh/command.rs:101-198`).
+  VMID>` shapes are produced (`src/ssh/command.rs:105-203`).
 - **Ticket/environment.** A ticket is generated only after exact master recheck,
   live inventory lookup, and running-state validation; it is passed as the one
   approved `LC_PVE_TICKET` value and not in argv (`src/ssh/proxy.rs:141-188`,
-  `src/ssh/command.rs:131-152`). Its type omits clone/display/serialization and
+  `src/ssh/command.rs:135-156`). Its type omits clone/display/serialization and
   redacts `Debug` (`src/ssh/proxy.rs:25-105`).
 - **RFB trust.** The production VNC entry point requires the private-state
   `TrustedSshProxy`, not an arbitrary socket (`src/vnc/client.rs:591-664`). Only
@@ -212,8 +213,11 @@ clipboard memory and the UI/OS. The fallback adds a same-host loopback boundary.
 - Parser-smoke work and its workflow are deferred to Task 14B; the complete
   native acceptance gate therefore remains blocked.
 - The compatibility plan for moving beyond egui/eframe 0.31, including replacing
-  unmaintained `ttf-parser` 0.25.1, remains open until review by 2027-02-28
-  (`Cargo.lock:2598-2602`).
+  unmaintained `ttf-parser` 0.25.1, remains open until review by 2027-02-28. The
+  lockfile records the active package chain through direct `egui`, `epaint`,
+  `ab_glyph`, and `owned_ttf_parser` (`Cargo.lock:2007-2037`,
+  `Cargo.lock:613-625`, `Cargo.lock:673-688`, `Cargo.lock:5-13`,
+  `Cargo.lock:1710-1716`, `Cargo.lock:2598-2602`).
 
 ## 3. Attack Surface, Mitigations, and Attacker Stories
 
@@ -222,34 +226,41 @@ clipboard memory and the UI/OS. The fallback adds a same-host loopback boundary.
 | Surface | Plausible attack | Mitigations and evidence | Residual risk |
 | --- | --- | --- | --- |
 | Profile and CLI | Option injection, malformed node/VM, unintended endpoint or command | Typed grammars reject leading-dash/whitespace targets and bound node/VM values; CLI has no direct VNC endpoint or secret flags (`src/model.rs:24-35`, `src/model.rs:65-79`, `src/cli.rs:23-89`) | A syntactically valid but wrong trusted target remains operator error |
-| OpenSSH/known-hosts | MITM, trust downgrade, password prompt, arbitrary remote execution | Fixed system executable and strict options; key/agent only; reviewed remote argument shapes; source-policy CI rejects weakening flags and file-transfer terms (`src/ssh/command.rs:20-29`, `src/ssh/command.rs:101-198`, `.github/workflows/ci.yml:50-60`) | Compromised known-hosts or system OpenSSH is outside the process boundary |
-| Ticket memory/environment | Ticket disclosure in argv, logs, inherited environment, crash evidence | Generated after revalidation, absent from argv, inherited value cleared, one explicit environment value, redacted nonserializable type (`src/ssh/command.rs:49-68`, `src/ssh/command.rs:131-152`, `src/ssh/proxy.rs:25-105`) | Same-user memory/process inspection can still observe a live secret |
+| OpenSSH/known-hosts | MITM, trust downgrade, alternate authentication, password prompt, arbitrary remote execution | Fixed system executable and strict options; public-key only with GSSAPI, hostbased, password, and keyboard-interactive disabled; reviewed remote argument shapes; source-policy CI rejects weakening flags and file-transfer terms (`src/ssh/command.rs:20-33`, `src/ssh/command.rs:105-203`, `.github/workflows/ci.yml:52-66`) | Compromised known-hosts or system OpenSSH is outside the process boundary |
+| Ticket memory/environment | Ticket disclosure in argv, logs, inherited environment, crash evidence | Generated after revalidation, absent from argv, inherited value cleared, one explicit environment value, redacted nonserializable type (`src/ssh/command.rs:53-73`, `src/ssh/command.rs:135-156`, `src/ssh/proxy.rs:25-105`) | Same-user memory/process inspection can still observe a live secret |
 | Inventory and RFB bytes | Oversized allocation, decompression/decoder abuse, malformed layout, auth downgrade | Read caps, checked arithmetic, fail-closed parsers, target-specific protocol ceilings, VNC Auth allowlist over typed SSH proxy (`src/ssh/inventory.rs:22-26`, `src/vnc/wire.rs:121-189`, `src/vnc/limits.rs:3-41`, `src/vnc/security.rs:122-187`) | Parser/decoder defects may remain; deferred parser smoke reduces confidence |
-| Framebuffer and UI queue | Guest pixels leaked to logs/artifacts; server floods UI | No pixel `Debug`/`Display`; bounded queues; checked transactional RGBA updates; CI uploads no artifacts (`src/app/state.rs:107-158`, `src/app/state.rs:198-223`, `.github/workflows/ci.yml:41-77`) | Pixels remain sensitive in process/GPU memory while displayed |
+| Framebuffer and UI queue | Guest pixels leaked to logs/artifacts; server floods UI | No pixel `Debug`/`Display`; bounded queues; checked transactional RGBA updates; CI uploads no artifacts (`src/app/state.rs:107-158`, `src/app/state.rs:198-223`, `.github/workflows/ci.yml:16-96`) | Pixels remain sensitive in process/GPU memory while displayed |
 | Keyboard/pointer | Input crosses sessions, sticks after focus loss, bypasses view-only | Semantic session IDs, readiness/view-only checks, bounded key tracking, release-all and exact cleanup (`src/vnc/input.rs:104-223`, `src/session/manager.rs:649-690`, `src/session/manager.rs:1052-1085`) | A compromised guest naturally receives input intentionally sent to it |
 | Clipboard | Silent collection, unbounded payload, wrong direction/session, content logging | Default off; explicit Send/Receive; one-shot replacing slot; UTF-8 and one-MiB bounds; content-free types/errors (`src/config.rs:77-90`, `src/app/actions.rs:291-323`, `src/connection.rs:70-101`, `src/vnc/input.rs:36-74`) | Enabling clipboard intentionally exposes selected text to one endpoint/host clipboard |
 | Dynamic Resolution | Resize storm, excessive geometry, stale reply mutates wrong request | Backing-pixel normalization, global bounds, multiples of eight, 250 ms debounce, one in-flight request, newest replacement, typed outcomes, Fit fallback (`src/vnc/client.rs:198-235`, `src/session/manager.rs:337-435`, `src/session/manager.rs:942-1039`) | Guest/driver may reject or ignore requests; no guarantee of Applied |
 | Config/cache/runtime files | Symlink/race, broad permissions, partial replacement, stale secret residue | Mode checks, no-follow cache traversal, private temporary files, sync/rename, process-owned mode-0700 runtime (`src/config.rs:200-279`, `src/cache.rs:170-252`, `src/runtime.rs:11-40`) | Same-user compromise can still modify user-owned data |
 | TigerVNC fallback | LAN exposure, loopback race, viewer substitution, password-file residue, inherited environment | Manual only; source executable opened then privately snapshotted; one IPv4 loopback listener; peer check; fixed argv; cleared environment; password/viewer RAII cleanup (`src/fallback/viewer.rs:146-238`, `src/fallback/relay.rs:32-101`, `src/fallback/mod.rs:241-297`, `src/fallback/mod.rs:499-540`) | Local race and third-party viewer vulnerabilities remain; fallback is temporary lower assurance |
-| Dependencies/CI | Vulnerable/yanked/unlicensed/Git dependency or policy bypass | macOS-only all-feature graph, crates.io-only source, wildcard/duplicate deny, exact exceptions, pinned toolchain/tools, locked gates (`deny.toml:1-59`, `.github/workflows/ci.yml:16-77`) | CI has not run on GitHub at this head; workflow/action supply chain remains part of review |
+| Dependencies/CI | Vulnerable/yanked/unlicensed/Git dependency or policy bypass | macOS-only all-feature graph, crates.io-only source, wildcard/duplicate deny, exact exceptions, pinned checkout/toolchain/tools, locked fail-closed gates (`deny.toml:1-59`, `.github/workflows/ci.yml:16-96`) | CI has not run on GitHub at this head; workflow/action supply chain remains part of review |
 
 ### Target-inactive advisory and maintenance exception
 
 `quick-xml` 0.39.4 remains lockfile-only for the supported target through
-`egui-winit -> smithay-clipboard -> wayland-scanner` on Linux/Wayland
-(`Cargo.lock:1893-1900`). The CI audit may ignore only `RUSTSEC-2026-0194` and
-`RUSTSEC-2026-0195`, and only after the immediately preceding graph assertion
-proves no `quick-xml` package enters `aarch64-apple-darwin`
-(`.github/workflows/ci.yml:62-71`). Linux is unsupported until that dependency is
-upgraded or the advisories are otherwise closed. Review is required by
-2027-02-28.
-
-`ttf-parser` 0.25.1 remains active through
-`owned_ttf_parser -> ab_glyph -> epaint -> egui` and is unmaintained, not
-resolved (`Cargo.lock:2598-2602`). The cargo-deny command deliberately keeps the
-warning visible (`deny.toml:5-8`, `.github/workflows/ci.yml:73-74`). There is no
-compatible maintained drop-in on the accepted egui/eframe 0.31 line. Review is
+`rustedoutclient -> eframe -> egui-winit -> smithay-clipboard ->
+smithay-client-toolkit -> wayland-scanner -> quick-xml` on Linux/Wayland. The
+lockfile records every package and declared edge (`Cargo.lock:2007-2037`,
+`Cargo.lock:578-610`, `Cargo.lock:628-644`, `Cargo.lock:2255-2263`,
+`Cargo.lock:2228-2252`, `Cargo.lock:2849-2857`, `Cargo.lock:1894-1900`); those
+declarations alone do not prove target activation. The all-target positive
+control observes the chain, while the locked macOS ARM64 all-feature command
+must observe no matching package. CI fails if graph generation or matching-tool
+availability fails, then checks the complete unprefixed graph before the exact
+two-ID audit (`.github/workflows/ci.yml:68-90`). Linux is unsupported until that
+dependency is upgraded or the advisories are otherwise closed. Review is
 required by 2027-02-28.
+
+`ttf-parser` 0.25.1 remains active through `rustedoutclient -> egui -> epaint ->
+ab_glyph -> owned_ttf_parser -> ttf-parser` and is unmaintained, not resolved.
+The lockfile records each material edge and the package (`Cargo.lock:2007-2037`,
+`Cargo.lock:613-625`, `Cargo.lock:673-688`, `Cargo.lock:5-13`,
+`Cargo.lock:1710-1716`, `Cargo.lock:2598-2602`). The cargo-deny command
+deliberately keeps the warning visible (`deny.toml:5-8`,
+`.github/workflows/ci.yml:92-93`). There is no compatible maintained drop-in on
+the accepted egui/eframe 0.31 line. Review is required by 2027-02-28.
 
 ### Attacker stories (hypotheses, not confirmed vulnerabilities)
 
@@ -263,13 +274,13 @@ required by 2027-02-28.
 2. **H2 — host-key downgrade.** An attacker redirects the configured target and
    relies on an automatic trust prompt or permissive flag. Expected control:
    batch mode plus `StrictHostKeyChecking=yes` fails unknown/changed trust, and CI
-   rejects known weakening strings (`src/ssh/command.rs:20-29`,
-   `src/ssh/error.rs:28-64`, `.github/workflows/ci.yml:50-60`). A bypass would be
+   rejects known weakening strings (`src/ssh/command.rs:20-33`,
+   `src/ssh/error.rs:28-64`, `.github/workflows/ci.yml:52-66`). A bypass would be
    Critical or High depending on ticket/key impact.
 3. **H3 — ticket disclosure.** A local observer inspects argv, logs, or inherited
    environment. Expected control: no ticket argv/log field, inherited ticket
    removal, one explicit child environment value, and redacted types
-   (`src/ssh/command.rs:31-68`, `src/ssh/command.rs:131-152`,
+   (`src/ssh/command.rs:35-73`, `src/ssh/command.rs:135-156`,
    `src/ssh/proxy.rs:25-105`). Same-user process-memory inspection remains an
    acknowledged residual risk.
 4. **H4 — clipboard exfiltration.** A server sends repeated clipboard data or
@@ -301,7 +312,8 @@ required by 2027-02-28.
 8. **H8 — dependency exception drifts onto macOS.** A feature or upstream update
    makes vulnerable `quick-xml` target-active while audit still ignores its IDs.
    Expected control: CI checks the target graph immediately before the exact
-   ignore list and fails if the package appears (`.github/workflows/ci.yml:62-71`).
+   ignore list and fails if the graph command fails or the package appears
+   (`.github/workflows/ci.yml:68-90`).
    A policy change that removes or reorders that assertion requires security
    review.
 

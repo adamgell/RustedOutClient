@@ -24,6 +24,10 @@ const COMMON_OPTIONS: &[&str] = &[
     "ServerAliveInterval=15",
     "ServerAliveCountMax=3",
     "StrictHostKeyChecking=yes",
+    "PreferredAuthentications=publickey",
+    "PubkeyAuthentication=yes",
+    "GSSAPIAuthentication=no",
+    "HostbasedAuthentication=no",
     "PasswordAuthentication=no",
     "KbdInteractiveAuthentication=no",
 ];

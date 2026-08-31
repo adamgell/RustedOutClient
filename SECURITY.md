@@ -61,10 +61,11 @@ disclosure but are not a sandbox against an already-compromised account.
 
 The following are product requirements, not optional deployment advice:
 
-- Production SSH uses only system `/usr/bin/ssh` with strict host-key checking,
-  batch mode, key/agent authentication, and password/keyboard-interactive
-  authentication disabled. Trust is established with OpenSSH outside the app;
-  changed or unknown host keys fail closed.
+- Production SSH uses only system `/usr/bin/ssh` with strict host-key checking
+  and batch mode. Fixed options set `PreferredAuthentications=publickey` and
+  `PubkeyAuthentication=yes`, while GSSAPI, hostbased, password, and keyboard-
+  interactive authentication are disabled. Trust and public-key or agent setup
+  happen in OpenSSH outside the app; changed or unknown host keys fail closed.
 - The app executes only the reviewed control-master, inventory, and per-session
   `qm vncproxy` command shapes. Profile, node, and VM identifiers are validated;
   there is no arbitrary remote command, SFTP, SCP, or file-transfer surface.
@@ -139,10 +140,12 @@ violation.
   replacement exists on the accepted egui/eframe 0.31 line. CI keeps the warning
   visible; review is due by 2027-02-28.
 - `quick-xml` 0.39.4 remains in Cargo metadata through the unsupported
-  `egui-winit -> smithay-clipboard -> wayland-scanner` Linux/Wayland path. It is
-  absent from the supported `aarch64-apple-darwin` graph. CI proves that absence
-  before ignoring only `RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` in
-  `cargo audit`; review is due by 2027-02-28.
+  `eframe -> egui-winit -> smithay-clipboard -> smithay-client-toolkit ->
+  wayland-scanner -> quick-xml` Linux/Wayland path. It is absent from the
+  supported `aarch64-apple-darwin` all-feature graph. CI generates that complete
+  locked graph without tree prefixes and fails closed before ignoring only
+  `RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` in `cargo audit`; review is due by
+  2027-02-28.
 - TigerVNC fallback is manual, temporary, and explicitly lower-assurance than
   the embedded path. It requires a configured absolute viewer executable and
   does not count as accepted until its separate live gate passes.

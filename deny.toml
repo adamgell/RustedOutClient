@@ -48,7 +48,7 @@ skip = [
     { crate = "objc2@0.5.2", reason = "eframe/winit need 0.5.2 while arboard/glutin/webbrowser use 0.6.4; review by 2027-02-28" },
     { crate = "objc2-app-kit@0.2.2", reason = "eframe/winit need 0.2.2 while arboard/glutin/webbrowser use 0.3.2; review by 2027-02-28" },
     { crate = "objc2-foundation@0.2.2", reason = "eframe/winit need 0.2.2 while arboard/glutin/webbrowser use 0.3.2; review by 2027-02-28" },
-    { crate = "syn@2.0.118", reason = "the Rust derive ecosystem uses 2.0.118 while clap_derive uses 3.0.4; review by 2027-02-28" },
+    { crate = "syn@2.0.118", reason = "rustedoutclient -> serde -> serde_derive uses 2.0.118 while rustedoutclient -> clap -> clap_derive uses 3.0.4; review by 2027-02-28" },
 ]
 skip-tree = []
 

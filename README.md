@@ -39,8 +39,10 @@ cargo run --locked -- open "Sample VM" --view-only
 
 Configuration lives in the user's private macOS application-support directory.
 It stores targeting and UI preferences, never an SSH password, private key, VNC
-ticket, guest pixels, or clipboard contents. Authentication and host trust stay
-with system OpenSSH. See [Configuration and CLI](docs/configuration.md).
+ticket, guest pixels, or clipboard contents. Fixed system-OpenSSH options permit
+only public-key authentication (including agent-backed keys), disable GSSAPI,
+hostbased, password, and keyboard-interactive authentication, and require strict
+known-host verification. See [Configuration and CLI](docs/configuration.md).
 
 ## Console boundaries
 
