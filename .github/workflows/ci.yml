@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64:
+    name: macOS ARM64
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Assert runner architecture
+        shell: bash
+        run: test "$(uname -m)" = arm64
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.92.0
+
+      - name: Install pinned supply-chain tools
+        shell: bash
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.19.0 --locked
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run all tests
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Lint all targets
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Enforce source policy
+        shell: bash
+        run: |
+          if rg -n -i '\bsftp\b|\bscp\b' src; then
+            echo "Disallowed file-transfer surface found in repository source"
+            exit 1
+          fi
+          if rg -n 'StrictHostKeyChecking=(no|accept-new)|UserKnownHostsFile=/dev/null' src; then
+            echo "Weakened OpenSSH trust flag found in repository source"
+            exit 1
+          fi
+
+      - name: Assert target-inactive advisory packages
+        shell: bash
+        run: |
+          if cargo tree --target aarch64-apple-darwin --format '{p}' | rg '^quick-xml v'; then
+            echo "quick-xml unexpectedly entered the supported macOS ARM64 graph"
+            exit 1
+          fi
+
+      - name: Audit dependencies
+        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+
+      - name: Enforce dependency policy
+        run: cargo deny check --warn unmaintained
+
+      - name: Build release binary
+        run: cargo build --release --locked

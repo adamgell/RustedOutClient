@@ -1,0 +1,59 @@
+[graph]
+targets = ["aarch64-apple-darwin"]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+]
+exceptions = [
+    # Bundled egui fonts use these two non-baseline font licenses. Path:
+    # epaint_default_fonts 0.31.1 -> epaint -> egui. Review by 2027-02-28.
+    { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts@0.31.1" },
+]
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = false
+deny = []
+# These are exact, target-active transitive duplicates. Upgrading one side of
+# each split requires an upstream eframe/egui ecosystem move; review all by
+# 2027-02-28. Each entry names the two paths which currently prevent unification.
+skip = [
+    { crate = "bitflags@1.3.2", reason = "core-graphics -> winit needs 1.3.2 while egui/glutin use 2.13.0; review by 2027-02-28" },
+    { crate = "getrandom@0.2.17", reason = "rand 0.8.7 -> rand_core needs 0.2.17 while rustedoutclient/tempfile/uuid use 0.4.3; review by 2027-02-28" },
+    { crate = "objc2@0.5.2", reason = "eframe/winit need 0.5.2 while arboard/glutin/webbrowser use 0.6.4; review by 2027-02-28" },
+    { crate = "objc2-app-kit@0.2.2", reason = "eframe/winit need 0.2.2 while arboard/glutin/webbrowser use 0.3.2; review by 2027-02-28" },
+    { crate = "objc2-foundation@0.2.2", reason = "eframe/winit need 0.2.2 while arboard/glutin/webbrowser use 0.3.2; review by 2027-02-28" },
+    { crate = "syn@2.0.118", reason = "the Rust derive ecosystem uses 2.0.118 while clap_derive uses 3.0.4; review by 2027-02-28" },
+]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
