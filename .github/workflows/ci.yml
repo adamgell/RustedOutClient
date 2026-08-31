@@ -81,10 +81,20 @@ jobs:
             echo "Could not generate the supported macOS ARM64 dependency graph"
             exit 1
           fi
-          if rg '^quick-xml v' "$graph_file"; then
-            echo "quick-xml unexpectedly entered the supported macOS ARM64 graph"
-            exit 1
-          fi
+          matcher_status=0
+          rg -q '^quick-xml v' "$graph_file" || matcher_status=$?
+          case "$matcher_status" in
+            0)
+              echo "quick-xml unexpectedly entered the supported macOS ARM64 graph"
+              exit 1
+              ;;
+            1)
+              ;;
+            *)
+              echo "Could not evaluate the supported macOS ARM64 dependency policy"
+              exit 1
+              ;;
+          esac
 
       - name: Audit dependencies
         run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195

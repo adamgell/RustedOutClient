@@ -28,16 +28,38 @@ Run and record:
 cargo fmt --all -- --check
 cargo test --all-targets --all-features --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
-graph_file="$(mktemp "${TMPDIR:-/tmp}/rustedoutclient-supported-graph.XXXXXX")"
+if ! command -v rg >/dev/null 2>&1; then
+  echo "Required dependency-policy matcher is unavailable"
+  exit 1
+fi
+graph_file="$(mktemp "${TMPDIR:-/tmp}/rustedoutclient-supported-graph.XXXXXX")" || {
+  echo "Could not create the supported dependency graph file"
+  exit 1
+}
+trap 'rm -f "$graph_file"' EXIT
 if ! cargo tree --locked --target aarch64-apple-darwin --all-features --format '{p}' --prefix none > "$graph_file"; then
-  rm -f "$graph_file"
+  echo "Could not generate the supported macOS ARM64 dependency graph"
   exit 1
 fi
-if rg '^quick-xml v' "$graph_file"; then
-  rm -f "$graph_file"
+matcher_status=0
+rg -q '^quick-xml v' "$graph_file" || matcher_status=$?
+case "$matcher_status" in
+  0)
+    echo "quick-xml unexpectedly entered the supported macOS ARM64 graph"
+    exit 1
+    ;;
+  1)
+    ;;
+  *)
+    echo "Could not evaluate the supported macOS ARM64 dependency policy"
+    exit 1
+    ;;
+esac
+if ! rm -f "$graph_file"; then
+  echo "Could not remove the supported dependency graph file"
   exit 1
 fi
-rm -f "$graph_file"
+trap - EXIT
 cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 cargo deny check --warn unmaintained
 ./scripts/fuzz-smoke.sh 30
