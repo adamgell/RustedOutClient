@@ -43,6 +43,65 @@ fn rust_sources(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn production_portion<'a>(relative_path: &Path, text: &'a str) -> &'a str {
+    const TEST_MODULE_MARKER: &str = "\n#[cfg(test)]\nmod tests {";
+
+    let test_module_declarations = text
+        .lines()
+        .filter(|line| {
+            line.chars()
+                .filter(|character| !character.is_ascii_whitespace())
+                .collect::<String>()
+                .ends_with("modtests{")
+        })
+        .count();
+    let exact_markers = text.matches(TEST_MODULE_MARKER).count();
+    if test_module_declarations == 0 {
+        assert_eq!(
+            exact_markers,
+            0,
+            "{} has an ambiguous test-module marker",
+            relative_path.display()
+        );
+        return text;
+    }
+
+    assert_eq!(
+        test_module_declarations,
+        1,
+        "{} has multiple conventional test modules",
+        relative_path.display()
+    );
+    assert_eq!(
+        exact_markers,
+        1,
+        "{} has an unsupported cfg(test) module layout",
+        relative_path.display()
+    );
+    let (production, test_module) = text
+        .split_once(TEST_MODULE_MARKER)
+        .expect("the exact marker count was checked");
+    let mut consumed = 0;
+    let terminal_module_end = test_module
+        .split_inclusive('\n')
+        .find_map(|line| {
+            consumed += line.len();
+            (line.trim_end_matches(['\r', '\n']) == "}").then_some(consumed)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{} has an unterminated conventional test module",
+                relative_path.display()
+            )
+        });
+    assert!(
+        test_module[terminal_module_end..].trim().is_empty(),
+        "{} has source after its conventional test module",
+        relative_path.display()
+    );
+    production
+}
+
 #[test]
 fn public_surface_is_verified_transport_only_and_contains_no_dangerous_constructor() {
     let fallback = source("src/fallback/mod.rs");
@@ -77,15 +136,12 @@ fn public_surface_is_verified_transport_only_and_contains_no_dangerous_construct
 
 #[test]
 fn listener_process_and_password_artifacts_stay_inside_the_approved_boundary() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let relay = source("src/fallback/relay.rs");
     let password = source("src/fallback/password_file.rs");
     let fallback = source("src/fallback/mod.rs");
     let viewer = source("src/fallback/viewer.rs");
     let manager = source("src/session/manager.rs");
-    let manager_production = manager
-        .split("\n#[cfg(test)]\nmod tests")
-        .next()
-        .expect("session manager source has a production section");
     assert!(relay.contains("TcpListener::bind((Ipv4Addr::LOCALHOST, 0))"));
     assert!(relay.contains("copy_bidirectional"));
     assert!(viewer.contains("File::open(configured_path)"));
@@ -95,43 +151,75 @@ fn listener_process_and_password_artifacts_stay_inside_the_approved_boundary() {
     assert!(!fallback.contains("tokio::process::Command::new(viewer_path)"));
     assert!(password.contains("0xE8, 0x4A, 0xD6, 0x60, 0xC4, 0x72, 0x1A, 0xE0"));
 
-    for forbidden in [
+    const APPROVED_RELAY: &str = "src/fallback/relay.rs";
+    const APPROVED_VIEWER_ENDPOINT: &str = "src/fallback/mod.rs";
+    const APPROVED_BIND: &str = "TcpListener::bind((Ipv4Addr::LOCALHOST, 0))";
+    const SOCKET_SURFACES: [&str; 7] = [
         "TcpListener",
-        "TcpSocket",
         "TcpStream",
+        "TcpSocket",
         "UdpSocket",
         "UnixListener",
-        ".bind(",
-    ] {
-        assert!(
-            !manager_production.contains(forbidden),
-            "native production session manager crossed the listener boundary with {forbidden}"
-        );
-    }
+        "UnixStream",
+        "UnixDatagram",
+    ];
+    let mut approved_relay_seen = false;
+    for file in rust_sources(&manifest.join("src")) {
+        let relative_path = file
+            .strip_prefix(manifest)
+            .expect("enumerated source remains below the manifest root");
+        let text = fs::read_to_string(&file).unwrap();
+        let production = production_portion(relative_path, &text);
+        let compact = production
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>();
+        let bind_calls = compact.matches("bind(").count() + compact.matches("bind::<").count();
 
-    for native in ["src/vnc", "src/connection.rs", "src/session/events.rs"] {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(native);
-        for file in rust_sources(&root) {
-            let text = fs::read_to_string(&file).unwrap();
-            for forbidden in [
-                "TcpListener",
-                "TcpSocket",
-                "TcpStream",
-                "UdpSocket",
-                "UnixListener",
-                ".bind(",
-            ] {
+        if relative_path == Path::new(APPROVED_RELAY) {
+            approved_relay_seen = true;
+            assert_eq!(
+                production.matches(APPROVED_BIND).count(),
+                1,
+                "approved relay must contain one exact loopback bind"
+            );
+            assert_eq!(
+                bind_calls, 1,
+                "approved relay gained a second or non-approved bind"
+            );
+            for forbidden in &SOCKET_SURFACES[2..] {
                 assert!(
-                    !text.contains(forbidden),
-                    "native source crossed the listener/bind boundary with {forbidden}"
+                    !production.contains(forbidden),
+                    "approved relay gained another socket family: {forbidden}"
                 );
             }
+        } else {
+            for forbidden in SOCKET_SURFACES {
+                assert!(
+                    !production.contains(forbidden),
+                    "{} gained a listener/socket surface: {forbidden}",
+                    relative_path.display()
+                );
+            }
+            assert_eq!(
+                bind_calls,
+                0,
+                "{} gained a production bind",
+                relative_path.display()
+            );
+        }
+        if relative_path != Path::new(APPROVED_VIEWER_ENDPOINT) {
             assert!(
-                !text.contains("127.0.0.1"),
-                "native source gained an endpoint"
+                !production.contains("127.0.0.1"),
+                "{} gained an unapproved loopback endpoint",
+                relative_path.display()
             );
         }
     }
+    assert!(
+        approved_relay_seen,
+        "approved relay source was not enumerated"
+    );
 
     let cleanup_cycle = manager
         .split("async fn ten_connect_disconnect_cycles_leave_zero_exact_owned_residue()")
