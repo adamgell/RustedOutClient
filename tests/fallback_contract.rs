@@ -1,4 +1,7 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use rustedoutclient::{
     fallback::{FallbackError, FallbackPreferences, FallbackSession, TigerVncFallback},
@@ -21,6 +24,23 @@ async fn production_open_surface(
 
 fn source(path: &str) -> String {
     fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
+}
+
+fn rust_sources(root: &Path) -> Vec<PathBuf> {
+    if root.is_file() {
+        return vec![root.to_owned()];
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(rust_sources(&path));
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
 }
 
 #[test]
@@ -61,6 +81,11 @@ fn listener_process_and_password_artifacts_stay_inside_the_approved_boundary() {
     let password = source("src/fallback/password_file.rs");
     let fallback = source("src/fallback/mod.rs");
     let viewer = source("src/fallback/viewer.rs");
+    let manager = source("src/session/manager.rs");
+    let manager_production = manager
+        .split("\n#[cfg(test)]\nmod tests")
+        .next()
+        .expect("session manager source has a production section");
     assert!(relay.contains("TcpListener::bind((Ipv4Addr::LOCALHOST, 0))"));
     assert!(relay.contains("copy_bidirectional"));
     assert!(viewer.contains("File::open(configured_path)"));
@@ -70,28 +95,56 @@ fn listener_process_and_password_artifacts_stay_inside_the_approved_boundary() {
     assert!(!fallback.contains("tokio::process::Command::new(viewer_path)"));
     assert!(password.contains("0xE8, 0x4A, 0xD6, 0x60, 0xC4, 0x72, 0x1A, 0xE0"));
 
+    for forbidden in [
+        "TcpListener",
+        "TcpSocket",
+        "TcpStream",
+        "UdpSocket",
+        "UnixListener",
+        ".bind(",
+    ] {
+        assert!(
+            !manager_production.contains(forbidden),
+            "native production session manager crossed the listener boundary with {forbidden}"
+        );
+    }
+
     for native in ["src/vnc", "src/connection.rs", "src/session/events.rs"] {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(native);
-        let files = if root.is_dir() {
-            fs::read_dir(root)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-                .collect::<Vec<_>>()
-        } else {
-            vec![root]
-        };
-        for file in files {
+        for file in rust_sources(&root) {
             let text = fs::read_to_string(&file).unwrap();
+            for forbidden in [
+                "TcpListener",
+                "TcpSocket",
+                "TcpStream",
+                "UdpSocket",
+                "UnixListener",
+                ".bind(",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "native source crossed the listener/bind boundary with {forbidden}"
+                );
+            }
             assert!(
-                !text.contains("TcpListener"),
-                "native source bound a listener"
-            );
-            assert!(
-                !text.contains("127.0.0.1::"),
+                !text.contains("127.0.0.1"),
                 "native source gained an endpoint"
             );
         }
+    }
+
+    let cleanup_cycle = manager
+        .split("async fn ten_connect_disconnect_cycles_leave_zero_exact_owned_residue()")
+        .nth(1)
+        .expect("Task 13 cleanup cycle exists")
+        .split("\n    #[cfg(unix)]")
+        .next()
+        .expect("Task 13 cleanup cycle has a bounded source section");
+    for unrelated in ["TcpListener", "listener_task", "rebound", "drop(runtime)"] {
+        assert!(
+            !cleanup_cycle.contains(unrelated),
+            "cleanup proof retained unrelated listener evidence: {unrelated}"
+        );
     }
 }
 

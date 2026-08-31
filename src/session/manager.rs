@@ -6,6 +6,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+
 use crossbeam_channel::TrySendError;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -48,6 +51,86 @@ const RESIZE_OUTCOME_DEADLINE: Duration = Duration::from_secs(2);
 
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+#[cfg(test)]
+static NEXT_TASK_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+struct TaskTerminalState {
+    started: AtomicBool,
+    dropped: AtomicBool,
+    joined: AtomicBool,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TaskTerminalProbe {
+    identity: u64,
+    state: Arc<TaskTerminalState>,
+}
+
+#[cfg(test)]
+impl TaskTerminalProbe {
+    fn new() -> Self {
+        Self {
+            identity: NEXT_TASK_TERMINAL_ID.fetch_add(1, AtomicOrdering::SeqCst),
+            state: Arc::new(TaskTerminalState {
+                started: AtomicBool::new(false),
+                dropped: AtomicBool::new(false),
+                joined: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn identity(&self) -> u64 {
+        self.identity
+    }
+
+    fn guard(&self) -> TaskTerminalGuard {
+        assert!(
+            !self.state.started.swap(true, AtomicOrdering::SeqCst),
+            "task terminal identity {} started more than once",
+            self.identity
+        );
+        TaskTerminalGuard {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    fn mark_joined(&self) {
+        self.state.joined.store(true, AtomicOrdering::SeqCst);
+    }
+
+    fn assert_terminal_joined_and_dropped(&self) {
+        assert!(
+            self.state.started.load(AtomicOrdering::SeqCst),
+            "task terminal identity {} never started",
+            self.identity
+        );
+        assert!(
+            self.state.joined.load(AtomicOrdering::SeqCst),
+            "task terminal identity {} was not joined",
+            self.identity
+        );
+        assert!(
+            self.state.dropped.load(AtomicOrdering::SeqCst),
+            "task terminal identity {} was not dropped",
+            self.identity
+        );
+    }
+}
+
+#[cfg(test)]
+struct TaskTerminalGuard {
+    state: Arc<TaskTerminalState>,
+}
+
+#[cfg(test)]
+impl Drop for TaskTerminalGuard {
+    fn drop(&mut self) {
+        self.state.dropped.store(true, AtomicOrdering::SeqCst);
+    }
+}
+
 pub trait ManagedSession: Send + 'static {
     fn try_recv(&mut self) -> Result<Option<SessionTransportEvent>, PublicError>;
     fn mark_ready(&mut self);
@@ -88,6 +171,8 @@ pub struct SessionManager {
     command_tx: mpsc::Sender<AppCommand>,
     event_rx: mpsc::Receiver<AppEvent>,
     worker: Option<JoinHandle<Result<(), PublicError>>>,
+    #[cfg(test)]
+    worker_terminal: Option<TaskTerminalProbe>,
 }
 
 impl SessionManager {
@@ -95,24 +180,62 @@ impl SessionManager {
     where
         B: SessionBackend,
     {
+        #[cfg(test)]
+        {
+            Self::spawn_inner(config, backend, None)
+        }
+        #[cfg(not(test))]
+        {
+            Self::spawn_inner(config, backend)
+        }
+    }
+
+    #[cfg(test)]
+    fn spawn_with_task_probe<B>(
+        config: AppConfig,
+        backend: B,
+        worker_terminal: TaskTerminalProbe,
+    ) -> Self
+    where
+        B: SessionBackend,
+    {
+        Self::spawn_inner(config, backend, Some(worker_terminal))
+    }
+
+    fn spawn_inner<B>(
+        config: AppConfig,
+        backend: B,
+        #[cfg(test)] worker_terminal: Option<TaskTerminalProbe>,
+    ) -> Self
+    where
+        B: SessionBackend,
+    {
         let (command_tx, command_rx) = mpsc::channel(APP_QUEUE_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(APP_QUEUE_CAPACITY);
-        let worker = tokio::spawn(
-            Worker {
-                profile_name: config.profile.name,
-                refresh_interval: Duration::from_secs(config.inventory_refresh_seconds),
-                backend,
-                command_rx,
-                event_tx,
-                sessions: Vec::new(),
-                fallbacks: Vec::new(),
-            }
-            .run(),
-        );
+        let worker_state = Worker {
+            profile_name: config.profile.name,
+            refresh_interval: Duration::from_secs(config.inventory_refresh_seconds),
+            backend,
+            command_rx,
+            event_tx,
+            sessions: Vec::new(),
+            fallbacks: Vec::new(),
+        };
+        #[cfg(test)]
+        let task_terminal = worker_terminal.clone();
+        #[cfg(test)]
+        let worker = tokio::spawn(async move {
+            let _terminal_guard = task_terminal.map(|probe| probe.guard());
+            worker_state.run().await
+        });
+        #[cfg(not(test))]
+        let worker = tokio::spawn(worker_state.run());
         Self {
             command_tx,
             event_rx,
             worker: Some(worker),
+            #[cfg(test)]
+            worker_terminal,
         }
     }
 
@@ -178,6 +301,10 @@ impl SessionManager {
         loop {
             tokio::select! {
                 result = &mut worker => {
+                    #[cfg(test)]
+                    if let Some(worker_terminal) = self.worker_terminal.take() {
+                        worker_terminal.mark_joined();
+                    }
                     return result
                         .map_err(|_| PublicError::new(PublicErrorKind::Cleanup))?;
                 }
@@ -1168,10 +1295,36 @@ pub struct ProductionSession {
     terminal: Arc<Mutex<Option<Result<(), PublicError>>>>,
     terminal_reported: bool,
     cancel: Option<oneshot::Sender<()>>,
+    #[cfg(test)]
+    task_terminal: Option<TaskTerminalProbe>,
 }
 
 impl ProductionSession {
     fn spawn(proxy: TrustedSshProxy, options: OpenOptions) -> Result<Self, PublicError> {
+        #[cfg(test)]
+        {
+            Self::spawn_inner(proxy, options, None)
+        }
+        #[cfg(not(test))]
+        {
+            Self::spawn_inner(proxy, options)
+        }
+    }
+
+    #[cfg(test)]
+    fn spawn_with_task_probe(
+        proxy: TrustedSshProxy,
+        options: OpenOptions,
+        task_terminal: TaskTerminalProbe,
+    ) -> Result<Self, PublicError> {
+        Self::spawn_inner(proxy, options, Some(task_terminal))
+    }
+
+    fn spawn_inner(
+        proxy: TrustedSshProxy,
+        options: OpenOptions,
+        #[cfg(test)] task_terminal: Option<TaskTerminalProbe>,
+    ) -> Result<Self, PublicError> {
         let (connection, channels) = bounded_vnc_channels();
         let input = InputController::for_connection(
             connection,
@@ -1181,10 +1334,14 @@ impl ProductionSession {
         )
         .map_err(|_| PublicError::new(PublicErrorKind::RfbLimit))?;
         let terminal = Arc::new(Mutex::new(None));
-        let task_terminal = terminal.clone();
+        let task_result = terminal.clone();
         let terminal_sender = channels.event_tx.clone();
         let (cancel, cancelled) = oneshot::channel();
+        #[cfg(test)]
+        let terminal_probe = task_terminal.clone();
         let task = tokio::spawn(async move {
+            #[cfg(test)]
+            let _terminal_guard = terminal_probe.map(|probe| probe.guard());
             let result = VncClient::run_cancellable(
                 proxy,
                 options.vnc,
@@ -1194,7 +1351,7 @@ impl ProductionSession {
             )
             .await
             .map_err(public_rfb_error);
-            *task_terminal
+            *task_result
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
             drop(terminal_sender);
@@ -1205,6 +1362,8 @@ impl ProductionSession {
             terminal,
             terminal_reported: false,
             cancel: Some(cancel),
+            #[cfg(test)]
+            task_terminal,
         })
     }
 
@@ -1366,6 +1525,10 @@ impl ManagedSession for ProductionSession {
                             cleanup_failed = true;
                         }
                     }
+                }
+                #[cfg(test)]
+                if let Some(task_terminal) = self.task_terminal.as_ref() {
+                    task_terminal.mark_joined();
                 }
             }
             drop(self.cancel.take());
@@ -1536,7 +1699,7 @@ fn public_rfb_error(error: RfbError) -> PublicError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeSet, VecDeque},
         fs, io,
         path::{Path, PathBuf},
         process::{Command, Stdio},
@@ -1556,7 +1719,7 @@ mod tests {
 
     use super::{
         BackendFuture, ManagedSession, OpenOptions, ProductionSession, SessionBackend,
-        SessionManager,
+        SessionManager, TaskTerminalProbe,
     };
     use crate::{
         config::AppConfig,
@@ -1617,6 +1780,7 @@ mod tests {
                 terminal: Arc::new(Mutex::new(terminal)),
                 terminal_reported,
                 cancel: None,
+                task_terminal: None,
             },
             channels,
         )
@@ -1646,6 +1810,7 @@ mod tests {
             ))))),
             terminal_reported: false,
             cancel: None,
+            task_terminal: None,
         };
 
         for _ in 0..VNC_QUEUE_CAPACITY {
@@ -1699,6 +1864,7 @@ mod tests {
             terminal: Arc::new(Mutex::new(None)),
             terminal_reported: false,
             cancel: None,
+            task_terminal: None,
         };
         session.mark_ready();
         channels
@@ -1783,6 +1949,7 @@ mod tests {
             terminal,
             terminal_reported: false,
             cancel: Some(cancel),
+            task_terminal: None,
         };
         session.mark_ready();
         session
@@ -1831,6 +1998,7 @@ mod tests {
             terminal,
             terminal_reported: false,
             cancel: Some(cancel),
+            task_terminal: None,
         };
         session.mark_ready();
 
@@ -1876,6 +2044,7 @@ mod tests {
             terminal,
             terminal_reported: false,
             cancel: Some(cancel),
+            task_terminal: None,
         };
         session.mark_ready();
 
@@ -1927,6 +2096,7 @@ mod tests {
             terminal,
             terminal_reported: false,
             cancel: Some(cancel),
+            task_terminal: None,
         };
 
         let close = tokio::spawn(async move {
@@ -1978,6 +2148,7 @@ mod tests {
             terminal,
             terminal_reported: false,
             cancel: Some(cancel),
+            task_terminal: None,
         };
         session.mark_ready();
         wait_for_flag(&task_started).await;
@@ -2033,6 +2204,7 @@ mod tests {
             terminal,
             terminal_reported: false,
             cancel: Some(cancel),
+            task_terminal: None,
         };
         session.mark_ready();
 
@@ -2069,6 +2241,7 @@ mod tests {
             terminal,
             terminal_reported: false,
             cancel: Some(cancel),
+            task_terminal: None,
         };
         session.mark_ready();
 
@@ -2098,6 +2271,7 @@ mod tests {
             terminal,
             terminal_reported: false,
             cancel: Some(cancel),
+            task_terminal: None,
         };
         session.mark_ready();
         session
@@ -2139,6 +2313,7 @@ mod tests {
             terminal,
             terminal_reported: false,
             cancel: Some(cancel),
+            task_terminal: None,
         };
         session.mark_ready();
         session
@@ -2251,9 +2426,39 @@ mod tests {
         opens: Arc<AtomicUsize>,
     }
 
-    struct ProductionWireBackend {
+    struct WireOrderBackend {
         master: Option<SshMaster>,
         opens: Arc<AtomicUsize>,
+    }
+
+    struct ProductionWireBackend {
+        runtime: RuntimeDir,
+        master: Option<SshMaster>,
+        opens: Arc<AtomicUsize>,
+        vnc_task_terminal: TaskTerminalProbe,
+        exact_children: Arc<Mutex<Vec<u32>>>,
+    }
+
+    fn assert_production_wire_backend_owns_runtime(backend: &ProductionWireBackend) {
+        let _: &RuntimeDir = &backend.runtime;
+    }
+
+    impl Drop for ProductionWireBackend {
+        fn drop(&mut self) {
+            let children =
+                fs::read_to_string(self.runtime.control_socket().with_extension("children"))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|line| {
+                        line.parse::<u32>()
+                            .expect("fake SSH recorded an invalid exact child identity")
+                    })
+                    .collect();
+            *self
+                .exact_children
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = children;
+        }
     }
 
     impl SessionBackend for ProductionPathBackend {
@@ -2310,7 +2515,7 @@ mod tests {
         }
     }
 
-    impl SessionBackend for ProductionWireBackend {
+    impl SessionBackend for WireOrderBackend {
         type Session = ProductionSession;
 
         fn load_cache(
@@ -2383,6 +2588,80 @@ mod tests {
         }
     }
 
+    impl SessionBackend for ProductionWireBackend {
+        type Session = ProductionSession;
+
+        fn load_cache(
+            &mut self,
+        ) -> BackendFuture<'_, Result<Option<InventorySnapshot>, PublicError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn start_master(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async move {
+                self.master
+                    .as_mut()
+                    .ok_or_else(|| PublicError::new(PublicErrorKind::SshUnavailable))?
+                    .verify()
+                    .await
+                    .map(|_| ())
+                    .map_err(super::public_master_error)
+            })
+        }
+
+        fn fetch_inventory(&mut self) -> BackendFuture<'_, Result<InventorySnapshot, PublicError>> {
+            Box::pin(async {
+                Ok(InventorySnapshot {
+                    observed_at_unix_ms: 1,
+                    stale: false,
+                    vms: vec![VmInventoryItem {
+                        vmid: VmId::new(107).unwrap(),
+                        name: "SYNTHETIC-107".to_owned(),
+                        node: NodeName::parse("pve2").unwrap(),
+                        status: VmStatus::Running,
+                        template: false,
+                    }],
+                })
+            })
+        }
+
+        fn save_cache(
+            &mut self,
+            _snapshot: &InventorySnapshot,
+        ) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn open_session(
+            &mut self,
+            vmid: VmId,
+            options: OpenOptions,
+        ) -> BackendFuture<'_, Result<Self::Session, PublicError>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let task_terminal = self.vnc_task_terminal.clone();
+            Box::pin(async move {
+                let master = self
+                    .master
+                    .as_mut()
+                    .ok_or_else(|| PublicError::new(PublicErrorKind::SshUnavailable))?;
+                let mut verified = master.verify().await.map_err(super::public_master_error)?;
+                let proxy = TrustedSshProxy::connect(&mut verified, vmid)
+                    .await
+                    .map_err(super::public_proxy_error)?;
+                ProductionSession::spawn_with_task_probe(proxy, options, task_terminal)
+            })
+        }
+
+        fn close_master(&mut self) -> BackendFuture<'_, Result<(), PublicError>> {
+            Box::pin(async move {
+                match self.master.as_mut() {
+                    Some(master) => master.close().await.map_err(super::public_master_error),
+                    None => Ok(()),
+                }
+            })
+        }
+    }
+
     async fn production_path_manager(
         runtime: &RuntimeDir,
         executable: PathBuf,
@@ -2442,7 +2721,7 @@ mod tests {
         let opens = Arc::new(AtomicUsize::new(0));
         let mut manager = SessionManager::spawn(
             AppConfig::new(fixture_profile()),
-            ProductionWireBackend {
+            WireOrderBackend {
                 master: Some(master),
                 opens: Arc::clone(&opens),
             },
@@ -2464,6 +2743,64 @@ mod tests {
             .await
             .unwrap();
         let opens_path = runtime.control_socket().with_extension("proxy.opens");
+        wait_for_proxy_open_count(&opens_path, 1).await;
+        let proxy_pid = fs::read_to_string(opens_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        (manager, opens, proxy_pid)
+    }
+
+    async fn production_owned_wire_manager(
+        runtime: RuntimeDir,
+        executable: PathBuf,
+        manager_task_terminal: TaskTerminalProbe,
+        vnc_task_terminal: TaskTerminalProbe,
+        exact_children: Arc<Mutex<Vec<u32>>>,
+    ) -> (SessionManager, Arc<AtomicUsize>, u32) {
+        let control_socket = runtime.control_socket().to_owned();
+        fs::write(
+            control_socket.with_extension("proxy_track_opens"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory = SshCommandFactory::new_for_test(executable, control_socket.clone());
+        let master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&control_socket.with_extension("state")).await;
+        let opens = Arc::new(AtomicUsize::new(0));
+        let backend = ProductionWireBackend {
+            runtime,
+            master: Some(master),
+            opens: Arc::clone(&opens),
+            vnc_task_terminal,
+            exact_children,
+        };
+        assert_production_wire_backend_owns_runtime(&backend);
+        let mut manager = SessionManager::spawn_with_task_probe(
+            AppConfig::new(fixture_profile()),
+            backend,
+            manager_task_terminal,
+        );
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(manager.recv().await, Some(AppEvent::LiveInventory(_))) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("owned production-wire manager did not publish live inventory");
+        manager
+            .send(AppCommand::Open {
+                vmid: VmId::new(107).unwrap(),
+                options: OpenOptions::default(),
+            })
+            .await
+            .unwrap();
+        let opens_path = control_socket.with_extension("proxy.opens");
         wait_for_proxy_open_count(&opens_path, 1).await;
         let proxy_pid = fs::read_to_string(opens_path)
             .unwrap()
@@ -2681,39 +3018,41 @@ mod tests {
     #[tokio::test]
     async fn ten_connect_disconnect_cycles_leave_zero_exact_owned_residue() {
         let _process_guard = crate::ssh::process_test_guard().await;
+        let mut manager_task_ids = BTreeSet::new();
+        let mut vnc_task_ids = BTreeSet::new();
 
         for cycle in 0..10 {
             let runtime = RuntimeDir::create().unwrap();
             let runtime_path = runtime.path().to_owned();
-            let children_path = runtime.control_socket().with_extension("children");
+            let control_socket = runtime.control_socket().to_owned();
+            let exact_children = Arc::new(Mutex::new(Vec::new()));
+            let manager_task = TaskTerminalProbe::new();
+            let vnc_task = TaskTerminalProbe::new();
+            assert!(
+                manager_task_ids.insert(manager_task.identity()),
+                "cycle {cycle}"
+            );
+            assert!(vnc_task_ids.insert(vnc_task.identity()), "cycle {cycle}");
             let (_fixture_directory, executable) = fake_ssh();
             fs::write(
-                runtime.control_socket().with_extension("track_all_pids"),
+                control_socket.with_extension("track_all_pids"),
                 b"synthetic fixture control\n",
             )
             .unwrap();
             fs::write(
-                runtime
-                    .control_socket()
-                    .with_extension("proxy_rfb_input_capture"),
+                control_socket.with_extension("proxy_rfb_input_capture"),
                 b"synthetic fixture control\n",
             )
             .unwrap();
 
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-                .await
-                .unwrap();
-            let listener_address = listener.local_addr().unwrap();
-            let (stop_listener, listener_stopped) = oneshot::channel::<()>();
-            let listener_task = tokio::spawn(async move {
-                tokio::select! {
-                    _ = listener.accept() => {}
-                    _ = listener_stopped => {}
-                }
-            });
-
-            let (mut manager, opens, proxy_pid) =
-                production_wire_manager(&runtime, executable).await;
+            let (mut manager, opens, proxy_pid) = production_owned_wire_manager(
+                runtime,
+                executable,
+                manager_task.clone(),
+                vnc_task.clone(),
+                Arc::clone(&exact_children),
+            )
+            .await;
             let ready = timeout(Duration::from_secs(2), async {
                 loop {
                     if let Some(AppEvent::SessionChanged(snapshot)) = manager.recv().await {
@@ -2735,12 +3074,8 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            wait_for_fixture_marker(
-                &runtime
-                    .control_socket()
-                    .with_extension("proxy.key-down-read"),
-            )
-            .await;
+            wait_for_fixture_marker(&control_socket.with_extension("proxy.key-down-read")).await;
+            drop(control_socket);
             manager
                 .send(AppCommand::Close { session_id: ready })
                 .await
@@ -2760,37 +3095,21 @@ mod tests {
             .unwrap();
             manager.shutdown().await.unwrap();
             assert_eq!(opens.load(Ordering::SeqCst), 1, "cycle {cycle}");
-            assert_exact_pid_is_gone(proxy_pid).await;
+            manager_task.assert_terminal_joined_and_dropped();
+            vnc_task.assert_terminal_joined_and_dropped();
+            assert!(!runtime_path.exists(), "cycle {cycle}");
 
-            stop_listener.send(()).unwrap();
-            listener_task.await.unwrap();
-            let rebound = tokio::net::TcpListener::bind(listener_address)
-                .await
-                .expect("exact test listener remained bound");
-            drop(rebound);
-
-            let exact_children = fs::read_to_string(&children_path)
-                .expect("fake SSH did not record exact child identities")
-                .lines()
-                .map(|line| line.parse::<u32>().unwrap())
-                .collect::<Vec<_>>();
+            let exact_children = exact_children.lock().unwrap().clone();
             assert!(exact_children.len() >= 5, "cycle {cycle}");
+            assert!(exact_children.contains(&proxy_pid), "cycle {cycle}");
             for pid in exact_children {
                 assert_exact_pid_is_gone(pid).await;
             }
-
-            let exact_artifacts = fs::read_dir(&runtime_path)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .collect::<Vec<_>>();
-            assert!(!exact_artifacts.is_empty(), "cycle {cycle}");
-            drop(runtime);
-            assert!(!runtime_path.exists(), "cycle {cycle}");
-            assert!(
-                exact_artifacts.iter().all(|path| !path.exists()),
-                "cycle {cycle} retained an exact runtime artifact"
-            );
         }
+
+        assert_eq!(manager_task_ids.len(), 10);
+        assert_eq!(vnc_task_ids.len(), 10);
+        assert!(manager_task_ids.is_disjoint(&vnc_task_ids));
     }
 
     #[cfg(unix)]
