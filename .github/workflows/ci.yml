@@ -56,14 +56,36 @@ jobs:
             echo "Required source-policy matcher is unavailable"
             exit 1
           fi
-          if rg -n -i '\bsftp\b|\bscp\b' src; then
-            echo "Disallowed file-transfer surface found in repository source"
-            exit 1
-          fi
-          if rg -n 'StrictHostKeyChecking=(no|accept-new)|UserKnownHostsFile=/dev/null' src; then
-            echo "Weakened OpenSSH trust flag found in repository source"
-            exit 1
-          fi
+          file_transfer_status=0
+          file_transfer_matches="$(rg -n -i '\bsftp\b|\bscp\b' src 2>/dev/null)" || file_transfer_status=$?
+          case "$file_transfer_status" in
+            0)
+              printf '%s\n' "$file_transfer_matches"
+              echo "Disallowed file-transfer surface found in repository source"
+              exit 1
+              ;;
+            1)
+              ;;
+            *)
+              echo "Could not evaluate repository file-transfer source policy"
+              exit 1
+              ;;
+          esac
+          trust_status=0
+          trust_matches="$(rg -n 'StrictHostKeyChecking=(no|accept-new)|UserKnownHostsFile=/dev/null' src 2>/dev/null)" || trust_status=$?
+          case "$trust_status" in
+            0)
+              printf '%s\n' "$trust_matches"
+              echo "Weakened OpenSSH trust flag found in repository source"
+              exit 1
+              ;;
+            1)
+              ;;
+            *)
+              echo "Could not evaluate repository SSH trust source policy"
+              exit 1
+              ;;
+          esac
 
       - name: Assert target-inactive advisory packages
         shell: bash

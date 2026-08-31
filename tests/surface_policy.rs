@@ -64,6 +64,19 @@ fn advisory_guard_script(workflow: &str) -> String {
     matching.into_iter().next().unwrap()
 }
 
+fn source_policy_script(workflow: &str) -> String {
+    let matching = workflow_run_blocks(workflow)
+        .into_iter()
+        .filter(|block| block.contains("Disallowed file-transfer surface"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "workflow must have one source-policy guard"
+    );
+    matching.into_iter().next().unwrap()
+}
+
 fn native_verification_block(checklist: &str) -> String {
     let matching = checklist
         .split("```bash\n")
@@ -84,6 +97,95 @@ enum MatcherMode {
     Working,
     Error,
     Missing,
+}
+
+#[derive(Clone, Copy)]
+enum SourceMatcherMode {
+    Clean,
+    FileTransferMatch,
+    TrustMatch,
+    FileTransferError,
+    TrustError,
+    Missing,
+}
+
+impl SourceMatcherMode {
+    fn environment_value(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::FileTransferMatch => "file-transfer-match",
+            Self::TrustMatch => "trust-match",
+            Self::FileTransferError => "file-transfer-error",
+            Self::TrustError => "trust-error",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+fn run_source_policy(script: &str, matcher_mode: SourceMatcherMode) -> Output {
+    let workspace = tempfile::tempdir().unwrap();
+    let bin = workspace.path().join("bin");
+    let source = workspace.path().join("src");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("synthetic.rs"), "fn synthetic() {}\n").unwrap();
+
+    if !matches!(matcher_mode, SourceMatcherMode::Missing) {
+        let matcher = bin.join("rg");
+        fs::write(
+            &matcher,
+            r#"#!/bin/sh
+case "$*" in
+  *sftp*) policy=file-transfer ;;
+  *StrictHostKeyChecking*) policy=trust ;;
+  *) exit 97 ;;
+esac
+case "$FAKE_SOURCE_MATCHER_MODE:$policy" in
+  clean:*) exit 1 ;;
+  file-transfer-match:file-transfer)
+    printf '%s\n' 'src/synthetic.rs:1:use synthetic_sftp'
+    exit 0
+    ;;
+  file-transfer-match:trust) exit 1 ;;
+  trust-match:file-transfer) exit 1 ;;
+  trust-match:trust)
+    printf '%s\n' 'src/synthetic.rs:2:StrictHostKeyChecking=no'
+    exit 0
+    ;;
+  file-transfer-error:file-transfer)
+    printf '%s\n' 'src/partial.rs:1:partial matcher output'
+    printf '%s\n' 'synthetic matcher stderr must be suppressed' >&2
+    exit 2
+    ;;
+  file-transfer-error:trust) exit 1 ;;
+  trust-error:file-transfer) exit 1 ;;
+  trust-error:trust)
+    printf '%s\n' 'src/partial.rs:2:partial matcher output'
+    printf '%s\n' 'synthetic matcher stderr must be suppressed' >&2
+    exit 2
+    ;;
+  *) exit 98 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&matcher, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let path = if !matches!(matcher_mode, SourceMatcherMode::Missing) {
+        env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap()
+    } else {
+        bin.into_os_string()
+    };
+    Command::new("/bin/bash")
+        .arg("-e")
+        .arg("-c")
+        .arg(script)
+        .current_dir(workspace.path())
+        .env("PATH", path)
+        .env("FAKE_SOURCE_MATCHER_MODE", matcher_mode.environment_value())
+        .output()
+        .unwrap()
 }
 
 fn run_advisory_guard(script: &str, cargo_mode: &str, matcher_mode: MatcherMode) -> Output {
@@ -188,6 +290,74 @@ fn ci_checkout_is_sha_pinned_without_persisted_credentials() {
     assert!(workflow.contains(&format!(
         "uses: {CHECKOUT_PIN} # v4\n        with:\n          persist-credentials: false"
     )));
+}
+
+#[test]
+fn ci_source_policy_distinguishes_matches_absence_and_each_matcher_error() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let script = source_policy_script(&workflow);
+
+    let clean = run_source_policy(&script, SourceMatcherMode::Clean);
+    let file_transfer_match = run_source_policy(&script, SourceMatcherMode::FileTransferMatch);
+    let trust_match = run_source_policy(&script, SourceMatcherMode::TrustMatch);
+    let file_transfer_error = run_source_policy(&script, SourceMatcherMode::FileTransferError);
+    let trust_error = run_source_policy(&script, SourceMatcherMode::TrustError);
+    let missing = run_source_policy(&script, SourceMatcherMode::Missing);
+
+    assert!(
+        clean.status.success(),
+        "two clean absence results must pass"
+    );
+    assert!(
+        !file_transfer_match.status.success(),
+        "a file-transfer source match must fail"
+    );
+    assert_eq!(
+        String::from_utf8(file_transfer_match.stdout).unwrap(),
+        concat!(
+            "src/synthetic.rs:1:use synthetic_sftp\n",
+            "Disallowed file-transfer surface found in repository source\n"
+        )
+    );
+    assert!(file_transfer_match.stderr.is_empty());
+    assert!(
+        !trust_match.status.success(),
+        "a weakened SSH trust match must fail"
+    );
+    assert_eq!(
+        String::from_utf8(trust_match.stdout).unwrap(),
+        concat!(
+            "src/synthetic.rs:2:StrictHostKeyChecking=no\n",
+            "Weakened OpenSSH trust flag found in repository source\n"
+        )
+    );
+    assert!(trust_match.stderr.is_empty());
+    assert!(
+        !file_transfer_error.status.success() && !trust_error.status.success(),
+        "present matcher errors must fail independently: file_transfer_success={}, trust_success={}",
+        file_transfer_error.status.success(),
+        trust_error.status.success()
+    );
+    assert_eq!(
+        String::from_utf8(file_transfer_error.stdout).unwrap(),
+        "Could not evaluate repository file-transfer source policy\n"
+    );
+    assert!(file_transfer_error.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(trust_error.stdout).unwrap(),
+        "Could not evaluate repository SSH trust source policy\n"
+    );
+    assert!(trust_error.stderr.is_empty());
+    assert!(
+        !missing.status.success(),
+        "a missing matcher must fail at preflight"
+    );
+    assert_eq!(
+        String::from_utf8(missing.stdout).unwrap(),
+        "Required source-policy matcher is unavailable\n"
+    );
+    assert!(missing.stderr.is_empty());
 }
 
 #[test]

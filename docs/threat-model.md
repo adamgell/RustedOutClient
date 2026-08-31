@@ -29,7 +29,7 @@ relay one loopback connection to the same verified SSH proxy.
 | Clipboard | Defaults off, requires an explicit direction-specific action, enforces one MiB, and retains at most one one-shot remote value | `src/config.rs:77-90`, `src/app/actions.rs:291-337`, `src/vnc/input.rs:8-74`, `src/vnc/input.rs:225-253`, `src/connection.rs:70-101` |
 | Dynamic Resolution | Normalizes backing pixels, debounces 250 ms, permits one in-flight request, and classifies bounded outcomes | `src/vnc/client.rs:198-235`, `src/session/manager.rs:45-50`, `src/session/manager.rs:337-435`, `src/session/manager.rs:700-785`, `src/session/manager.rs:942-1039` |
 | Manual TigerVNC fallback | Owns one loopback listener, private viewer/password snapshots, fixed arguments/environment, relay, and cleanup | `src/fallback/relay.rs:32-34`, `src/fallback/relay.rs:49-82`, `src/fallback/mod.rs:241-297`, `src/fallback/mod.rs:333-485`, `src/fallback/mod.rs:499-540`, `src/fallback/password_file.rs:146-235` |
-| Supply chain/CI | Restricts the supported target, sources, licenses, duplicates, toolchain, fail-closed audit exception, tests, and source policies; checkout is SHA-pinned without persisted credentials | `deny.toml:1-59`, `.github/workflows/ci.yml:16-96` |
+| Supply chain/CI | Restricts the supported target, sources, licenses, duplicates, toolchain, fail-closed audit exception, tests, and source policies; checkout is SHA-pinned without persisted credentials | `deny.toml:1-59`, `.github/workflows/ci.yml:16-128` |
 
 ### Effective resources and ownership
 
@@ -226,16 +226,16 @@ clipboard memory and the UI/OS. The fallback adds a same-host loopback boundary.
 | Surface | Plausible attack | Mitigations and evidence | Residual risk |
 | --- | --- | --- | --- |
 | Profile and CLI | Option injection, malformed node/VM, unintended endpoint or command | Typed grammars reject leading-dash/whitespace targets and bound node/VM values; CLI has no direct VNC endpoint or secret flags (`src/model.rs:24-35`, `src/model.rs:65-79`, `src/cli.rs:23-89`) | A syntactically valid but wrong trusted target remains operator error |
-| OpenSSH/known-hosts | MITM, trust downgrade, alternate authentication, password prompt, arbitrary remote execution | Fixed system executable and strict options; public-key only with GSSAPI, hostbased, password, and keyboard-interactive disabled; reviewed remote argument shapes; source-policy CI rejects weakening flags and file-transfer terms (`src/ssh/command.rs:20-33`, `src/ssh/command.rs:105-203`, `.github/workflows/ci.yml:52-66`) | Compromised known-hosts or system OpenSSH is outside the process boundary |
+| OpenSSH/known-hosts | MITM, trust downgrade, alternate authentication, password prompt, arbitrary remote execution | Fixed system executable and strict options; public-key only with GSSAPI, hostbased, password, and keyboard-interactive disabled; reviewed remote argument shapes; source-policy CI rejects weakening flags and file-transfer terms (`src/ssh/command.rs:20-33`, `src/ssh/command.rs:105-203`, `.github/workflows/ci.yml:52-88`) | Compromised known-hosts or system OpenSSH is outside the process boundary |
 | Ticket memory/environment | Ticket disclosure in argv, logs, inherited environment, crash evidence | Generated after revalidation, absent from argv, inherited value cleared, one explicit environment value, redacted nonserializable type (`src/ssh/command.rs:53-73`, `src/ssh/command.rs:135-156`, `src/ssh/proxy.rs:25-105`) | Same-user memory/process inspection can still observe a live secret |
 | Inventory and RFB bytes | Oversized allocation, decompression/decoder abuse, malformed layout, auth downgrade | Read caps, checked arithmetic, fail-closed parsers, target-specific protocol ceilings, VNC Auth allowlist over typed SSH proxy (`src/ssh/inventory.rs:22-26`, `src/vnc/wire.rs:121-189`, `src/vnc/limits.rs:3-41`, `src/vnc/security.rs:122-187`) | Parser/decoder defects may remain; deferred parser smoke reduces confidence |
-| Framebuffer and UI queue | Guest pixels leaked to logs/artifacts; server floods UI | No pixel `Debug`/`Display`; bounded queues; checked transactional RGBA updates; CI uploads no artifacts (`src/app/state.rs:107-158`, `src/app/state.rs:198-223`, `.github/workflows/ci.yml:16-96`) | Pixels remain sensitive in process/GPU memory while displayed |
+| Framebuffer and UI queue | Guest pixels leaked to logs/artifacts; server floods UI | No pixel `Debug`/`Display`; bounded queues; checked transactional RGBA updates; CI uploads no artifacts (`src/app/state.rs:107-158`, `src/app/state.rs:198-223`, `.github/workflows/ci.yml:16-128`) | Pixels remain sensitive in process/GPU memory while displayed |
 | Keyboard/pointer | Input crosses sessions, sticks after focus loss, bypasses view-only | Semantic session IDs, readiness/view-only checks, bounded key tracking, release-all and exact cleanup (`src/vnc/input.rs:104-223`, `src/session/manager.rs:649-690`, `src/session/manager.rs:1052-1085`) | A compromised guest naturally receives input intentionally sent to it |
 | Clipboard | Silent collection, unbounded payload, wrong direction/session, content logging | Default off; explicit Send/Receive; one-shot replacing slot; UTF-8 and one-MiB bounds; content-free types/errors (`src/config.rs:77-90`, `src/app/actions.rs:291-323`, `src/connection.rs:70-101`, `src/vnc/input.rs:36-74`) | Enabling clipboard intentionally exposes selected text to one endpoint/host clipboard |
 | Dynamic Resolution | Resize storm, excessive geometry, stale reply mutates wrong request | Backing-pixel normalization, global bounds, multiples of eight, 250 ms debounce, one in-flight request, newest replacement, typed outcomes, Fit fallback (`src/vnc/client.rs:198-235`, `src/session/manager.rs:337-435`, `src/session/manager.rs:942-1039`) | Guest/driver may reject or ignore requests; no guarantee of Applied |
 | Config/cache/runtime files | Symlink/race, broad permissions, partial replacement, stale secret residue | Mode checks, no-follow cache traversal, private temporary files, sync/rename, process-owned mode-0700 runtime (`src/config.rs:200-279`, `src/cache.rs:170-252`, `src/runtime.rs:11-40`) | Same-user compromise can still modify user-owned data |
 | TigerVNC fallback | LAN exposure, loopback race, viewer substitution, password-file residue, inherited environment | Manual only; source executable opened then privately snapshotted; one IPv4 loopback listener; peer check; fixed argv; cleared environment; password/viewer RAII cleanup (`src/fallback/viewer.rs:146-238`, `src/fallback/relay.rs:32-101`, `src/fallback/mod.rs:241-297`, `src/fallback/mod.rs:499-540`) | Local race and third-party viewer vulnerabilities remain; fallback is temporary lower assurance |
-| Dependencies/CI | Vulnerable/yanked/unlicensed/Git dependency or policy bypass | macOS-only all-feature graph, crates.io-only source, wildcard/duplicate deny, exact exceptions, pinned checkout/toolchain/tools, locked fail-closed gates (`deny.toml:1-59`, `.github/workflows/ci.yml:16-96`) | CI has not run on GitHub at this head; workflow/action supply chain remains part of review |
+| Dependencies/CI | Vulnerable/yanked/unlicensed/Git dependency or policy bypass | macOS-only all-feature graph, crates.io-only source, wildcard/duplicate deny, exact exceptions, pinned checkout/toolchain/tools, locked fail-closed gates (`deny.toml:1-59`, `.github/workflows/ci.yml:16-128`) | CI has not run on GitHub at this head; workflow/action supply chain remains part of review |
 
 ### Target-inactive advisory and maintenance exception
 
@@ -249,7 +249,7 @@ declarations alone do not prove target activation. The all-target positive
 control observes the chain, while the locked macOS ARM64 all-feature command
 must observe no matching package. CI fails if graph generation or matching-tool
 availability fails, then checks the complete unprefixed graph before the exact
-two-ID audit (`.github/workflows/ci.yml:68-90`). Linux is unsupported until that
+two-ID audit (`.github/workflows/ci.yml:90-122`). Linux is unsupported until that
 dependency is upgraded or the advisories are otherwise closed. Review is
 required by 2027-02-28.
 
@@ -259,7 +259,7 @@ The lockfile records each material edge and the package (`Cargo.lock:2007-2037`,
 `Cargo.lock:613-625`, `Cargo.lock:673-688`, `Cargo.lock:5-13`,
 `Cargo.lock:1710-1716`, `Cargo.lock:2598-2602`). The cargo-deny command
 deliberately keeps the warning visible (`deny.toml:5-8`,
-`.github/workflows/ci.yml:92-93`). There is no compatible maintained drop-in on
+`.github/workflows/ci.yml:124-125`). There is no compatible maintained drop-in on
 the accepted egui/eframe 0.31 line. Review is required by 2027-02-28.
 
 ### Attacker stories (hypotheses, not confirmed vulnerabilities)
@@ -275,7 +275,7 @@ the accepted egui/eframe 0.31 line. Review is required by 2027-02-28.
    relies on an automatic trust prompt or permissive flag. Expected control:
    batch mode plus `StrictHostKeyChecking=yes` fails unknown/changed trust, and CI
    rejects known weakening strings (`src/ssh/command.rs:20-33`,
-   `src/ssh/error.rs:28-64`, `.github/workflows/ci.yml:52-66`). A bypass would be
+   `src/ssh/error.rs:28-64`, `.github/workflows/ci.yml:52-88`). A bypass would be
    Critical or High depending on ticket/key impact.
 3. **H3 — ticket disclosure.** A local observer inspects argv, logs, or inherited
    environment. Expected control: no ticket argv/log field, inherited ticket
@@ -313,7 +313,7 @@ the accepted egui/eframe 0.31 line. Review is required by 2027-02-28.
    makes vulnerable `quick-xml` target-active while audit still ignores its IDs.
    Expected control: CI checks the target graph immediately before the exact
    ignore list and fails if the graph command fails or the package appears
-   (`.github/workflows/ci.yml:68-90`).
+   (`.github/workflows/ci.yml:90-122`).
    A policy change that removes or reorders that assertion requires security
    review.
 
