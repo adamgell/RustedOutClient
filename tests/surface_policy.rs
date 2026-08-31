@@ -259,16 +259,31 @@ fn dependency_advisory_guards_fail_closed_and_precede_the_exact_audit() {
     assert!(block.contains("  0)"));
     assert!(block.contains("  1)"));
     assert!(block.contains("  *)"));
-    assert!(block.contains("if ! rm -f \"$graph_file\"; then"));
-    assert!(block.contains("trap - EXIT"));
 
     let graph_position = block
         .find(SUPPORTED_GRAPH_COMMAND)
         .expect("exact supported graph command");
-    let cleanup_position = block.find("trap - EXIT").expect("cleared cleanup trap");
+    let cleanup_check_position = block
+        .find("if rm -f \"$graph_file\"; then")
+        .expect("checked successful graph removal");
+    let cleanup_trap_position = block[cleanup_check_position..]
+        .find("trap - EXIT")
+        .map(|offset| cleanup_check_position + offset)
+        .expect("cleanup trap cleared only after successful removal");
+    let cleanup_failure_position = block[cleanup_trap_position..]
+        .find("\nelse\n")
+        .map(|offset| cleanup_trap_position + offset)
+        .expect("failed removal branch retains the cleanup trap");
+    let cleanup_exit_position = block[cleanup_failure_position..]
+        .find("\n  exit 1\n")
+        .map(|offset| cleanup_failure_position + offset)
+        .expect("failed removal exits before audit");
     let audit_position = block
         .find(EXACT_AUDIT_COMMAND)
         .expect("exact two-ID audit command");
-    assert!(graph_position < cleanup_position);
-    assert!(cleanup_position < audit_position);
+    assert!(graph_position < cleanup_check_position);
+    assert!(cleanup_check_position < cleanup_trap_position);
+    assert!(cleanup_trap_position < cleanup_failure_position);
+    assert!(cleanup_failure_position < cleanup_exit_position);
+    assert!(cleanup_exit_position < audit_position);
 }

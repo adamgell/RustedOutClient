@@ -55,11 +55,12 @@ case "$matcher_status" in
     exit 1
     ;;
 esac
-if ! rm -f "$graph_file"; then
+if rm -f "$graph_file"; then
+  trap - EXIT
+else
   echo "Could not remove the supported dependency graph file"
   exit 1
 fi
-trap - EXIT
 cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 cargo deny check --warn unmaintained
 ./scripts/fuzz-smoke.sh 30
