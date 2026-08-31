@@ -442,23 +442,8 @@ fn bind_invocation_count(production: &str) -> usize {
                 .get(next + 2)
                 .is_some_and(|token| token.is_punct('<'))
         {
-            next += 3;
-            let mut angle_depth = 1_usize;
-            while let Some(token) = tokens.get(next) {
-                if token.is_punct('<') {
-                    angle_depth += 1;
-                } else if token.is_punct('>') {
-                    angle_depth -= 1;
-                    if angle_depth == 0 {
-                        next += 1;
-                        break;
-                    }
-                }
-                next += 1;
-            }
-            if angle_depth != 0 {
-                continue;
-            }
+            count += 1;
+            continue;
         }
         while tokens.get(next).is_some_and(|token| token.is_punct(')')) {
             next += 1;
@@ -670,6 +655,56 @@ fn bind_counter_handles_whitespace_comments_turbofish_and_parenthesization() {
             "{name} bind invocation was not detected"
         );
     }
+}
+
+#[test]
+fn bind_counter_counts_turbofish_capabilities_without_parsing_generic_contents() {
+    let cases = [
+        (
+            "const generic shift",
+            "TcpListener::bind::<Endpoint<{ 1 << 1 }>>(endpoint);",
+        ),
+        (
+            "const generic comparison",
+            "TcpListener::bind::<Endpoint<{ 1 > 0 }>>(endpoint);",
+        ),
+        (
+            "nested function type",
+            "TcpListener::bind::<Endpoint<fn() -> SocketAddr>>(endpoint);",
+        ),
+        (
+            "ordinary nested generic closers",
+            "TcpListener::bind::<Endpoint<Vec<Vec<u8>>>>(endpoint);",
+        ),
+        (
+            "comment-separated turbofish",
+            "TcpListener :: bind /* bind trivia */ :: /* turbofish trivia */ < Endpoint < { 1 << 1 } > > (endpoint);",
+        ),
+        (
+            "parenthesized turbofish callee",
+            "(TcpListener::bind::<Endpoint<{ 1 << 1 }>>)(endpoint);",
+        ),
+        (
+            "turbofish function-item reference",
+            "let _bind = TcpListener::bind::<Endpoint<{ 1 << 1 }>>;",
+        ),
+    ];
+
+    let actual = cases.map(|(name, production)| (name, bind_invocation_count(production)));
+
+    assert_eq!(
+        actual,
+        [
+            ("const generic shift", 1),
+            ("const generic comparison", 1),
+            ("nested function type", 1),
+            ("ordinary nested generic closers", 1),
+            ("comment-separated turbofish", 1),
+            ("parenthesized turbofish callee", 1),
+            ("turbofish function-item reference", 1),
+        ],
+        "every bind turbofish is a conservatively counted capability"
+    );
 }
 
 #[test]
