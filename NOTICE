@@ -1,5 +1,15 @@
-RustedOutClient is a fork of IronVNC.
+RustedOutClient
 
-Fork base: hkder/ironvnc commit 999e00e3a3672efdbf8e8f307e7bd60875dee67e.
-Upstream attribution and the original dual-license terms are preserved in
-LICENSE-MIT and LICENSE-APACHE.
+This product contains source derived from IronVNC by hkder and contributors.
+
+Exact fork base:
+  hkder/ironvnc@999e00e3a3672efdbf8e8f307e7bd60875dee67e
+  https://github.com/hkder/ironvnc/commit/999e00e3a3672efdbf8e8f307e7bd60875dee67e
+
+IronVNC and the derived RustedOutClient source are made available under the
+upstream dual-license choice: the MIT License or the Apache License, Version
+2.0. The complete license texts are retained in LICENSE-MIT and LICENSE-APACHE.
+
+Additional third-party notices and license metadata are represented by the
+locked dependency graph and enforced by deny.toml. This notice does not modify
+the terms of any third-party component.
