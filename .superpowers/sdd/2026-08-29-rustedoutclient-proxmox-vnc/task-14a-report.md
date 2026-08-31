@@ -3,14 +3,14 @@
 ## Outcome
 
 The Task 14A non-fuzz governance/documentation tranche, review-fix rounds 1
-through 3, and the controller's post-round-2 cleanup-proof correction are
-implemented locally. Independent round 3 returned `Identity: PASS`,
-`Spec: FAIL`, and `Quality: CHANGES REQUIRED`, with no Critical findings, one
-Important source-policy status-handling finding, and one Minor stale-citation
-finding. Both round-3 findings are remediated by the exact implementation and
-evidence below. Independent round-4 review is pending and is not claimed as
-approved. Hosted CI, live native acceptance, TigerVNC fallback acceptance,
-rollback execution, and rollout were not performed and are not claimed.
+through 4, and the controller's post-round-2 cleanup-proof correction are
+implemented locally. Independent round 4 returned `Identity: PASS`,
+`Spec: FAIL`, and `Quality: CHANGES REQUIRED`, with no Critical or Important
+findings and one Minor proxy-ticket-lifetime documentation finding. The
+round-4 finding is remediated by the exact documentation and evidence below.
+Independent round-5 review is pending and is not claimed as approved. Hosted
+CI, live native acceptance, TigerVNC fallback acceptance, rollback execution,
+and rollout were not performed and are not claimed.
 
 Task 14B remains the sole deferred parser-smoke/fuzz target, script, corpus, and
 workflow scope. No tracked Task 14B target, script, workflow, corpus, or parser
@@ -51,6 +51,12 @@ under `fuzz/artifacts` remained untouched and contain zero files.
 - Round-3 remediation implementation head:
   `70fef1d6aabf373c2d96f0c83b8c88129f636501`
   (`fix: fail closed on source policy errors`)
+- Round-3 evidence report and exact round-4 fix base:
+  `b6294e34ac9681c7808aacf9f02f926f917d3734`
+  (`docs: record Task 14A review round 3 fixes`)
+- Round-4 documentation correction head:
+  `5527325f9dfcbd21e9c5e50087f01cae2e0ad6b7`
+  (`docs: correct proxy ticket lifetime`)
 - This updated report is committed separately. Its new commit SHA and the
   required post-report-commit gate results are reported by the controller-facing
   completion response rather than embedded self-referentially here.
@@ -132,6 +138,16 @@ The round-3 range changes no Rust production source, native acceptance recipe,
 manifest, lock data, dependency, CLI/SSH/VNC/fallback/parser behavior, fuzz
 scope, live-acceptance state, or protected rollback artifact. The round-3
 report commit changes only this report.
+
+Round-4 documentation correction commit
+`5527325f9dfcbd21e9c5e50087f01cae2e0ad6b7` contains exactly:
+
+- `docs/threat-model.md`
+
+It replaces only the VNC proxy ticket resource row. It changes no runtime Rust,
+test, CI, policy, configuration, acceptance behavior, dependency, manifest,
+lock data, parser/fuzz scope, live state, or protected rollback artifact. The
+round-4 evidence commit changes only this report.
 
 ## RED / baseline evidence
 
@@ -677,6 +693,96 @@ rerun at that final report-only head and supplied in the controller-facing
 completion response. Independent round-4 review is pending and is not claimed
 as approved.
 
+## Round-4 proxy ticket lifetime documentation correction
+
+Independent round 4 reviewed exact clean base
+`b6294e34ac9681c7808aacf9f02f926f917d3734` (tree
+`e91879dbfe9b5c3067acda710c9395f1d3122d14`) on
+`feature/proxmox-console-foundation`. It returned `Identity: PASS`,
+`Spec: FAIL`, and `Quality: CHANGES REQUIRED`, with no Critical or Important
+findings. Its one Minor finding was that the threat model's VNC proxy ticket
+resource row conflated the Rust-owned ticket lifetime with the separate copy
+placed in the spawned system OpenSSH child's environment.
+
+A documentation-specific semantic check was run before editing. The old row
+failed because it did not distinguish the two owners and lacked four exact
+supporting ranges. Actual RED was:
+
+```text
+ticket lifetime documentation missing: Rust-owned `ProxyTicket`, before waiting for `SecurityResult`, fallback password-file creation, `LC_PVE_TICKET` environment copy, potentially present until that exact owned proxy child exits, earlier erasure is unproved, `src/vnc/security.rs:266-279`, `src/fallback/mod.rs:345-364`, `src/ssh/command.rs:53-68`, `src/ssh/stream.rs:869-960`
+```
+
+Commit `5527325f9dfcbd21e9c5e50087f01cae2e0ad6b7` changes only that row. It now
+states separately that:
+
+- the Rust-owned `ProxyTicket` is transferred into native VNC authentication
+  or consumed by explicit fallback password-file creation, and the native path
+  drops its Rust owner before waiting for `SecurityResult`
+  (`src/ssh/proxy.rs:25-105`, `src/vnc/security.rs:266-279`,
+  `src/fallback/mod.rs:345-364`); and
+- the system OpenSSH proxy child is spawned with an `LC_PVE_TICKET` environment
+  copy (`src/ssh/command.rs:53-68`, `src/ssh/stream.rs:869-960`). Because no
+  in-process mechanism proves earlier erasure, the child copy is conservatively
+  treated as potentially present until that exact owned proxy child exits.
+
+The row retains same-user process inspection as a residual risk, states that a
+Rust drop cannot erase another process's environment, and explicitly does not
+claim that the OpenSSH copy was observed to persist. This documentation-only
+correction neither establishes a shorter child-environment lifetime nor changes
+runtime behavior.
+
+Focused GREEN was 15/15 required ticket-row semantics. Replacing two old row
+citations with five source-specific citations changed the current threat-model
+inventory from 189 citations and 108 unique ranges to 192 citations and 112
+unique ranges. Historical counts above remain attached to their earlier exact
+heads and were not rewritten.
+
+Every required gate below was rerun at exact committed documentation head
+`5527325f9dfcbd21e9c5e50087f01cae2e0ad6b7` (tree
+`6cb0d63427421e085fe5a83f796477a8efaa0c09`):
+
+| Gate | Actual committed-head result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Pass |
+| `cargo test --all-targets --all-features --locked` | 356 passed; 0 failed; 0 ignored |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | Pass |
+| `cargo build --release --locked` | Pass |
+| `actionlint .github/workflows/ci.yml` | Pass |
+| focused fallback/surface/SSH contracts | 23 passed; 0 failed |
+| extracted actual source-policy block | Pass |
+| supported locked ARM64 all-feature unprefixed graph | Pass; `quick-xml` absent |
+| locked all-target all-feature unprefixed positive control | Pass; exactly one `quick-xml v0.39.4` |
+| 10 supported inverse selectors plus all-target `quick-xml` inverse | Pass |
+| exact two-ID `cargo audit` | Pass; 346 dependencies, 0 vulnerabilities, 1 allowed maintenance warning |
+| `cargo deny list` | Pass |
+| all four cargo-deny components | Pass; reviewed `ttf-parser` and unused MPL-2.0 warnings visible |
+| aggregate cargo-deny | Pass |
+| local PyYAML parse | `ci_yaml=valid` |
+| official security-policy resolution | Exactly `["SECURITY.md"]`; root and `src` resolve the root policy |
+| threat citation ranges | 192/192 valid; 112 unique path/range tuples |
+| workflow citation semantics | 8/8 valid against the unchanged workflow controls |
+| ticket lifetime semantics | 15/15 valid against the corrected row and cited sources |
+| local Markdown links | 24/24 valid |
+| sensitive-keyword classification | 100/100 explanatory or synthetic |
+| real-data documentation scan | 0 matches |
+| exact round-4 documentation boundary | 1/1 allowed file only |
+| cumulative Task 14A boundary | 16/16 expected files only |
+| protected metadata and SHA-256 | All four exactly match the required baseline |
+| Task 14B artifact boundary | 0 tracked artifacts; two pre-existing ignored directories remain empty |
+| `git diff --check` and tracked status | Pass; clean |
+
+The test total remains exactly 356:
+
+```text
+151 + 0 + 13 + 3 + 12 + 14 + 7 + 17 + 39 + 3 + 15 + 7 + 14 + 3 +
+16 + 23 + 4 + 11 + 4 = 356
+```
+
+This report is committed separately. The same complete offline sequence is
+rerun at that final report-only head and supplied in the controller-facing
+completion response. Independent round-5 review is pending and is not claimed
+as approved.
+
 ## Protected rollback artifacts and parked stash
 
 Only metadata and SHA-256 were read for the four rollback artifacts; no file
@@ -703,18 +809,21 @@ claim is made. It was neither applied, edited, dropped, recreated, nor touched.
   recipes and their executable/documentation contract test. The controller
   correction makes native trap clearing structurally success-only. Round-3
   remediation changes only CI source-policy status handling, its executable
-  test, and the eight workflow citation ranges. No public API, CLI contract,
-  remote command, VNC, fallback, ticket, transport ownership, or cleanup
-  lifecycle was changed.
+  test, and the eight workflow citation ranges. Round-4 correction changes only
+  one threat-model resource row and this evidence report; it documents distinct
+  Rust-owner and child-environment lifetimes without shortening either in
+  production. No public API, CLI contract, remote command, VNC, fallback,
+  ticket, transport ownership, or cleanup lifecycle was changed.
 - CI's only advisory ignores are the two exact target-inactive `quick-xml`
   IDs, ordered after the ARM64 graph assertion. Active `webbrowser` is upgraded
   and never ignored.
 - Cargo-deny has exact source/license/duplicate controls with dated exceptions;
   no broad skip tree, Git source, wildcard, or active-target advisory ignore is
   present.
-- Documentation is source-backed; all 189 source citations and all eight
-  workflow-citation semantics validate. It deliberately labels hosted, live,
-  fallback, rollback, and rollout evidence as unexecuted.
+- Documentation is source-backed; all 192 source citations, 112 unique ranges,
+  all eight workflow-citation semantics, and all 15 ticket-lifetime semantics
+  validate. It deliberately labels hosted, live, fallback, rollback, and
+  rollout evidence as unexecuted.
 - No live Proxmox/VM, real clipboard, configuration contents, TigerVNC process,
   private credential, host address, fingerprint, guest pixel, or stderr body
   was accessed.
@@ -731,8 +840,8 @@ Remaining concerns are explicit rather than accepted silently:
    remains green, and it expires for review by 2027-02-28.
 3. Hosted CI has not run at this head and branch protection was not inspected or
    changed.
-4. Independent round-3 review is complete with its Important and Minor findings
-   remediated; round-4 review is pending and not approved. Every live/native/
+4. Independent round-4 review is complete with its one Minor finding
+   remediated; round-5 review is pending and not approved. Every live/native/
    fallback/rollback/rollout gate remains unexecuted.
 5. Complete acceptance remains blocked on the parked Task 14B parser-smoke and
    merge-workflow tranche.
