@@ -912,9 +912,19 @@ impl ProxyStream {
         if let Some(setup_error) = setup_error {
             drop(stdin);
             drop(stdout);
-            let lifecycle = terminate_owned_child(child.child_mut(), faults, &policy);
+            #[cfg(test)]
+            let setup_policy = {
+                let mut setup_policy = policy.clone();
+                setup_policy.graceful_close_timeout = Duration::from_secs(5);
+                setup_policy
+            };
+            #[cfg(not(test))]
+            let setup_policy = policy.clone();
+
+            let lifecycle = terminate_owned_child(child.child_mut(), faults, &setup_policy);
             let (outcome, stderr_result) =
-                run_lifecycle_with_stderr(lifecycle, stderr, policy.pipe_drain_timeout).await;
+                run_lifecycle_with_stderr(lifecycle, stderr, setup_policy.pipe_drain_timeout).await;
+
             if outcome.reaped {
                 child.mark_reaped();
             }

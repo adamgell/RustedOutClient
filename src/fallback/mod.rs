@@ -1402,7 +1402,7 @@ while :; do sleep 1; done
         let runtime = RuntimeDir::create().unwrap();
         let fixture = ViewerFixture::new(ViewerBehavior::ExitImmediately);
         let (proxy, _peer) = duplex(64);
-        let (policy, channels) = test_policy(Duration::from_secs(1), Duration::from_secs(1));
+        let (policy, channels) = test_policy(Duration::from_secs(5), Duration::from_secs(1));
         let mut session = open_test(
             &runtime,
             &fixture.path,

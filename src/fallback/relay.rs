@@ -64,14 +64,15 @@ where
         let accept = timeout(policy.accept_timeout, listener.accept());
         tokio::pin!(accept);
         tokio::select! {
-            result = &mut accept => match result {
-                Ok(accepted) => AcceptOutcome::Accepted(accepted),
-                Err(_) => AcceptOutcome::TimedOut,
-            },
+            biased;
             status = viewer.child.wait() => AcceptOutcome::Viewer(status),
             deadline = &mut cancelled => AcceptOutcome::Cancelled(
                 deadline.unwrap_or_else(|_| Instant::now() + close_timeout)
             ),
+            result = &mut accept => match result {
+                Ok(accepted) => AcceptOutcome::Accepted(accepted),
+                Err(_) => AcceptOutcome::TimedOut,
+            },
         }
     };
     drop(listener);

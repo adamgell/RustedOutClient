@@ -20,7 +20,7 @@ pub use stream::{
 };
 
 #[cfg(test)]
-pub(super) async fn process_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) async fn process_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
     use std::sync::OnceLock;
 
     static PROCESS_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
