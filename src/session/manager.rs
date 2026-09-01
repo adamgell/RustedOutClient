@@ -1205,10 +1205,7 @@ impl SessionBackend for ProductionBackend {
                 .map_err(public_master_error)?;
             if let Err(error) = master.verify().await {
                 let primary = public_master_error(error);
-                if master.close().await.is_err() {
-                    return Err(PublicError::new(PublicErrorKind::Cleanup));
-                }
-                return Err(primary);
+                return Err(compose_master_start_failure(primary, master.close().await));
             }
             self.master = Some(master);
             Ok(())
@@ -1621,6 +1618,17 @@ fn public_master_error(error: SshMasterError) -> PublicError {
         SshMasterError::Io(_) | SshMasterError::ControlTimedOut => {
             PublicError::new(PublicErrorKind::SshUnavailable)
         }
+    }
+}
+
+fn compose_master_start_failure(
+    primary: PublicError,
+    cleanup_result: Result<(), SshMasterError>,
+) -> PublicError {
+    if cleanup_result.is_err() {
+        primary.with_cleanup_failure()
+    } else {
+        primary
     }
 }
 
@@ -2353,6 +2361,19 @@ mod tests {
 
         let public = super::public_rfb_error(error);
         assert_eq!(public.kind(), PublicErrorKind::RfbSecurity);
+        assert!(public.has_cleanup_failure());
+    }
+
+    #[test]
+    fn master_startup_cleanup_failure_preserves_the_primary_category() {
+        let primary = PublicError::new(PublicErrorKind::SshAuthentication);
+
+        let public = super::compose_master_start_failure(
+            primary,
+            Err(crate::ssh::SshMasterError::CleanupFailed),
+        );
+
+        assert_eq!(public.kind(), PublicErrorKind::SshAuthentication);
         assert!(public.has_cleanup_failure());
     }
 

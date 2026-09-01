@@ -1,7 +1,7 @@
 use std::{
     convert::Infallible,
     ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -121,6 +121,10 @@ impl SshCommandFactory {
 
     pub fn exit(&self, profile: &PveProfile) -> Result<CommandSpec, Infallible> {
         self.control_operation(profile, "exit")
+    }
+
+    pub(super) fn control_socket(&self) -> &Path {
+        &self.control_socket
     }
 
     pub fn inventory(&self, profile: &PveProfile) -> Result<CommandSpec, Infallible> {
