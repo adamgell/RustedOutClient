@@ -210,8 +210,12 @@ clipboard memory and the UI/OS. The fallback adds a same-host loopback boundary.
   startup; source currently exposes a narrow importer but loads only the new
   private configuration path (`src/config.rs:138-180`,
   `src/app/mod.rs:387-417`).
-- Parser-smoke work and its workflow are deferred to Task 14B; the complete
-  native acceptance gate therefore remains blocked.
+- Parser-smoke is implemented as a five-target synthetic RFB harness, offline
+  `scripts/fuzz-smoke.sh`, and a candidate hosted workflow. Residual limits:
+  inputs are synthetic only; harness geometry is tightened; `authenticate_vnc`
+  is excluded; session observation is counts/dimensions only; CI never runs
+  `cmin`; hosted/local pass is exact-commit scoped and is not live Proxmox
+  acceptance (`fuzz/`, `scripts/fuzz-smoke.sh`, `.github/workflows/parser-smoke.yml`).
 - The compatibility plan for moving beyond egui/eframe 0.31, including replacing
   unmaintained `ttf-parser` 0.25.1, remains open until review by 2027-02-28. The
   lockfile records the active package chain through direct `egui`, `epaint`,
@@ -228,7 +232,7 @@ clipboard memory and the UI/OS. The fallback adds a same-host loopback boundary.
 | Profile and CLI | Option injection, malformed node/VM, unintended endpoint or command | Typed grammars reject leading-dash/whitespace targets and bound node/VM values; CLI has no direct VNC endpoint or secret flags (`src/model.rs:24-35`, `src/model.rs:65-79`, `src/cli.rs:23-89`) | A syntactically valid but wrong trusted target remains operator error |
 | OpenSSH/known-hosts | MITM, trust downgrade, alternate authentication, password prompt, arbitrary remote execution | Fixed system executable and strict options; public-key only with GSSAPI, hostbased, password, and keyboard-interactive disabled; reviewed remote argument shapes; source-policy CI rejects weakening flags and file-transfer terms (`src/ssh/command.rs:20-33`, `src/ssh/command.rs:105-203`, `.github/workflows/ci.yml:53-89`) | Compromised known-hosts or system OpenSSH is outside the process boundary |
 | Ticket memory/environment | Ticket disclosure in argv, logs, inherited environment, crash evidence | Generated after revalidation, absent from argv, inherited value cleared, one explicit environment value, redacted nonserializable type (`src/ssh/command.rs:53-73`, `src/ssh/command.rs:135-156`, `src/ssh/proxy.rs:25-105`) | Same-user memory/process inspection can still observe a live secret |
-| Inventory and RFB bytes | Oversized allocation, decompression/decoder abuse, malformed layout, auth downgrade | Read caps, checked arithmetic, fail-closed parsers, target-specific protocol ceilings, VNC Auth allowlist over typed SSH proxy (`src/ssh/inventory.rs:22-26`, `src/vnc/wire.rs:121-189`, `src/vnc/limits.rs:3-41`, `src/vnc/security.rs:122-187`) | Parser/decoder defects may remain; deferred parser smoke reduces confidence |
+| Inventory and RFB bytes | Oversized allocation, decompression/decoder abuse, malformed layout, auth downgrade | Read caps, checked arithmetic, fail-closed parsers, target-specific protocol ceilings, VNC Auth allowlist over typed SSH proxy, synthetic five-target parser smoke (`src/ssh/inventory.rs:22-26`, `src/vnc/wire.rs:121-189`, `src/vnc/limits.rs:3-41`, `src/vnc/security.rs:122-187`, `fuzz/`, `scripts/fuzz-smoke.sh`) | Parser/decoder defects may remain outside the five harnessed boundaries and outside live traffic |
 | Framebuffer and UI queue | Guest pixels leaked to logs/artifacts; server floods UI | No pixel `Debug`/`Display`; bounded queues; checked transactional RGBA updates; CI uploads no artifacts (`src/app/state.rs:107-158`, `src/app/state.rs:198-223`, `.github/workflows/ci.yml:16-129`) | Pixels remain sensitive in process/GPU memory while displayed |
 | Keyboard/pointer | Input crosses sessions, sticks after focus loss, bypasses view-only | Semantic session IDs, readiness/view-only checks, bounded key tracking, release-all and exact cleanup (`src/vnc/input.rs:104-223`, `src/session/manager.rs:649-690`, `src/session/manager.rs:1052-1085`) | A compromised guest naturally receives input intentionally sent to it |
 | Clipboard | Silent collection, unbounded payload, wrong direction/session, content logging | Default off; explicit Send/Receive; one-shot replacing slot; UTF-8 and one-MiB bounds; content-free types/errors (`src/config.rs:77-90`, `src/app/actions.rs:291-323`, `src/connection.rs:70-101`, `src/vnc/input.rs:36-74`) | Enabling clipboard intentionally exposes selected text to one endpoint/host clipboard |
@@ -335,5 +339,5 @@ new capability. Unsupported functionality is not automatically exempt: if
 supported code violates an invariant by exposing that functionality, report it.
 
 No risk in this document is marked accepted merely because a compensating
-control exists. The absence of live/native acceptance and the deferred Task 14B
-parser-smoke tranche are explicit confidence limits until independently closed.
+control exists. The absence of live/native acceptance and of exact-head hosted
+parser-smoke evidence are explicit confidence limits until independently closed.

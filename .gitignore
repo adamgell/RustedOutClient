@@ -1,5 +1,7 @@
 # Build artifacts
 /target
+/fuzz/target
+/fuzz/artifacts
 
 # Saved sessions (may contain hostnames and passwords) — never commit
 sessions.json

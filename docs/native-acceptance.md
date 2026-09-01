@@ -1,9 +1,11 @@
 # Native Acceptance and Reversible Rollout
 
 **Status: NOT READY and NOT EXECUTED.** Local synthetic verification is not
-live acceptance. The Task 14B parser-smoke target/script/workflow remains
-parked, so Step 2 and therefore the complete gate cannot pass yet. This file is
-the sanitized operator checklist for a later separately authorized run.
+live acceptance. Task 14B parser-smoke files exist at this branch (S1:
+implementation present). The parser gate is not marked passed. Hosted smoke,
+independent review, and live native/fallback acceptance remain separate.
+This file is the sanitized operator checklist for a later separately
+authorized run.
 
 Keep local/CI readiness, independent review, native lab acceptance, TigerVNC
 fallback acceptance, rollback proof, and rollout as separate results. Never
@@ -72,9 +74,12 @@ Expected: all gates pass and the record contains the exact HEAD and release
 binary SHA-256. The graph command must prove `quick-xml` absent from the
 supported target before the exact audit exception is used.
 
-**Current blocker:** the parser-smoke command and its merge-blocking workflow
-belong to Task 14B and do not exist in this Task 14A tranche. Do not create or
-run a substitute and do not mark this step ready.
+**Parser-smoke state:** scripts, five fuzz targets, corpus, workflow, and
+contract tests exist. `./scripts/fuzz-smoke.sh 30` is the operator interface.
+Approved pins: Rust 1.92.0, `nightly-2026-08-29-aarch64-apple-darwin`,
+`cargo-fuzz` 0.13.2. The workflow is a candidate required check pending
+separate operator authorization. Do not mark this step passed without
+exact-head local and hosted evidence.
 
 ### Step 3: Run an independent code review
 
@@ -196,7 +201,7 @@ guest image, clipboard value, stderr body, or environment value.
 | Exact head | Local SHA / remote SHA / clean diff |  |
 | Local suite | Formatting / tests and count / lint / release SHA-256 |  |
 | Dependency policy | Supported-target graph / audit / deny |  |
-| Parser smoke | Duration / workflow run | BLOCKED — Task 14B parked |
+| Parser smoke | Duration / workflow run | Implementation present; not marked passed without exact-head evidence |
 | Independent review | Reviewer / reviewed SHA / findings closed |  |
 | Side-by-side install | Version / old helper metadata unchanged |  |
 | Configuration | Directory mode / file mode / no secret fields |  |
@@ -214,4 +219,4 @@ guest image, clipboard value, stderr body, or environment value.
 
 No build, synthetic peer, one live connection, fallback result, or rollback
 result alone completes acceptance. Completion requires all eleven steps at one
-reviewed exact head, including the currently deferred Task 14B parser gate.
+reviewed exact head, including exact-head parser-smoke evidence.

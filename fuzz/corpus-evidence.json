@@ -1,0 +1,483 @@
+{
+  "targets": {
+    "rfb_handshake": {
+      "candidate_count": 10,
+      "minimized_count": 10,
+      "final_filenames": [
+        "banner-malformed.bin",
+        "banner-unsupported-version.bin",
+        "init-invalid-pixel-format.bin",
+        "init-oversized-dimensions.bin",
+        "init-oversized-name.bin",
+        "init-truncated-name.bin",
+        "security-no-vncauth.bin",
+        "security-result-failure-reason.bin",
+        "security-zero-reason.bin",
+        "valid-3.8-vncauth-init.bin"
+      ],
+      "final_count": 10,
+      "files": [
+        {
+          "file": "banner-malformed.bin",
+          "sha256": "8d34c120edc593622e8cc40bf1d57add4c1c962c82467dfa4050c47013ceba3e",
+          "length": 12,
+          "category": "ProtocolBanner"
+        },
+        {
+          "file": "banner-unsupported-version.bin",
+          "sha256": "c046e3b1192023a18e5e690177544cdddfff5a244c8e0700b0b8698c8877b0d9",
+          "length": 12,
+          "category": "ProtocolBanner"
+        },
+        {
+          "file": "init-invalid-pixel-format.bin",
+          "sha256": "6bbdd3c026b8945161e63407afc6eb38bc765fd0ec1e3561a4c1e3a78e1c232f",
+          "length": 51,
+          "category": "ServerInit"
+        },
+        {
+          "file": "init-oversized-dimensions.bin",
+          "sha256": "3c9131558dc38f44180fd26fd4a84e3f40311e4eb084e293887678a236e11610",
+          "length": 51,
+          "category": "Limit"
+        },
+        {
+          "file": "init-oversized-name.bin",
+          "sha256": "2051e393c600564138a85dfdc74f3220d71407e3d1433e25aab17d57f504a31f",
+          "length": 42,
+          "category": "Limit"
+        },
+        {
+          "file": "init-truncated-name.bin",
+          "sha256": "882b81689c65db4e3b26848736c7533c12a4dfdbc97a18dbac5f74a3e668e69f",
+          "length": 45,
+          "category": "IoEof"
+        },
+        {
+          "file": "security-no-vncauth.bin",
+          "sha256": "0d83670474ca7d2b4ac72e2563d1fff54389520ae48a4205f3834447a7393813",
+          "length": 15,
+          "category": "SecurityAllowlist"
+        },
+        {
+          "file": "security-result-failure-reason.bin",
+          "sha256": "4c5b05aa8a64ce5520f55592ac8ee0f3bf239eb7ae7dd146d5378e88a15b16aa",
+          "length": 26,
+          "category": "SecurityFailure"
+        },
+        {
+          "file": "security-zero-reason.bin",
+          "sha256": "34a9f178cca81bdaed434a36ddf4e1df63cd1ee119cfbe6e18939e4f79d8e7c2",
+          "length": 21,
+          "category": "SecurityFailure"
+        },
+        {
+          "file": "valid-3.8-vncauth-init.bin",
+          "sha256": "68491272b753dd33c2c8d37f42b37bc73174fd54d5dcbb7101e80bbe7ef38c24",
+          "length": 51,
+          "category": "Ok"
+        }
+      ]
+    },
+    "rfb_session": {
+      "candidate_count": 15,
+      "minimized_count": 15,
+      "final_filenames": [
+        "bell.bin",
+        "clipboard-invalid-utf8.bin",
+        "clipboard-over-limit.bin",
+        "clipboard-valid-utf8.bin",
+        "colour-map-entries.bin",
+        "desktop-size-resize.bin",
+        "extended-desktop-size-malformed.bin",
+        "extended-desktop-size-valid.bin",
+        "rect-count-over-limit.bin",
+        "rect-out-of-bounds.bin",
+        "truncated-rect-header.bin",
+        "unknown-encoding.bin",
+        "unknown-message-type.bin",
+        "valid-mixed-encodings.bin",
+        "valid-raw-rect.bin"
+      ],
+      "final_count": 15,
+      "files": [
+        {
+          "file": "bell.bin",
+          "sha256": "dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986",
+          "length": 1,
+          "category": "IoEof"
+        },
+        {
+          "file": "clipboard-invalid-utf8.bin",
+          "sha256": "975a8a79472d7e85d6c3c644218a98259900e6c814fec8bdc7413a28c05e98ff",
+          "length": 10,
+          "category": "Protocol"
+        },
+        {
+          "file": "clipboard-over-limit.bin",
+          "sha256": "2460cffc7f27c8aa27ede8ab1f20a56f8c9a3c77b0c9c161dc56f8dc999aa6cb",
+          "length": 8,
+          "category": "Limit"
+        },
+        {
+          "file": "clipboard-valid-utf8.bin",
+          "sha256": "b904951294739edce1674dd4c4d0b31f49d1221e74d4336cd8a068ebbcb4df44",
+          "length": 17,
+          "category": "IoEof"
+        },
+        {
+          "file": "colour-map-entries.bin",
+          "sha256": "c64cc8710105d2cd95895c5f662473f9de1bbeef65301e06f01d3233a1dddb90",
+          "length": 12,
+          "category": "IoEof"
+        },
+        {
+          "file": "desktop-size-resize.bin",
+          "sha256": "9920ad45d0f88590d9949da1df49352587f2ebdf12e866f867dbb83e70f31314",
+          "length": 16,
+          "category": "IoEof"
+        },
+        {
+          "file": "extended-desktop-size-malformed.bin",
+          "sha256": "4d880d677e58a8f0c7b5aa1c76600a4bd5b991fb367b96ca39bc8bf95390ee03",
+          "length": 20,
+          "category": "Protocol"
+        },
+        {
+          "file": "extended-desktop-size-valid.bin",
+          "sha256": "43cf5650136e363cf88054e3262b4dace9923bef0ab8f4d5987f01505019bce9",
+          "length": 36,
+          "category": "IoEof"
+        },
+        {
+          "file": "rect-count-over-limit.bin",
+          "sha256": "f61784e1c765f6d6e60a3af16ce607f343cffbd3864d462f5d2c19ebe7325167",
+          "length": 4,
+          "category": "Limit"
+        },
+        {
+          "file": "rect-out-of-bounds.bin",
+          "sha256": "5e86a1acba64b2f194dd7a58e5d4561306d4995a68be1af74d0880097dc7b3f6",
+          "length": 20,
+          "category": "Protocol"
+        },
+        {
+          "file": "truncated-rect-header.bin",
+          "sha256": "c58614458c2397d967e807716d65e70c4d6470e3e56e3fb99862671bad2fdee6",
+          "length": 9,
+          "category": "IoEof"
+        },
+        {
+          "file": "unknown-encoding.bin",
+          "sha256": "2fff8808d80d076eda11fccfb3a0ae612aeceec4e0e5c09c53b525c253789168",
+          "length": 16,
+          "category": "Protocol"
+        },
+        {
+          "file": "unknown-message-type.bin",
+          "sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+          "length": 1,
+          "category": "Protocol"
+        },
+        {
+          "file": "valid-mixed-encodings.bin",
+          "sha256": "a6432a6ad3b402c8cce8e834f37b052fdc236bc4aa773614caf93771e09231e1",
+          "length": 97,
+          "category": "IoEof"
+        },
+        {
+          "file": "valid-raw-rect.bin",
+          "sha256": "13bec9bf57e01ca2363784a3df8a613afa97bb76ac6495acac78dec2888d6fee",
+          "length": 20,
+          "category": "IoEof"
+        }
+      ]
+    },
+    "rfb_zrle": {
+      "candidate_count": 12,
+      "minimized_count": 12,
+      "final_filenames": [
+        "declared-over-limit.bin",
+        "empty-decoded.bin",
+        "no-progress-zlib.bin",
+        "packed-palette-2.bin",
+        "palette-index-out-of-range.bin",
+        "palette-rle.bin",
+        "plain-rle.bin",
+        "raw-tile.bin",
+        "run-beyond-tile.bin",
+        "solid-tile.bin",
+        "trailing-data.bin",
+        "truncated-compressed.bin"
+      ],
+      "final_count": 12,
+      "files": [
+        {
+          "file": "declared-over-limit.bin",
+          "sha256": "160811fdaf692ba77eabfbfc3a6bb3c4cf6a87beafd28cfe90b5dc64cb20ab46",
+          "length": 4,
+          "category": "Limit"
+        },
+        {
+          "file": "empty-decoded.bin",
+          "sha256": "8586f6acef9592d743bcd60860269e35921a576efef828931b2d54a804dde5e1",
+          "length": 12,
+          "category": "Decoder"
+        },
+        {
+          "file": "no-progress-zlib.bin",
+          "sha256": "7299d201cc5f776b539b39f3791223d6e3a73acded7eeea7800b619601085f6e",
+          "length": 7,
+          "category": "Decoder"
+        },
+        {
+          "file": "packed-palette-2.bin",
+          "sha256": "3a01acae8b23967c5c1589f42603c93ffa78e4fc6b26c8af898674a767bd7c91",
+          "length": 21,
+          "category": "Ok"
+        },
+        {
+          "file": "palette-index-out-of-range.bin",
+          "sha256": "9b831012f1b755a88214806538dc3e4029de368f067a754cb6a68f985c47e0a9",
+          "length": 26,
+          "category": "Decoder"
+        },
+        {
+          "file": "palette-rle.bin",
+          "sha256": "735cea0c267f710d2ba4206e896f1b1c27c0dc948646abefbac8275fb48f2893",
+          "length": 22,
+          "category": "Ok"
+        },
+        {
+          "file": "plain-rle.bin",
+          "sha256": "fa8f0428823d856cd1491e097834333789531359a312f06930fc0824780f08b7",
+          "length": 18,
+          "category": "Ok"
+        },
+        {
+          "file": "raw-tile.bin",
+          "sha256": "8a43c9f65133fd08af057769fc078d7735240000efca338128848411f0988062",
+          "length": 29,
+          "category": "Ok"
+        },
+        {
+          "file": "run-beyond-tile.bin",
+          "sha256": "4103c846843a97a203b7219b3c1bd76e978cca22fccda1b692b215c6c92f2c46",
+          "length": 18,
+          "category": "Decoder"
+        },
+        {
+          "file": "solid-tile.bin",
+          "sha256": "894098395febaa070e045949012dbe5a966d75520566de24dc94cfe58c66f9f6",
+          "length": 16,
+          "category": "Ok"
+        },
+        {
+          "file": "trailing-data.bin",
+          "sha256": "052bd90b0f067f3652e4c68303607f2fc640644e88c9dafd8cf4155e3b8448d1",
+          "length": 17,
+          "category": "Decoder"
+        },
+        {
+          "file": "truncated-compressed.bin",
+          "sha256": "cf69429939162b168c261fd5bdbc770f059e4304a94d42593538878d809d2f3b",
+          "length": 7,
+          "category": "IoEof"
+        }
+      ]
+    },
+    "rfb_tight": {
+      "candidate_count": 14,
+      "minimized_count": 14,
+      "final_filenames": [
+        "basic-copy-compressed.bin",
+        "basic-copy-uncompressed.bin",
+        "compact-length-noncanonical.bin",
+        "compact-length-truncated.bin",
+        "fill.bin",
+        "gradient.bin",
+        "jpeg-16x16.bin",
+        "jpeg-truncated.bin",
+        "jpeg-wrong-dimensions.bin",
+        "method-10-no-zlib.bin",
+        "output-length-mismatch.bin",
+        "palette-2-compressed.bin",
+        "palette-2.bin",
+        "palette-256.bin"
+      ],
+      "final_count": 14,
+      "files": [
+        {
+          "file": "basic-copy-compressed.bin",
+          "sha256": "aa92d6e405844527aad6d77d7a42d0cbc10a7c5719795ea32b29871e5a21ce1b",
+          "length": 25,
+          "category": "Ok"
+        },
+        {
+          "file": "basic-copy-uncompressed.bin",
+          "sha256": "a498efa8d0759e7b704095853db9bc1ef8cf65af37bed9d006c4b2917e695061",
+          "length": 5,
+          "category": "Ok"
+        },
+        {
+          "file": "compact-length-noncanonical.bin",
+          "sha256": "9541de8e71e311a3a7453cc7d9efed44bfe9051b41f63926ffa3cc5947aef5be",
+          "length": 4,
+          "category": "Decoder"
+        },
+        {
+          "file": "compact-length-truncated.bin",
+          "sha256": "f00964a88182eb00edddddd948367845326f80d0e3864f0a59d91f759260792b",
+          "length": 3,
+          "category": "IoEof"
+        },
+        {
+          "file": "fill.bin",
+          "sha256": "c5fc9e538bd5082d7ecf375e26bde5ee5cfb2c00804f4a9688de790f1cc69a90",
+          "length": 5,
+          "category": "Ok"
+        },
+        {
+          "file": "gradient.bin",
+          "sha256": "aa55990619b4feef010bb74b5f732dd629c982f9e67823b6fdee57b180922d8a",
+          "length": 26,
+          "category": "Ok"
+        },
+        {
+          "file": "jpeg-16x16.bin",
+          "sha256": "c2d3c9930d448e163295bc934a94e1aa5c1168920cfe7a322013c283da796851",
+          "length": 638,
+          "category": "Ok"
+        },
+        {
+          "file": "jpeg-truncated.bin",
+          "sha256": "12ee8ca1542b9397f7e4810a4a082937c26f6a11f1e772392cdabb4d171806e2",
+          "length": 5,
+          "category": "Decoder"
+        },
+        {
+          "file": "jpeg-wrong-dimensions.bin",
+          "sha256": "450e8b29de3463c13e486cb9663c2cf24b730916f87f7bc1c5a3ca1415c45a56",
+          "length": 641,
+          "category": "Decoder"
+        },
+        {
+          "file": "method-10-no-zlib.bin",
+          "sha256": "fdf6ae803f983d8b8e862914fcac3e89a4198cdd9e0ce8bf7b5eb08161471dba",
+          "length": 2,
+          "category": "Decoder"
+        },
+        {
+          "file": "output-length-mismatch.bin",
+          "sha256": "0b39f5273aa07649c76f7c540c5236286b13d7acba50fc2518a5983a7e773569",
+          "length": 25,
+          "category": "Decoder"
+        },
+        {
+          "file": "palette-2-compressed.bin",
+          "sha256": "3bf1de3a3b82b9787a1156e166513d577c65ec0dfafe0899e8c39f722de58776",
+          "length": 22,
+          "category": "Ok"
+        },
+        {
+          "file": "palette-2.bin",
+          "sha256": "b69d75cc0a15d4e0236c60accc02d34e25c11ca68e666dfdd0ebefa908ee2657",
+          "length": 11,
+          "category": "Ok"
+        },
+        {
+          "file": "palette-256.bin",
+          "sha256": "84209da021c77e1b45685be6012cae6285b5f700dde4dae1e7ae67f0585f3691",
+          "length": 773,
+          "category": "Ok"
+        }
+      ]
+    },
+    "rfb_hextile": {
+      "candidate_count": 11,
+      "minimized_count": 9,
+      "final_filenames": [
+        "background-fill.bin",
+        "bg-fg-subrects.bin",
+        "coloured-subrects.bin",
+        "foreground-without-spec.bin",
+        "full-raw-over-budget.bin",
+        "invalid-subtype-bits.bin",
+        "missing-background.bin",
+        "raw-tile.bin",
+        "raw-with-irrelevant-bits.bin",
+        "subrect-out-of-tile.bin",
+        "truncated-raw.bin"
+      ],
+      "final_count": 11,
+      "files": [
+        {
+          "file": "background-fill.bin",
+          "sha256": "bbe08b19006d061fb13f00e6b7e9799de6b77e56e076b0c70df18a55c2524576",
+          "length": 10,
+          "category": "Ok"
+        },
+        {
+          "file": "bg-fg-subrects.bin",
+          "sha256": "2f34b14a2483d13b73a47e667342475fd05ff03bdb7e56d35f429fcf5bb5a282",
+          "length": 17,
+          "category": "Ok"
+        },
+        {
+          "file": "coloured-subrects.bin",
+          "sha256": "41df120c984a167da8a27fb310429e8e6bbc8a18319f1dd5a39534e42fcefaa8",
+          "length": 17,
+          "category": "Ok"
+        },
+        {
+          "file": "foreground-without-spec.bin",
+          "sha256": "6ac1c8ea5b4632f96943d4c6c393ebc4e2b9c4fa6433fe3cda36a4924115a96b",
+          "length": 4,
+          "category": "Decoder"
+        },
+        {
+          "file": "full-raw-over-budget.bin",
+          "sha256": "0569d4b29b0ce8371a58e6b433c16ca90f59a9538025a3d29ca1c52e27a4aeee",
+          "length": 2050,
+          "category": "Limit"
+        },
+        {
+          "file": "invalid-subtype-bits.bin",
+          "sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+          "length": 1,
+          "category": "Decoder"
+        },
+        {
+          "file": "missing-background.bin",
+          "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+          "length": 1,
+          "category": "Decoder"
+        },
+        {
+          "file": "raw-tile.bin",
+          "sha256": "056602d7b758b7dca59ef6896eb7a0b244793553b5c315c3984209bfb515fca6",
+          "length": 1030,
+          "category": "Ok"
+        },
+        {
+          "file": "raw-with-irrelevant-bits.bin",
+          "sha256": "ee77c41d3c475cf990c49996fa6b6c1da81e76a9361d77cec44eb2600830f032",
+          "length": 1030,
+          "category": "Ok"
+        },
+        {
+          "file": "subrect-out-of-tile.bin",
+          "sha256": "971daeb17bcfa4770d89e085223dc316f4c993d0ef2dc85d743d5fed8af507f4",
+          "length": 12,
+          "category": "Decoder"
+        },
+        {
+          "file": "truncated-raw.bin",
+          "sha256": "9184abd2bb318731d717e972057240eae26cca202a8d35dbe9d2176f526886a0",
+          "length": 4,
+          "category": "IoEof"
+        }
+      ]
+    }
+  }
+}

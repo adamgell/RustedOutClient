@@ -1,0 +1,71 @@
+[package]
+name = "rustedoutclient-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[lib]
+name = "rustedoutclient_fuzz"
+path = "src/lib.rs"
+
+[dependencies]
+flate2 = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+libfuzzer-sys = "0.4"
+rustedoutclient = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "time", "macros", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "rfb_handshake"
+path = "fuzz_targets/rfb_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rfb_session"
+path = "fuzz_targets/rfb_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rfb_zrle"
+path = "fuzz_targets/rfb_zrle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rfb_tight"
+path = "fuzz_targets/rfb_tight.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rfb_hextile"
+path = "fuzz_targets/rfb_hextile.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

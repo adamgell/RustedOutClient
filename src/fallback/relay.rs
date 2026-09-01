@@ -1,10 +1,10 @@
-use std::{io, net::Ipv4Addr, process::ExitStatus, time::Duration};
+use std::{future::Future, io, net::Ipv4Addr, process::ExitStatus, time::Duration};
 
 use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
-    time::{timeout, timeout_at, Instant},
+    time::{timeout_at, Instant},
 };
 
 use super::{password_file::VncPasswordFile, FallbackError, FallbackErrorKind, OwnedViewer};
@@ -40,6 +40,32 @@ enum AcceptOutcome {
     TimedOut,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum PreConnectRace<A, W> {
+    Accepted(A),
+    Viewer(W),
+    Cancelled(Instant),
+    TimedOut,
+}
+
+async fn race_pre_connect<A, W>(
+    accept: impl Future<Output = A>,
+    wait: impl Future<Output = W>,
+    cancelled: &mut oneshot::Receiver<Instant>,
+    accept_timeout: Duration,
+    close_timeout: Duration,
+) -> PreConnectRace<A, W> {
+    tokio::select! {
+        biased;
+        result = accept => PreConnectRace::Accepted(result),
+        status = wait => PreConnectRace::Viewer(status),
+        deadline = cancelled => PreConnectRace::Cancelled(
+            deadline.unwrap_or_else(|_| Instant::now() + close_timeout)
+        ),
+        () = tokio::time::sleep(accept_timeout) => PreConnectRace::TimedOut,
+    }
+}
+
 enum RelayOutcome {
     Relay(io::Result<(u64, u64)>),
     Viewer(io::Result<ExitStatus>),
@@ -60,20 +86,21 @@ where
     let close_timeout = policy.close_timeout;
     #[cfg(test)]
     let mut accepted_signal = policy.accepted;
-    let accept_outcome = {
-        let accept = timeout(policy.accept_timeout, listener.accept());
-        tokio::pin!(accept);
-        tokio::select! {
-            result = &mut accept => match result {
-                Ok(accepted) => AcceptOutcome::Accepted(accepted),
-                Err(_) => AcceptOutcome::TimedOut,
-            },
-            status = viewer.child.wait() => AcceptOutcome::Viewer(status),
-            deadline = &mut cancelled => AcceptOutcome::Cancelled(
-                deadline.unwrap_or_else(|_| Instant::now() + close_timeout)
-            ),
-        }
+    let accept_outcome = match race_pre_connect(
+        listener.accept(),
+        viewer.child.wait(),
+        &mut cancelled,
+        policy.accept_timeout,
+        close_timeout,
+    )
+    .await
+    {
+        PreConnectRace::Accepted(accepted) => AcceptOutcome::Accepted(accepted),
+        PreConnectRace::Viewer(status) => AcceptOutcome::Viewer(status),
+        PreConnectRace::Cancelled(deadline) => AcceptOutcome::Cancelled(deadline),
+        PreConnectRace::TimedOut => AcceptOutcome::TimedOut,
     };
+
     drop(listener);
 
     let (primary, deadline, viewer_reaped, client) = match accept_outcome {
@@ -241,5 +268,58 @@ where
     match timeout_at(deadline, proxy.shutdown()).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) | Err(_) => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod pre_connect_race_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn register_deadline<T>(race: &mut std::pin::Pin<&mut impl Future<Output = T>>) {
+        tokio::select! {
+            biased;
+            _ = race.as_mut() => panic!("deadline must register while every arm is pending"),
+            () = std::future::ready(()) => {}
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_accept_wins_over_ready_viewer_after_elapsed_timeout() {
+        let (accept_tx, accept_rx) = oneshot::channel::<u8>();
+        let (wait_tx, wait_rx) = oneshot::channel::<u8>();
+        let (_cancel_tx, mut cancel_rx) = oneshot::channel::<Instant>();
+        let race = race_pre_connect(
+            async { accept_rx.await.expect("accept sender dropped") },
+            async { wait_rx.await.expect("wait sender dropped") },
+            &mut cancel_rx,
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+        );
+        tokio::pin!(race);
+        register_deadline(&mut race).await;
+        tokio::time::advance(Duration::from_millis(5)).await;
+        accept_tx.send(1).expect("accept receiver live");
+        wait_tx.send(2).expect("wait receiver live");
+        assert_eq!(race.await, PreConnectRace::Accepted(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_viewer_wins_over_elapsed_timeout_when_accept_stays_pending() {
+        let (_accept_tx, accept_rx) = oneshot::channel::<u8>();
+        let (wait_tx, wait_rx) = oneshot::channel::<u8>();
+        let (_cancel_tx, mut cancel_rx) = oneshot::channel::<Instant>();
+        let race = race_pre_connect(
+            async { accept_rx.await.expect("accept sender dropped") },
+            async { wait_rx.await.expect("wait sender dropped") },
+            &mut cancel_rx,
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+        );
+        tokio::pin!(race);
+        register_deadline(&mut race).await;
+        tokio::time::advance(Duration::from_millis(5)).await;
+        wait_tx.send(2).expect("wait receiver live");
+        assert_eq!(race.await, PreConnectRace::Viewer(2));
     }
 }
