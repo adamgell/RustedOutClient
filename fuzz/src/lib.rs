@@ -1622,11 +1622,7 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
         match execute_target(&seed.target, &bytes) {
             Ok(execution) => {
                 if execution.category != seed.category {
-                    failures.push(fail_seed(&format!(
-                        "expected {} got {}",
-                        seed.category.as_str(),
-                        execution.category.as_str()
-                    )));
+                    failures.push(fail_seed("category-mismatch"));
                     continue;
                 }
                 if let Some(expected) = &seed.transition {

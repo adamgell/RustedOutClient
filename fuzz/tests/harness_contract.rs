@@ -284,6 +284,25 @@ fn verify_hash_mismatch_prints_token_without_digests() {
 }
 
 #[test]
+fn verify_category_mismatch_prints_one_fixed_token() {
+    let root = tempfile::tempdir().unwrap();
+    write_hextile_invalid_subtype(root.path());
+    let manifest = canonical_manifest(rustedoutclient_fuzz::SeedRecord {
+        target: "rfb_hextile".to_string(),
+        file: "rfb_hextile/invalid-subtype-bits.bin".to_string(),
+        sha256: "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068".to_string(),
+        length: 1,
+        category: rustedoutclient_fuzz::Category::Ok,
+        transition: None,
+        fixture: None,
+        reason: None,
+        behavior: "category mismatch".to_string(),
+    });
+    let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
+    assert_eq!(failures, vec!["FAIL seed category-mismatch".to_string()]);
+}
+
+#[test]
 fn verify_transition_mismatch_prints_token_without_debug_collection() {
     let root = tempfile::tempdir().unwrap();
     write_hextile_invalid_subtype(root.path());
