@@ -1300,6 +1300,7 @@ while :; do sleep 1; done
         assert_eq!(arguments[5], "-FullScreen=1");
         assert_eq!(arguments[6], "-ViewOnly=1");
         assert_eq!(arguments[7], format!("127.0.0.1::{}", address.port()));
+        wait_for_nonempty(&fixture.artifact(".ticket-env")).await;
         assert_eq!(
             fs::read_to_string(fixture.artifact(".ticket-env")).unwrap(),
             "absent\n"

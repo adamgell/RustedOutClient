@@ -1183,12 +1183,16 @@ async fn manager_close_deadline_starts_before_release_and_is_not_renewed_for_tra
     assert!(release_started < release_finished);
     assert!(release_started < close_deadline);
     assert!(
-        close_deadline.duration_since(release_started) <= Duration::from_secs(3),
-        "the absolute deadline must exist before manager-level release"
+        close_deadline.duration_since(release_started) <= Duration::from_secs(6),
+        "the absolute deadline must exist before manager-level release and remain bounded"
     );
     assert!(
-        close_deadline.saturating_duration_since(release_finished) < Duration::from_secs(3),
+        close_deadline.saturating_duration_since(release_finished) < Duration::from_secs(6),
         "transport close must receive the already-consumed deadline"
+    );
+    assert!(
+        close_deadline.duration_since(release_started) >= Duration::from_secs(5),
+        "the session deadline must cover the proxy graceful-wait, reap, and drain budgets"
     );
     manager.shutdown().await.unwrap();
 }

@@ -1,7 +1,12 @@
+use std::io;
+
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::model::VmId;
+use crate::{
+    model::VmId,
+    vnc::{RfbError, RfbErrorKind, RfbPhase},
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SessionId(Uuid);
@@ -140,12 +145,53 @@ pub enum PublicErrorKind {
     Queue,
 }
 
+/// Payload-free RFB failure evidence suitable for local diagnostics and logs.
+///
+/// It deliberately omits the protocol field label and every remote or OS error
+/// message. The retained enum values cannot contain tickets, stream bytes,
+/// clipboard contents, framebuffer pixels, or raw process output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RfbFailureDetail {
+    phase: RfbPhase,
+    kind: RfbErrorKind,
+    io_kind: Option<io::ErrorKind>,
+    cleanup_io_kind: Option<io::ErrorKind>,
+}
+
+impl RfbFailureDetail {
+    pub fn from_error(error: &RfbError) -> Self {
+        Self {
+            phase: error.phase(),
+            kind: error.kind(),
+            io_kind: error.io_kind(),
+            cleanup_io_kind: error.cleanup_io_kind(),
+        }
+    }
+
+    pub const fn phase(self) -> RfbPhase {
+        self.phase
+    }
+
+    pub const fn kind(self) -> RfbErrorKind {
+        self.kind
+    }
+
+    pub const fn io_kind(self) -> Option<io::ErrorKind> {
+        self.io_kind
+    }
+
+    pub const fn cleanup_io_kind(self) -> Option<io::ErrorKind> {
+        self.cleanup_io_kind
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PublicError {
     kind: PublicErrorKind,
     session_id: Option<SessionId>,
     vmid: Option<VmId>,
     cleanup_failed: bool,
+    rfb_failure: Option<RfbFailureDetail>,
 }
 
 impl PublicError {
@@ -155,6 +201,7 @@ impl PublicError {
             session_id: None,
             vmid: None,
             cleanup_failed: false,
+            rfb_failure: None,
         }
     }
 
@@ -172,6 +219,15 @@ impl PublicError {
 
     pub fn has_cleanup_failure(self) -> bool {
         self.cleanup_failed
+    }
+
+    pub const fn rfb_failure(self) -> Option<RfbFailureDetail> {
+        self.rfb_failure
+    }
+
+    pub fn with_rfb_failure(mut self, detail: RfbFailureDetail) -> Self {
+        self.rfb_failure = Some(detail);
+        self
     }
 
     pub fn with_public_context(mut self, session_id: SessionId, vmid: VmId) -> Self {

@@ -1,11 +1,19 @@
 # Native Acceptance and Reversible Rollout
 
-**Status: NOT READY and NOT EXECUTED.** Local synthetic verification is not
-live acceptance. Task 14B parser-smoke files exist at this branch (S1:
-implementation present). The parser gate is not marked passed. Hosted smoke,
-independent review, and live native/fallback acceptance remain separate.
-This file is the sanitized operator checklist for a later separately
-authorized run.
+**Status: PARTIAL LIVE DIAGNOSTIC EVIDENCE; NATIVE ACCEPTANCE NOT COMPLETE.**
+An authorized Windows 11 lab run on 2026-09-01 proved native guest changes from
+`1600x1000` to `1920x1080` to `1280x800`; the client observed matching
+framebuffers and QEMU Guest Agent independently confirmed `1280x800` and a
+later optimized-build change back to `1920x1080`. The installed GUI then
+followed its live viewport from `1920x1080` to `968x640` without timing out. The
+run depended on a temporary, ordinary-user `viogpuap.exe` watcher and occurred
+before a clean reviewed exact head, so it does not complete Step 7 or authorize
+rollout. Local synthetic verification is also not live acceptance. Task 14B
+passed its local, independent-review, and exact-head hosted parser-smoke gates at
+`78be68ee6a2487b4eaa597e56945ed86bdb123a7`. Every later acceptance head must
+rerun those gates. Full native input, warm-open, cleanup-cycle, TigerVNC
+fallback, rollback, and rollout acceptance remain separate. This file is the
+sanitized operator checklist for a separately authorized run.
 
 Keep local/CI readiness, independent review, native lab acceptance, TigerVNC
 fallback acceptance, rollback proof, and rollout as separate results. Never
@@ -124,6 +132,7 @@ retaining only the content-free elapsed values.
 ```bash
 ~/.local/bin/rustedoutclient list
 ~/.local/bin/rustedoutclient probe <approved-selector> --json
+~/.local/bin/rustedoutclient probe <approved-selector> --resize 1920x1080 --json
 ~/.local/bin/rustedoutclient open <approved-selector>
 ```
 
@@ -201,7 +210,7 @@ guest image, clipboard value, stderr body, or environment value.
 | Exact head | Local SHA / remote SHA / clean diff |  |
 | Local suite | Formatting / tests and count / lint / release SHA-256 |  |
 | Dependency policy | Supported-target graph / audit / deny |  |
-| Parser smoke | Duration / workflow run | Implementation present; not marked passed without exact-head evidence |
+| Parser smoke | Duration / workflow run | Baseline passed at `78be68e`; rerun required at the final acceptance head |
 | Independent review | Reviewer / reviewed SHA / findings closed |  |
 | Side-by-side install | Version / old helper metadata unchanged |  |
 | Configuration | Directory mode / file mode / no secret fields |  |

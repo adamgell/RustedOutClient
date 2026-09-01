@@ -15,6 +15,28 @@ fn cli_has_compatibility_commands_without_endpoint_or_secret_flags() {
 }
 
 #[test]
+fn probe_accepts_an_explicit_resize_target() {
+    let command = Cli::try_parse_from(["rustedoutclient", "probe", "107", "--resize", "1600x900"])
+        .unwrap()
+        .command
+        .unwrap();
+    assert!(matches!(
+        command,
+        Command::Probe {
+            resize: Some(size),
+            ..
+        } if size.width == 1_600 && size.height == 896
+    ));
+
+    for value in ["1920-by-1080", "639x480", "8193x480", "8192x8192"] {
+        assert!(
+            Cli::try_parse_from(["rustedoutclient", "probe", "107", "--resize", value]).is_err(),
+            "accepted unsafe resize target {value}"
+        );
+    }
+}
+
+#[test]
 fn cli_rejects_ticket_and_arbitrary_endpoint_flags() {
     for arguments in [
         &["rustedoutclient", "open", "107", "--ticket", "bad"][..],
@@ -70,6 +92,7 @@ fn cli_defaults_to_gui_native_open_and_thirty_second_probe() {
         Command::Probe {
             selector,
             timeout_seconds: 30,
+            resize: None,
             json: false,
         } if selector == "107"
     ));

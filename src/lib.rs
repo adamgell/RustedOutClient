@@ -7,6 +7,7 @@ pub mod config;
 pub mod connection;
 pub mod diagnostics;
 pub mod fallback;
+pub mod logging;
 pub mod model;
 pub mod runtime;
 pub mod session;

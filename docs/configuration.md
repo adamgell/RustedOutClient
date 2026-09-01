@@ -67,6 +67,23 @@ process before using the app. Runtime SSH uses strict host-key checking and
 fails closed for unknown or changed keys; RustedOutClient does not offer an
 accept-new or trust-bypass switch.
 
+### Private diagnostic log
+
+The application writes a bounded local event log beside the configuration:
+
+```text
+~/Library/Application Support/RustedOutClient/diagnostics.log
+```
+
+The file is mode `0600` inside the mode-`0700` application directory. It rolls
+to `diagnostics.log.1` before crossing one MiB. Events contain only typed
+connection phases, VMID, dimensions, resize outcomes, public error categories,
+and bounded RFB/OS error enums. They never contain SSH targets, VM names,
+tickets, passwords, fingerprints, raw stderr or I/O messages, process IDs,
+session UUIDs, clipboard text, guest pixels, or framebuffer payloads. The
+in-app **Session → Diagnostics** panel shows the same typed terminal failure
+detail and remains safe to copy.
+
 ### Legacy import boundary
 
 The source includes a narrow importer that can propose only `ssh_target`,
@@ -108,7 +125,8 @@ The command-line surface is deliberately narrow:
 
 ```text
 rustedoutclient list
-rustedoutclient probe <selector> [--timeout-seconds <1..300>] [--json]
+rustedoutclient probe <selector> [--timeout-seconds <1..300>]
+                       [--resize <WIDTHxHEIGHT>] [--json]
 rustedoutclient open <selector> [--fullscreen] [--view-only]
                      [--viewer native|tiger-vnc]
 ```
@@ -117,7 +135,9 @@ rustedoutclient open <selector> [--fullscreen] [--view-only]
   has a 30-second deadline.
 - `probe` opens the native preflight path without a long-running GUI. Its
   timeout defaults to 30 seconds and must be between 1 and 300 seconds. `--json`
-  emits the bounded structured result.
+  emits the bounded structured result. `--resize` applies the same checked
+  normalization as the GUI, waits for a matching guest size and non-empty
+  framebuffer event, and makes one explicit retry after a resize timeout.
 - `open` launches the native workspace and selects one VM. `--fullscreen` and
   `--view-only` are presence flags. `native` is the default viewer;
   `tiger-vnc` requests the explicit fallback.
@@ -131,6 +151,7 @@ following shapes are examples only and deliberately use no real host:
 ```bash
 cargo run --locked -- list
 cargo run --locked -- probe 100 --json
+cargo run --locked -- probe 100 --resize 1920x1080 --json
 cargo run --locked -- open "Sample VM" --view-only
 ```
 
@@ -161,6 +182,52 @@ continue working even when the guest cannot resize.
 
 An `Applied` result depends on the VM display device and guest video driver.
 RustedOutClient does not alter VM hardware or install guest drivers.
+
+QEMU's VNC server forwards `SetDesktopSize` only when the selected virtual
+display implements QEMU UI-info updates. A Proxmox `virtio` display maps to
+`virtio-vga` and provides that path; the legacy `default`/`std` VGA path
+rejects the request as an invalid screen layout. QEMU reports a forwarded
+request with ExtendedDesktopSize result `4`. RustedOutClient treats that reply
+as `Pending` even when it still carries the old framebuffer dimensions, and
+does not report `Applied` until a later server update matches the requested
+size. The guest must also have a working VirtIO GPU driver and honor the
+display event; capable VM hardware alone is not acceptance.
+
+### Windows VirtIO guest prerequisite
+
+For a Windows guest on the `virtio` display, the VirtIO GPU display driver is
+necessary but may not be sufficient. The guest also needs a working
+per-session VirtIO GPU resolution watcher. A QEMU result of `Forwarded`
+followed by `Timed out` means the host and RFB path accepted the request but
+the guest did not publish the requested framebuffer size.
+
+Current virtio-win media includes the signed `vgpusrv.exe` resolution service
+and `viogpuap.exe` per-session watcher, but the guest-tools installer has had
+open service-installation and startup gaps. Verify the files come from the
+driver media that matches the installed VirtIO GPU driver, retain their valid
+Microsoft hardware-publisher signatures, and inspect the `VioGpu Resolution
+Service` plus the watcher in the signed-in user's session. See the upstream
+[resolution-service installation issue](https://github.com/virtio-win/virtio-win-guest-tools-installer/issues/86)
+and [service integration issue](https://github.com/virtio-win/virtio-win-guest-tools-installer/issues/32).
+
+The current service source creates a per-session named pipe using default
+service-process security. A standard interactive user can therefore be denied
+access even while the service is running. Do not work around that by making
+the user an administrator or granting broad pipe access. The temporary lab
+workaround is to run the matching signed `viogpuap.exe` in no-argument watcher
+mode as the exact interactive standard user, with its standard input held open
+for the session. This bypasses the privileged service pipe without elevating
+the watcher. It is an explicit, reversible acceptance workaround, not a
+RustedOutClient installer feature or production persistence design. The
+upstream service and pipe behavior are visible in the official
+[`vgpusrv` service source](https://github.com/virtio-win/kvm-guest-drivers-windows/blob/master/viogpu/viogpusc/utils.cpp),
+[`viogpupipe` source](https://github.com/virtio-win/kvm-guest-drivers-windows/blob/master/viogpu/shared/pipe.cpp),
+and [`viogpuap` source](https://github.com/virtio-win/kvm-guest-drivers-windows/blob/master/viogpu/viogpuap/viogpuap.cpp).
+
+This handling follows the
+[RFB ExtendedDesktopSize result contract](https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#extendeddesktopsize-pseudo-encoding)
+and the
+[QEMU 10.1.2 SetDesktopSize implementation](https://gitlab.com/qemu-project/qemu/-/blob/v10.1.2/ui/vnc.c).
 
 ## Clipboard
 

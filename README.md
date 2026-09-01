@@ -8,8 +8,10 @@ clipboard transfer, view-only mode, scaling, and guest Dynamic Resolution.
 
 **Status:** unreleased and not accepted for production. The synthetic suite and
 local security gates establish implementation readiness only. Native lab,
-TigerVNC fallback, rollback, hosted CI, and rollout remain separate gates; the
-Task 14B parser-smoke tranche is still parked.
+TigerVNC fallback, rollback, final-head hosted CI, and rollout remain separate
+gates. The Task 14B parser-smoke tranche passed its local, independent-review,
+and exact-head hosted gates at `78be68ee6a2487b4eaa597e56945ed86bdb123a7`;
+later acceptance heads must rerun those gates.
 
 The initial supported target is macOS 26 on ARM64. Direct TCP VNC, arbitrary
 remote commands, file transfer, trust bypasses, password entry, and general

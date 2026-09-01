@@ -24,11 +24,12 @@ use crate::{
     fallback::{
         FallbackError, FallbackErrorKind, FallbackPreferences, FallbackSession, TigerVncFallback,
     },
+    logging::{emit_session_event, SessionLogEvent},
     model::{PveProfile, VmId},
     runtime::RuntimeDir,
     ssh::{
-        InventoryError, InventorySnapshot, ProxyOpenError, SshCommandFactory, SshFailureKind,
-        SshMaster, SshMasterError, TrustedSshProxy,
+        proxy_cleanup_budget, InventoryError, InventorySnapshot, ProxyOpenError, SshCommandFactory,
+        SshFailureKind, SshMaster, SshMasterError, TrustedSshProxy,
     },
     vnc::{
         normalize_resize_request, ClipboardText, InputController, InputError, RfbError,
@@ -48,6 +49,7 @@ const MAX_ACTIVE_FALLBACK_SESSIONS: usize = 2;
 const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 const RESIZE_OUTCOME_DEADLINE: Duration = Duration::from_secs(2);
+const SESSION_CLOSE_OVERHEAD_BUDGET: Duration = Duration::from_secs(1);
 
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -563,6 +565,13 @@ where
             return;
         }
 
+        emit_session_event(SessionLogEvent::OpenRequested {
+            vmid,
+            dynamic_resolution: options.dynamic_resolution,
+            view_only: options.view_only,
+            clipboard_enabled: options.clipboard_enabled,
+        });
+
         let session_id = SessionId::new();
         let snapshot = SessionSnapshot::opening_with_options(
             session_id,
@@ -846,6 +855,10 @@ where
     }
 
     async fn handle_desktop_size(&mut self, index: usize, size: DesktopSize) {
+        emit_session_event(SessionLogEvent::GuestSize {
+            vmid: self.sessions[index].snapshot.vmid,
+            size,
+        });
         self.sessions[index].snapshot.guest_size = Some(size);
         let matching = self.sessions[index]
             .resize
@@ -880,6 +893,10 @@ where
     }
 
     async fn handle_resize_outcome(&mut self, index: usize, outcome: ResizeProtocolOutcome) {
+        emit_session_event(SessionLogEvent::ResizeOutcome {
+            vmid: self.sessions[index].snapshot.vmid,
+            outcome,
+        });
         if outcome == ResizeProtocolOutcome::ServerUnsupported {
             self.sessions[index].resize.cancel_unsent_work();
             self.sessions[index].resize.automatic_allowed = false;
@@ -895,7 +912,11 @@ where
         }
         let mut release_replacement = false;
         match outcome {
-            ResizeProtocolOutcome::Forwarded(size) if size == in_flight.requested => {
+            ResizeProtocolOutcome::Forwarded(_) => {
+                // QEMU's result-4 reply carries its current layout, not necessarily
+                // the requested layout. With one ordered request in flight, the
+                // reply is correlated to that request rather than to these fields.
+                let size = in_flight.requested;
                 if in_flight.actual_observed {
                     self.sessions[index].resize.in_flight = None;
                     self.sessions[index].resize.outcome = ResizeOutcomeState::Applied(size);
@@ -911,7 +932,7 @@ where
                     });
                 }
             }
-            ResizeProtocolOutcome::Forwarded(_) | ResizeProtocolOutcome::Unsupported => {
+            ResizeProtocolOutcome::Unsupported => {
                 self.sessions[index].resize.in_flight = None;
                 self.sessions[index].resize.stop_automatic_retries();
                 self.sessions[index].resize.outcome = ResizeOutcomeState::Unsupported;
@@ -964,6 +985,10 @@ where
                     record.resize.outcome = if request.actual_observed {
                         ResizeOutcomeState::Applied(request.requested)
                     } else {
+                        emit_session_event(SessionLogEvent::ResizeTimedOut {
+                            vmid: record.snapshot.vmid,
+                            size: request.requested,
+                        });
                         ResizeOutcomeState::TimedOut
                     };
                     if request.protocol == ResizeProtocolState::Forwarded {
@@ -1007,6 +1032,18 @@ where
         {
             return;
         }
+        if self.sessions[index].snapshot.guest_size == Some(requested) {
+            let resize = &mut self.sessions[index].resize;
+            if resize.explicit_retry_armed {
+                resize.automatic_allowed = true;
+            }
+            resize.explicit_retry_armed = false;
+            resize.pending_replacement = None;
+            resize.outcome = ResizeOutcomeState::Applied(requested);
+            resize.server_layout_unsupported = false;
+            self.emit_session_snapshot(index).await;
+            return;
+        }
         let result = self.sessions[index]
             .session
             .as_mut()
@@ -1014,6 +1051,10 @@ where
             .and_then(|session| session.request_resize(requested));
         match result {
             Ok(()) => {
+                emit_session_event(SessionLogEvent::ResizeRequested {
+                    vmid: self.sessions[index].snapshot.vmid,
+                    size: requested,
+                });
                 if self.sessions[index].resize.explicit_retry_armed {
                     self.sessions[index].resize.automatic_allowed = true;
                 }
@@ -1074,6 +1115,10 @@ where
             (Some(primary), Ok(())) => Err(primary),
             (None, result) => result,
         };
+        emit_session_event(SessionLogEvent::Terminal {
+            vmid: self.sessions[index].snapshot.vmid,
+            failure: result.err(),
+        });
         if let Err(error) = result {
             if !self.sessions[index].error_emitted {
                 self.sessions[index].error_emitted = true;
@@ -1101,6 +1146,12 @@ where
             previous,
             transitioned_at.saturating_duration_since(self.sessions[index].phase_started),
         );
+        emit_session_event(SessionLogEvent::PhaseChanged {
+            vmid: self.sessions[index].snapshot.vmid,
+            from: previous,
+            to: phase,
+            duration: transitioned_at.saturating_duration_since(self.sessions[index].phase_started),
+        });
         self.sessions[index].phase_started = transitioned_at;
         let session_id = self.sessions[index].snapshot.session_id;
         self.emit_critical(AppEvent::PhaseTiming { session_id, timing })
@@ -1205,10 +1256,7 @@ impl SessionBackend for ProductionBackend {
                 .map_err(public_master_error)?;
             if let Err(error) = master.verify().await {
                 let primary = public_master_error(error);
-                if master.close().await.is_err() {
-                    return Err(PublicError::new(PublicErrorKind::Cleanup));
-                }
-                return Err(primary);
+                return Err(compose_master_start_failure(primary, master.close().await));
             }
             self.master = Some(master);
             Ok(())
@@ -1570,8 +1618,12 @@ fn graceful_close_timeout() -> Duration {
     }
     #[cfg(not(test))]
     {
-        Duration::from_secs(3)
+        production_graceful_close_timeout()
     }
+}
+
+fn production_graceful_close_timeout() -> Duration {
+    proxy_cleanup_budget().saturating_add(SESSION_CLOSE_OVERHEAD_BUDGET)
 }
 
 fn compose_release_and_transport(
@@ -1621,6 +1673,17 @@ fn public_master_error(error: SshMasterError) -> PublicError {
         SshMasterError::Io(_) | SshMasterError::ControlTimedOut => {
             PublicError::new(PublicErrorKind::SshUnavailable)
         }
+    }
+}
+
+fn compose_master_start_failure(
+    primary: PublicError,
+    cleanup_result: Result<(), SshMasterError>,
+) -> PublicError {
+    if cleanup_result.is_err() {
+        primary.with_cleanup_failure()
+    } else {
+        primary
     }
 }
 
@@ -1677,6 +1740,7 @@ fn public_ssh_failure(kind: SshFailureKind) -> PublicError {
 }
 
 fn public_rfb_error(error: RfbError) -> PublicError {
+    let detail = crate::session::RfbFailureDetail::from_error(&error);
     let has_cleanup_failure = error.has_cleanup_failure();
     let kind = match (error.kind(), error.phase()) {
         (_, RfbPhase::Cleanup) => PublicErrorKind::Cleanup,
@@ -1688,7 +1752,7 @@ fn public_rfb_error(error: RfbError) -> PublicError {
         (RfbErrorKind::Queue, RfbPhase::EventQueue) => PublicErrorKind::Queue,
         _ => PublicErrorKind::RfbProtocol,
     };
-    let error = PublicError::new(kind);
+    let error = PublicError::new(kind).with_rfb_failure(detail);
     if has_cleanup_failure {
         error.with_cleanup_failure()
     } else {
@@ -1760,6 +1824,10 @@ mod tests {
 
     fn close_deadline() -> Instant {
         Instant::now() + super::graceful_close_timeout()
+    }
+
+    fn production_close_deadline() -> Instant {
+        Instant::now() + super::production_graceful_close_timeout()
     }
 
     fn production_session(
@@ -2353,6 +2421,19 @@ mod tests {
 
         let public = super::public_rfb_error(error);
         assert_eq!(public.kind(), PublicErrorKind::RfbSecurity);
+        assert!(public.has_cleanup_failure());
+    }
+
+    #[test]
+    fn master_startup_cleanup_failure_preserves_the_primary_category() {
+        let primary = PublicError::new(PublicErrorKind::SshAuthentication);
+
+        let public = super::compose_master_start_failure(
+            primary,
+            Err(crate::ssh::SshMasterError::CleanupFailed),
+        );
+
+        assert_eq!(public.kind(), PublicErrorKind::SshAuthentication);
         assert!(public.has_cleanup_failure());
     }
 
@@ -3135,6 +3216,82 @@ mod tests {
         assert_production_key_release_wire_order(ProductionCloseCase::Reconnect).await;
 
         assert_eq!(ProxyTicket::test_generation_count(), before + 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_close_budget_covers_proxy_forced_cleanup_after_graceful_ack() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("proxy_rfb_input_capture"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("proxy_input_capture_hang_after_keyup"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&runtime.control_socket().with_extension("state")).await;
+        let mut verified = master.verify().await.unwrap();
+        let proxy = TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap())
+            .await
+            .unwrap();
+        let mut session = ProductionSession::spawn(proxy, OpenOptions::default()).unwrap();
+        let proxy_pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&proxy_pid_path).await;
+        let proxy_pid = helper_pid(&proxy_pid_path);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    session.try_recv().unwrap(),
+                    Some(SessionTransportEvent::Framebuffer(ref rects)) if !rects.is_empty()
+                ) {
+                    session.mark_ready();
+                    return;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("real stalled-shutdown session did not become ready");
+        session
+            .send_input(InputAction::Key {
+                down: true,
+                keysym: 0xffe3,
+            })
+            .unwrap();
+        wait_for_fixture_marker(
+            &runtime
+                .control_socket()
+                .with_extension("proxy.key-down-read"),
+        )
+        .await;
+
+        let result = timeout(
+            Duration::from_secs(7),
+            session.close(production_close_deadline()),
+        )
+        .await
+        .expect("production close exceeded its outer bound");
+
+        wait_for_fixture_marker(&runtime.control_socket().with_extension("proxy.key-up-read"))
+            .await;
+        assert_exact_pid_is_gone(proxy_pid).await;
+        master.close().await.unwrap();
+        assert!(
+            result.is_ok(),
+            "normal proxy kill/reap/drain was misreported as a cleanup failure: {result:?}"
+        );
     }
 
     #[cfg(unix)]

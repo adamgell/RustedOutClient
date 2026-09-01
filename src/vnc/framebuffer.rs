@@ -169,6 +169,9 @@ impl Framebuffer {
     where
         F: FnOnce(usize) -> Result<Vec<u8>, RfbError>,
     {
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
         let layout = validate_framebuffer_layout_for_phase(
             width,
             height,

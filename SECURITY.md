@@ -81,6 +81,10 @@ The following are product requirements, not optional deployment advice:
   never persisted or logged. The fallback's required obfuscated eight-byte
   password file is a mode-0600 process-lifetime exception and must be removed on
   success, failure, cancellation, and drop.
+- The private diagnostic event log is limited to one active one-MiB file and one
+  backup. It contains only typed lifecycle, VMID, dimension, resize, public
+  failure, RFB phase/kind, and OS error-kind values; it never accepts raw
+  process, transport, remote-text, clipboard, or framebuffer payloads.
 - Server-controlled lengths, dimensions, rectangle counts, encoded payloads,
   text, clipboard text, framebuffer allocation, inventory output, stderr
   capture, and viewer snapshot size are bounded before allocation or use.

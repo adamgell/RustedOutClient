@@ -1481,6 +1481,9 @@ fn render_status_rail(ctx: &egui::Context, state: &AppState) {
                                 MUTED_TELEMETRY
                             },
                         );
+                        if let Some(error) = tab.last_error {
+                            status(ui, &format!("ERROR · {error:?}"), PROXMOX_ORANGE);
+                        }
                         status(ui, &format!("{:?}", tab.scale_mode), MUTED_TELEMETRY);
                         if let Some(size) = tab.snapshot.guest_size {
                             status(
@@ -1558,7 +1561,7 @@ fn resize_label(status: ResizeStatus) -> String {
         ResizeStatus::Applied(size) => format!("resize applied {}x{}", size.width, size.height),
         ResizeStatus::Rejected => "resize rejected".to_owned(),
         ResizeStatus::Unsupported => "resize unsupported".to_owned(),
-        ResizeStatus::TimedOut => "resize timed out".to_owned(),
+        ResizeStatus::TimedOut => "resize timed out · check guest VirtIO resize helper".to_owned(),
     }
 }
 
@@ -1591,6 +1594,13 @@ fn render_diagnostics(ctx: &egui::Context, state: &mut AppState, actions: &mut V
         .open(&mut open)
         .resizable(true)
         .show(ctx, |ui| {
+            ui.label(
+                RichText::new(
+                    "Private rolling log: ~/Library/Application Support/RustedOutClient/diagnostics.log",
+                )
+                .monospace()
+                .color(MUTED_TELEMETRY),
+            );
             let mut diagnostics = state.diagnostics_summary();
             ui.add(
                 egui::TextEdit::multiline(&mut diagnostics)
@@ -1611,7 +1621,8 @@ fn render_diagnostics(ctx: &egui::Context, state: &mut AppState, actions: &mut V
 mod input_tests {
     use super::{
         collect_keyboard_events, collect_pointer_events, framebuffer_paint_clip, paint_framebuffer,
-        prepare_actions, release_owner_for_control_actions, visible_console_rect, InputOwnership,
+        prepare_actions, release_owner_for_control_actions, resize_label, visible_console_rect,
+        InputOwnership,
     };
     use crate::{
         app::{AppState, DispatchOutcome, UiAction},
@@ -1663,6 +1674,14 @@ mod input_tests {
             _ => unreachable!(),
         }
         modifiers
+    }
+
+    #[test]
+    fn resize_timeout_label_points_to_the_guest_prerequisite() {
+        assert_eq!(
+            resize_label(ResizeStatus::TimedOut),
+            "resize timed out · check guest VirtIO resize helper"
+        );
     }
 
     fn key_actions(actions: &[UiAction]) -> Vec<(SessionId, bool, u32)> {

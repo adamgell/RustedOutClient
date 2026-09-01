@@ -583,7 +583,7 @@ async fn dynamic_resolution_acceptance_exceeds_1280_and_preserves_pending_applie
         .lock()
         .unwrap()
         .push_back(SessionTransportEvent::ResizeOutcome(
-            ResizeProtocolOutcome::Forwarded(requested),
+            ResizeProtocolOutcome::Forwarded(DesktopSize::new(1_280, 800)),
         ));
     wait_resize_status(&mut manager, session_id, |status| {
         status == ResizeStatus::Pending(requested)

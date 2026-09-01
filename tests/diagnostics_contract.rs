@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::BTreeSet,
+    io::{self, Write},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use rustedoutclient::{
     app::{
@@ -11,13 +16,16 @@ use rustedoutclient::{
         ChildExitStatus, DiagnosticFailure, DiagnosticRecord, PhaseTiming, ProbeReport,
         ProbeResult, UPSTREAM_BASE_SHA,
     },
+    logging::{emit_session_event, SessionLogEvent},
     model::{NodeName, PveProfile, SshTarget, VmId},
     session::{
-        AppCommand, AppEvent, PublicError, PublicErrorKind, ResizeStatus, SessionId, SessionPhase,
-        SessionSnapshot,
+        AppCommand, AppEvent, PublicError, PublicErrorKind, ResizeStatus, RfbFailureDetail,
+        SessionId, SessionPhase, SessionSnapshot,
     },
     ssh::{InventorySnapshot, VmInventoryItem, VmStatus},
+    vnc::{RfbError, RfbPhase},
 };
+use tracing_subscriber::fmt::MakeWriter;
 
 fn profile() -> PveProfile {
     PveProfile {
@@ -135,6 +143,126 @@ fn diagnostic_json_is_an_exact_typed_allowlist_and_never_accepts_raw_failure_mat
         assert!(!exported.contains(forbidden), "leaked {forbidden:?}");
     }
     assert!(!format!("{record:?}").contains(failure.target));
+}
+
+#[test]
+fn diagnostic_record_preserves_typed_rfb_terminal_detail_without_raw_io_text() {
+    let transport = RfbError::io(
+        RfbPhase::Session,
+        io::Error::new(io::ErrorKind::ConnectionReset, "SECRET RAW I/O SENTINEL"),
+    );
+    let public = PublicError::new(PublicErrorKind::RfbProtocol)
+        .with_rfb_failure(RfbFailureDetail::from_error(&transport));
+    let record = DiagnosticRecord::new(
+        profile().name,
+        profile().node,
+        Some(vmid(126)),
+        Vec::new(),
+        None,
+        Some(DiagnosticFailure::from_public(public)),
+    );
+
+    let exported = record.to_json().unwrap();
+    let json: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    assert_eq!(json["error_category"], "rfb_protocol");
+    assert_eq!(json["rfb_phase"], "session");
+    assert_eq!(json["rfb_error_kind"], "io");
+    assert_eq!(json["rfb_io_kind"], "connection_reset");
+    assert!(!exported.contains("SECRET RAW I/O SENTINEL"));
+
+    let rendered = record.to_text();
+    assert!(rendered.contains("RFB phase: session"));
+    assert!(rendered.contains("RFB error: io"));
+    assert!(rendered.contains("RFB I/O: connection_reset"));
+    assert!(!rendered.contains("SECRET RAW I/O SENTINEL"));
+}
+
+#[derive(Clone, Default)]
+struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedLogBuffer {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedLogBuffer {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[test]
+fn session_event_logging_is_structured_and_cannot_accept_raw_failure_material() {
+    let output = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(output.clone())
+        .finish();
+    let raw_failure = RfbError::io(
+        RfbPhase::Session,
+        io::Error::new(io::ErrorKind::BrokenPipe, "SECRET LOG SENTINEL"),
+    );
+    let public = PublicError::new(PublicErrorKind::RfbProtocol)
+        .with_rfb_failure(RfbFailureDetail::from_error(&raw_failure));
+
+    tracing::subscriber::with_default(subscriber, || {
+        for event in [
+            SessionLogEvent::OpenRequested {
+                vmid: vmid(126),
+                dynamic_resolution: true,
+                view_only: false,
+                clipboard_enabled: false,
+            },
+            SessionLogEvent::PhaseChanged {
+                vmid: vmid(126),
+                from: SessionPhase::NegotiatingRfb,
+                to: SessionPhase::Ready,
+                duration: Duration::from_millis(2409),
+            },
+            SessionLogEvent::ResizeRequested {
+                vmid: vmid(126),
+                size: DesktopSize::new(1600, 896),
+            },
+            SessionLogEvent::Terminal {
+                vmid: vmid(126),
+                failure: Some(public),
+            },
+        ] {
+            emit_session_event(event);
+        }
+    });
+
+    let rendered = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    for expected in [
+        "event=\"session_open_requested\"",
+        "vmid=126",
+        "dynamic_resolution=true",
+        "event=\"session_phase_changed\"",
+        "duration_ms=2409",
+        "event=\"resize_requested\"",
+        "width=1600",
+        "height=896",
+        "event=\"session_terminal_error\"",
+        "rfb_phase=Session",
+        "rfb_kind=Io",
+        "io_kind=BrokenPipe",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected:?}: {rendered}"
+        );
+    }
+    assert!(!rendered.contains("SECRET LOG SENTINEL"));
 }
 
 #[test]
@@ -381,7 +509,12 @@ fn gui_text_and_copy_use_the_same_typed_record_with_ordered_phase_and_failure_tr
         .unwrap();
     state
         .apply(AppEvent::Error(
-            PublicError::new(PublicErrorKind::Decoder).with_public_context(session_id, vmid(107)),
+            PublicError::new(PublicErrorKind::Decoder)
+                .with_rfb_failure(RfbFailureDetail::from_error(&RfbError::io(
+                    RfbPhase::Encoding,
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "RAW DECODER SENTINEL"),
+                )))
+                .with_public_context(session_id, vmid(107)),
         ))
         .unwrap();
 
@@ -392,9 +525,13 @@ fn gui_text_and_copy_use_the_same_typed_record_with_ordered_phase_and_failure_tr
     assert!(rendered.contains("starting_proxy: 5 ms"));
     assert!(rendered.contains("Child exit status: 9"));
     assert!(rendered.contains("Error category: decoder"));
+    assert!(rendered.contains("RFB phase: encoding"));
+    assert!(rendered.contains("RFB error: io"));
+    assert!(rendered.contains("RFB I/O: unexpected_eof"));
     assert!(rendered.contains("Cleanup failure: false"));
     assert!(!rendered.contains("VM-NAME-SENTINEL"));
     assert!(!rendered.contains("64x64"));
+    assert!(!rendered.contains("RAW DECODER SENTINEL"));
 
     let mut clipboard = RecordingClipboard::default();
     assert_eq!(

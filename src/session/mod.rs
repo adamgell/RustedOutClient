@@ -12,6 +12,6 @@ pub use manager::{
     APP_QUEUE_CAPACITY,
 };
 pub use model::{
-    PublicError, PublicErrorKind, ResizeStatus, SessionId, SessionPhase, SessionSnapshot,
-    SessionTransitionError,
+    PublicError, PublicErrorKind, ResizeStatus, RfbFailureDetail, SessionId, SessionPhase,
+    SessionSnapshot, SessionTransitionError,
 };

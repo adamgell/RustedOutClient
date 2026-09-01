@@ -10,12 +10,8 @@ use rustedoutclient::{
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    let persistent_log = rustedoutclient::logging::initialize_tracing();
+    rustedoutclient::logging::emit_application_started(persistent_log);
 
     let command = Cli::parse().command;
     match command {

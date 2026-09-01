@@ -1,14 +1,11 @@
-use std::{io, process::Stdio, time::Duration};
-
-#[cfg(test)]
-use std::path::PathBuf;
+use std::{io, path::PathBuf, process::Stdio, time::Duration};
 
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Child,
     task::JoinHandle,
-    time::timeout,
+    time::{sleep, timeout, Instant},
 };
 
 use crate::model::PveProfile;
@@ -21,11 +18,15 @@ use super::{
 const MAX_CAPTURED_STDERR_BYTES: usize = 65_536;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+const MASTER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const MASTER_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct ControlPolicy {
+    master_startup_timeout: Duration,
+    master_startup_poll_interval: Duration,
     operation_timeout: Duration,
     reap_timeout: Duration,
     pipe_drain_timeout: Duration,
@@ -36,6 +37,8 @@ struct ControlPolicy {
 impl ControlPolicy {
     fn production() -> Self {
         Self {
+            master_startup_timeout: MASTER_STARTUP_TIMEOUT,
+            master_startup_poll_interval: MASTER_STARTUP_POLL_INTERVAL,
             operation_timeout: CONTROL_OPERATION_TIMEOUT,
             reap_timeout: REAP_TIMEOUT,
             pipe_drain_timeout: PIPE_DRAIN_TIMEOUT,
@@ -60,6 +63,8 @@ struct TestControlPolicy(ControlPolicy);
 impl TestControlPolicy {
     fn generous() -> Self {
         Self(ControlPolicy {
+            master_startup_timeout: Duration::from_secs(60),
+            master_startup_poll_interval: Duration::from_millis(10),
             operation_timeout: Duration::from_secs(60),
             reap_timeout: Duration::from_secs(30),
             pipe_drain_timeout: Duration::from_secs(30),
@@ -69,6 +74,8 @@ impl TestControlPolicy {
 
     fn short_after_ready(path: PathBuf) -> Self {
         Self(ControlPolicy {
+            master_startup_timeout: Duration::from_secs(60),
+            master_startup_poll_interval: Duration::from_millis(10),
             operation_timeout: Duration::from_secs(2),
             reap_timeout: Duration::from_secs(30),
             pipe_drain_timeout: Duration::from_secs(30),
@@ -76,6 +83,17 @@ impl TestControlPolicy {
                 path,
                 timeout: Duration::from_secs(30),
             }),
+        })
+    }
+
+    fn short_startup() -> Self {
+        Self(ControlPolicy {
+            master_startup_timeout: Duration::from_millis(100),
+            master_startup_poll_interval: Duration::from_millis(10),
+            operation_timeout: Duration::from_secs(30),
+            reap_timeout: Duration::from_secs(30),
+            pipe_drain_timeout: Duration::from_secs(30),
+            readiness: None,
         })
     }
 }
@@ -104,6 +122,7 @@ pub struct SshMaster {
     profile: PveProfile,
     child: Option<Child>,
     stderr_task: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    initially_verified: bool,
 }
 
 /// Proof that this exact owned master completed a successful control check.
@@ -190,6 +209,7 @@ impl SshMaster {
             profile,
             child: Some(child),
             stderr_task,
+            initially_verified: false,
         })
     }
 
@@ -199,7 +219,7 @@ impl SshMaster {
     }
 
     pub async fn check(&mut self) -> Result<(), SshMasterError> {
-        run_control(self.factory.check(&self.profile).unwrap()).await
+        self.check_inner(&ControlPolicy::production()).await
     }
 
     #[cfg(test)]
@@ -207,12 +227,73 @@ impl SshMaster {
         &mut self,
         policy: TestControlPolicy,
     ) -> Result<(), SshMasterError> {
+        self.check_inner(&policy.0).await
+    }
+
+    async fn check_inner(&mut self, policy: &ControlPolicy) -> Result<(), SshMasterError> {
+        if !self.initially_verified {
+            self.wait_for_initial_readiness(policy).await?;
+        }
         run_control_inner(
             self.factory.check(&self.profile).unwrap(),
             CleanupFaults::default(),
-            &policy.0,
+            policy,
         )
-        .await
+        .await?;
+        self.initially_verified = true;
+        Ok(())
+    }
+
+    async fn wait_for_initial_readiness(
+        &mut self,
+        policy: &ControlPolicy,
+    ) -> Result<(), SshMasterError> {
+        let readiness_path = master_readiness_path(&self.factory);
+        let deadline = Instant::now() + policy.master_startup_timeout;
+
+        loop {
+            match tokio::fs::symlink_metadata(&readiness_path).await {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+
+            let status = self
+                .child
+                .as_mut()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?
+                .try_wait()?;
+            if status.is_some() {
+                self.child.take();
+                let stderr = finish_capture(
+                    self.stderr_task.take(),
+                    CleanupFaults::default(),
+                    policy.pipe_drain_timeout,
+                )
+                .await?;
+                return Err(classify_stderr(&stderr).into());
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                let (terminated, cleanup_result) = terminate_owned_child(
+                    self.child.as_mut().expect("owned child checked above"),
+                    CleanupFaults::default(),
+                    policy,
+                )
+                .await;
+                let cleanup_result = self
+                    .apply_termination_outcome(
+                        terminated,
+                        cleanup_result,
+                        CleanupFaults::default(),
+                        policy,
+                    )
+                    .await;
+                return cleanup_result.and(Err(SshMasterError::ControlTimedOut));
+            }
+            sleep(policy.master_startup_poll_interval.min(deadline - now)).await;
+        }
     }
 
     pub async fn close(&mut self) -> Result<(), SshMasterError> {
@@ -261,13 +342,20 @@ impl SshMaster {
         }
 
         self.child.take();
-        if finish_capture(
-            self.stderr_task.take(),
-            cleanup_faults,
-            policy.pipe_drain_timeout,
-        )
-        .await
-        .is_err()
+        let socket_cleanup_failed =
+            match tokio::fs::remove_file(self.factory.control_socket()).await {
+                Ok(()) => false,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            };
+        if socket_cleanup_failed
+            || finish_capture(
+                self.stderr_task.take(),
+                cleanup_faults,
+                policy.pipe_drain_timeout,
+            )
+            .await
+            .is_err()
         {
             cleanup_result = Err(SshMasterError::CleanupFailed);
         }
@@ -340,8 +428,15 @@ impl Drop for SshMaster {
     }
 }
 
-async fn run_control(spec: CommandSpec) -> Result<(), SshMasterError> {
-    run_control_inner(spec, CleanupFaults::default(), &ControlPolicy::production()).await
+fn master_readiness_path(factory: &SshCommandFactory) -> PathBuf {
+    #[cfg(test)]
+    {
+        factory.control_socket().with_extension("state")
+    }
+    #[cfg(not(test))]
+    {
+        factory.control_socket().to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -529,7 +624,7 @@ mod tests {
     use crate::{
         model::{NodeName, PveProfile, SshTarget},
         runtime::RuntimeDir,
-        ssh::SshCommandFactory,
+        ssh::{SshCommandFactory, SshFailureKind},
     };
 
     fn fixture_profile() -> PveProfile {
@@ -615,6 +710,114 @@ mod tests {
         assert!(argv.contains("check"));
         assert!(argv.contains("exit"));
         assert!(!runtime.path().join("environment").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_check_waits_for_the_owned_master_to_become_ready() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("delay_master_readiness"),
+            b"synthetic startup race\n",
+        )
+        .unwrap();
+
+        let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&runtime.control_socket().with_extension("master.spawned")).await;
+        master
+            .check_with_test_policy(TestControlPolicy::generous())
+            .await
+            .unwrap();
+
+        let argv = fs::read_to_string(runtime.control_socket().with_extension("argv")).unwrap();
+        assert_eq!(argv.lines().filter(|line| *line == "check").count(), 1);
+        master
+            .close_with_test_policy(TestControlPolicy::generous())
+            .await
+            .unwrap();
+        assert!(!master.is_running());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_readiness_timeout_remains_primary_and_reaps_the_owned_master() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("never_master_ready"),
+            b"synthetic startup timeout\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("leave_control_socket_on_kill"),
+            b"synthetic stale socket\n",
+        )
+        .unwrap();
+
+        let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&runtime.control_socket().with_extension("pid")).await;
+        wait_for(runtime.control_socket()).await;
+        assert!(matches!(
+            master
+                .check_with_test_policy(TestControlPolicy::short_startup())
+                .await,
+            Err(SshMasterError::ControlTimedOut)
+        ));
+        master
+            .close_with_test_policy(TestControlPolicy::generous())
+            .await
+            .unwrap();
+
+        let argv = fs::read_to_string(runtime.control_socket().with_extension("argv")).unwrap();
+        assert!(!argv.lines().any(|line| line == "exit"));
+        assert!(!master.is_running());
+        assert!(!runtime.control_socket().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn master_failure_before_readiness_preserves_redacted_ssh_category() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("master_auth_failure"),
+            b"synthetic authentication failure\n",
+        )
+        .unwrap();
+
+        let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        let result = master
+            .check_with_test_policy(TestControlPolicy::generous())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SshMasterError::Ssh(failure))
+                if failure.kind() == SshFailureKind::Authentication
+        ));
+        assert!(!master.is_running());
+        master
+            .close_with_test_policy(TestControlPolicy::generous())
+            .await
+            .unwrap();
     }
 
     #[cfg(unix)]

@@ -5,13 +5,15 @@ use tokio::time::{timeout_at, Instant};
 
 use crate::{
     config::{default_config_path, load_config_from_path},
+    connection::DesktopSize,
     diagnostics::{ProbeReport, ProbeResult},
     model::VmId,
     session::{
-        AppCommand, AppEvent, OpenOptions, PublicError, PublicErrorKind, SessionId, SessionManager,
-        SessionPhase,
+        AppCommand, AppEvent, OpenOptions, PublicError, PublicErrorKind, ResizeStatus, SessionId,
+        SessionManager, SessionPhase,
     },
     ssh::{InventorySnapshot, VmStatus},
+    vnc::{normalize_resize_request, ProtocolLimits},
 };
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -57,6 +59,8 @@ pub enum Command {
             value_parser = parse_probe_timeout_seconds
         )]
         timeout_seconds: u64,
+        #[arg(long, value_parser = parse_resize_target)]
+        resize: Option<DesktopSize>,
         #[arg(long)]
         json: bool,
     },
@@ -124,6 +128,20 @@ fn parse_probe_timeout_seconds(value: &str) -> Result<u64, String> {
         ));
     }
     Ok(seconds)
+}
+
+fn parse_resize_target(value: &str) -> Result<DesktopSize, String> {
+    let (width, height) = value
+        .split_once('x')
+        .ok_or_else(|| "resize must use WIDTHxHEIGHT".to_owned())?;
+    let width = width
+        .parse::<u32>()
+        .map_err(|_| "resize width must be an integer".to_owned())?;
+    let height = height
+        .parse::<u32>()
+        .map_err(|_| "resize height must be an integer".to_owned())?;
+    normalize_resize_request(width, height, ProtocolLimits::default())
+        .map_err(|_| "resize is outside the supported framebuffer limits".to_owned())
 }
 
 fn parse_view_only_presence(value: &str) -> Result<bool, String> {
@@ -237,8 +255,9 @@ where
         Command::Probe {
             selector,
             timeout_seconds,
+            resize,
             json,
-        } => execute_probe(runtime, output, &selector, timeout_seconds, json).await,
+        } => execute_probe(runtime, output, &selector, timeout_seconds, resize, json).await,
         Command::Open { .. } => {
             let shutdown = runtime.shutdown().await;
             CliExit::failed(
@@ -306,6 +325,7 @@ async fn execute_probe<R, W>(
     output: &mut W,
     selector: &str,
     timeout_seconds: u64,
+    resize: Option<DesktopSize>,
     json: bool,
 ) -> CliExit
 where
@@ -322,7 +342,7 @@ where
         Ok(snapshot) => match select_running(&snapshot, selector) {
             Ok(selected) => (
                 Some(selected),
-                observe_probe(&mut runtime, selected, timeout_duration).await,
+                observe_probe(&mut runtime, selected, timeout_duration, resize).await,
             ),
             Err(result) => (
                 None,
@@ -405,6 +425,7 @@ async fn observe_probe<R>(
     runtime: &mut R,
     selected: VmId,
     timeout_duration: Duration,
+    resize_target: Option<DesktopSize>,
 ) -> ProbeObservation
 where
     R: CliRuntime,
@@ -431,6 +452,8 @@ where
 
     let mut session_id = None;
     let mut size = None;
+    let mut resize_sent = false;
+    let mut resize_retried = false;
     loop {
         let event = match timeout_at(deadline, runtime.recv()).await {
             Ok(Some(event)) => event,
@@ -454,6 +477,42 @@ where
                     if let Some(guest_size) = snapshot.guest_size {
                         size = Some(guest_size);
                     }
+                    if snapshot.phase == SessionPhase::Ready && !resize_sent {
+                        if let Some(target) = resize_target {
+                            if let Err(error) = runtime
+                                .send(AppCommand::ViewportChanged {
+                                    session_id: snapshot.session_id,
+                                    backing_width: u32::from(target.width),
+                                    backing_height: u32::from(target.height),
+                                })
+                                .await
+                            {
+                                return ProbeObservation {
+                                    session_id,
+                                    report: Err(error.kind().into()),
+                                };
+                            }
+                            resize_sent = true;
+                        }
+                    }
+                    if resize_target.is_some()
+                        && resize_sent
+                        && !resize_retried
+                        && snapshot.resize_status == ResizeStatus::TimedOut
+                    {
+                        if let Err(error) = runtime
+                            .send(AppCommand::RetryDynamicResolution {
+                                session_id: snapshot.session_id,
+                            })
+                            .await
+                        {
+                            return ProbeObservation {
+                                session_id,
+                                report: Err(error.kind().into()),
+                            };
+                        }
+                        resize_retried = true;
+                    }
                     if snapshot.phase == SessionPhase::Disconnected {
                         return ProbeObservation {
                             session_id,
@@ -466,6 +525,9 @@ where
                 session_id: frame_session,
                 rects,
             } if Some(frame_session) == session_id && !rects.is_empty() => {
+                if resize_target.is_some() && size != resize_target {
+                    continue;
+                }
                 let Some(frame_size) = size else {
                     return ProbeObservation {
                         session_id,

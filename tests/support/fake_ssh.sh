@@ -43,6 +43,25 @@ pid_file="${socket}.pid"
 
 if [ "$master" = true ]; then
     printf '%s\n' "$$" > "$pid_file"
+    if [ -f "${socket}.master_auth_failure" ]; then
+        printf '%s\n' 'root@pve.example.invalid: Permission denied (publickey).' >&2
+        rm -f "$pid_file"
+        exit 255
+    fi
+    if [ -f "${socket}.never_master_ready" ]; then
+        if [ -f "${socket}.leave_control_socket_on_kill" ]; then
+            sleep 0.025
+            : > "$socket"
+        fi
+        trap 'rm -f "$pid_file"; exit 0' TERM INT HUP
+        while :; do
+            sleep 0.05
+        done
+    fi
+    if [ -f "${socket}.delay_master_readiness" ]; then
+        : > "${socket}.master.spawned"
+        sleep 0.25
+    fi
     : > "$state"
     trap 'rm -f "$state" "$pid_file"; exit 0' TERM INT HUP
     while [ -f "$state" ]; do

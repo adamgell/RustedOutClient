@@ -8,8 +8,8 @@ use crate::{
     diagnostics::{ChildExitStatus, DiagnosticFailure, DiagnosticRecord, PhaseTiming},
     model::{ScaleMode, VmId},
     session::{
-        AppEvent, DesktopSize, OpenOptions, PublicErrorKind, SessionId, SessionPhase,
-        SessionSnapshot,
+        AppEvent, DesktopSize, OpenOptions, PublicErrorKind, RfbFailureDetail, SessionId,
+        SessionPhase, SessionSnapshot,
     },
     ssh::{InventorySnapshot, VmInventoryItem, VmStatus},
     vnc::{normalize_resize_request, ClipboardText, InputError, ProtocolLimits, VncOptions},
@@ -351,6 +351,7 @@ pub struct SessionTabState {
     pub clipboard_status: ClipboardStatus,
     pub last_error: Option<PublicErrorKind>,
     pub last_input_error: Option<InputError>,
+    last_rfb_failure: Option<RfbFailureDetail>,
     phase_history: Vec<SessionPhase>,
     phase_timings: Vec<PhaseTiming>,
     child_exit_status: Option<ChildExitStatus>,
@@ -386,7 +387,7 @@ pub struct InventoryRow {
 
 impl InventoryRow {
     pub fn can_open(&self) -> bool {
-        self.status == VmStatus::Running
+        !self.stale && self.status == VmStatus::Running
     }
 }
 
@@ -429,6 +430,7 @@ pub struct AppState {
     queue_status: QueueStatus,
     last_error: Option<PublicErrorKind>,
     last_cleanup_failed: bool,
+    last_rfb_failure: Option<RfbFailureDetail>,
     fullscreen: bool,
     diagnostics_open: bool,
 }
@@ -462,6 +464,7 @@ impl AppState {
             queue_status: QueueStatus::Ready,
             last_error: None,
             last_cleanup_failed: false,
+            last_rfb_failure: None,
             fullscreen: false,
             diagnostics_open: false,
         }
@@ -493,6 +496,7 @@ impl AppState {
             queue_status: QueueStatus::Disconnected,
             last_error: None,
             last_cleanup_failed: false,
+            last_rfb_failure: None,
             fullscreen: false,
             diagnostics_open: false,
         }
@@ -693,11 +697,11 @@ impl AppState {
 
     pub(crate) fn selected_inventory_item(&self) -> Option<&VmInventoryItem> {
         let selected = self.selected_inventory?;
-        self.inventory
-            .as_ref()?
-            .vms
-            .iter()
-            .find(|item| item.vmid == selected)
+        let inventory = self.inventory.as_ref()?;
+        if inventory.stale {
+            return None;
+        }
+        inventory.vms.iter().find(|item| item.vmid == selected)
     }
 
     pub(crate) fn selected_resize_is_actionable(&self) -> bool {
@@ -824,6 +828,7 @@ impl AppState {
             AppEvent::Error(error) => {
                 self.last_error = Some(error.kind());
                 self.last_cleanup_failed = error.has_cleanup_failure();
+                self.last_rfb_failure = error.rfb_failure();
                 if error.kind() != PublicErrorKind::Queue {
                     if let Some(session_id) = error.session_id() {
                         if let Some(tab) = self
@@ -833,6 +838,7 @@ impl AppState {
                         {
                             tab.last_error = Some(error.kind());
                             tab.last_cleanup_failed = error.has_cleanup_failure();
+                            tab.last_rfb_failure = error.rfb_failure();
                         }
                     }
                 }
@@ -867,6 +873,7 @@ impl AppState {
             if tab.snapshot.phase == SessionPhase::Ready {
                 tab.last_error = None;
                 tab.last_cleanup_failed = false;
+                tab.last_rfb_failure = None;
             }
         } else {
             self.tabs
@@ -900,6 +907,7 @@ impl AppState {
                 clipboard_status,
                 last_error: None,
                 last_input_error: None,
+                last_rfb_failure: None,
                 phase_timings: Vec::new(),
                 child_exit_status: None,
                 last_cleanup_failed: false,
@@ -966,7 +974,11 @@ impl AppState {
                         } else {
                             crate::session::PublicError::new(kind)
                         };
-                        DiagnosticFailure::from_public(error)
+                        DiagnosticFailure::from_public(if let Some(detail) = tab.last_rfb_failure {
+                            error.with_rfb_failure(detail)
+                        } else {
+                            error
+                        })
                     }),
                 )
             });
@@ -977,7 +989,11 @@ impl AppState {
                 } else {
                     crate::session::PublicError::new(kind)
                 };
-                DiagnosticFailure::from_public(error)
+                DiagnosticFailure::from_public(if let Some(detail) = self.last_rfb_failure {
+                    error.with_rfb_failure(detail)
+                } else {
+                    error
+                })
             })
         });
         DiagnosticRecord::new(
