@@ -33,9 +33,10 @@ assets remain unchanged.
    viewer. Reject any password, ticket, fingerprint, or other secret field.
    The current application does not automatically invoke the narrow source
    importer at startup.
-4. Complete local/CI readiness. The parser-smoke tranche and workflow are
-   parked in Task 14B, so the complete acceptance gate remains blocked until
-   that tranche is implemented and reviewed.
+4. Complete local/CI readiness. The Task 14B parser-smoke tranche passed at
+   `78be68ee6a2487b4eaa597e56945ed86bdb123a7`; rerun its local and hosted gates
+   at the final acceptance head rather than treating the baseline result as
+   approval of later changes.
 5. At an approved exact head, perform every native gate in
    [Native acceptance](native-acceptance.md), keeping evidence sanitized.
 6. Perform the explicit TigerVNC fallback gate independently. A successful

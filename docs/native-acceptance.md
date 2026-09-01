@@ -1,11 +1,11 @@
 # Native Acceptance and Reversible Rollout
 
-**Status: NOT READY and NOT EXECUTED.** Local synthetic verification is not
-live acceptance. Task 14B parser-smoke files exist at this branch (S1:
-implementation present). The parser gate is not marked passed. Hosted smoke,
-independent review, and live native/fallback acceptance remain separate.
-This file is the sanitized operator checklist for a later separately
-authorized run.
+**Status: NATIVE CONSOLE ACCEPTANCE NOT EXECUTED.** Local synthetic verification
+is not live acceptance. Task 14B passed its local, independent-review, and
+exact-head hosted parser-smoke gates at
+`78be68ee6a2487b4eaa597e56945ed86bdb123a7`. Every later acceptance head must
+rerun those gates. Live native and fallback acceptance remain separate. This
+file is the sanitized operator checklist for a separately authorized run.
 
 Keep local/CI readiness, independent review, native lab acceptance, TigerVNC
 fallback acceptance, rollback proof, and rollout as separate results. Never
@@ -201,7 +201,7 @@ guest image, clipboard value, stderr body, or environment value.
 | Exact head | Local SHA / remote SHA / clean diff |  |
 | Local suite | Formatting / tests and count / lint / release SHA-256 |  |
 | Dependency policy | Supported-target graph / audit / deny |  |
-| Parser smoke | Duration / workflow run | Implementation present; not marked passed without exact-head evidence |
+| Parser smoke | Duration / workflow run | Baseline passed at `78be68e`; rerun required at the final acceptance head |
 | Independent review | Reviewer / reviewed SHA / findings closed |  |
 | Side-by-side install | Version / old helper metadata unchanged |  |
 | Configuration | Directory mode / file mode / no secret fields |  |
