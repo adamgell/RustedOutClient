@@ -118,6 +118,58 @@ fn session_valid_raw_rect_is_io_eof_with_framebuffer_event() {
         .any(|transition| transition == "framebuffer_event"));
 }
 
+#[cfg(fuzzing)]
+#[test]
+fn session_resize_fixtures_require_desktop_size_and_framebuffer_resized() {
+    for name in ["desktop-size-resize.bin", "extended-desktop-size-valid.bin"] {
+        let candidate = all_candidates()
+            .into_iter()
+            .find(|candidate| candidate.target == "rfb_session" && candidate.name == name)
+            .unwrap();
+        assert_eq!(
+            candidate.transition,
+            Some("desktop_size_event,framebuffer_resized"),
+            "{name}"
+        );
+        let execution = rustedoutclient_fuzz::execute_rfb_session(&candidate.bytes);
+        assert_eq!(execution.category.as_str(), "IoEof", "{name}");
+        assert!(
+            execution
+                .transitions
+                .iter()
+                .any(|transition| transition == "desktop_size_event"),
+            "{name} {:?}",
+            execution.transitions
+        );
+        assert!(
+            execution
+                .transitions
+                .iter()
+                .any(|transition| transition == "framebuffer_resized"),
+            "{name} {:?}",
+            execution.transitions
+        );
+    }
+}
+
+#[cfg(fuzzing)]
+#[test]
+fn session_dispatcher_consumes_a_cursor_rectangle_as_typed_eof() {
+    let mut bytes = vec![0, 0, 0, 1];
+    bytes.extend_from_slice(&0_u16.to_be_bytes());
+    bytes.extend_from_slice(&0_u16.to_be_bytes());
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.extend_from_slice(&(-239_i32).to_be_bytes());
+    bytes.extend_from_slice(&[1, 2, 3, 4, 0x80]);
+    let execution = rustedoutclient_fuzz::execute_rfb_session(&bytes);
+    assert_eq!(execution.category.as_str(), "IoEof");
+    assert!(execution
+        .transitions
+        .iter()
+        .all(|transition| transition != "framebuffer_event"));
+}
+
 #[test]
 fn typed_builders_are_deterministic_across_two_private_directories() {
     let first = tempfile::tempdir().unwrap();

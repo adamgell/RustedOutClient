@@ -858,7 +858,7 @@ fn session_candidates() -> Vec<Candidate> {
             "rfb_session",
             "desktop-size-resize.bin",
             Category::IoEof,
-            Some("framebuffer_resized"),
+            Some("desktop_size_event,framebuffer_resized"),
             "DesktopSize 32x32",
             desktop,
         ),
@@ -866,7 +866,7 @@ fn session_candidates() -> Vec<Candidate> {
             "rfb_session",
             "extended-desktop-size-valid.bin",
             Category::IoEof,
-            Some("framebuffer_resized"),
+            Some("desktop_size_event,framebuffer_resized"),
             "ExtendedDesktopSize one 32x32 screen",
             extended,
         ),
@@ -1629,7 +1629,17 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
                     continue;
                 }
                 if let Some(expected) = &seed.transition {
-                    if !execution.transitions.iter().any(|item| item == expected) {
+                    let missing: Vec<&str> = expected
+                        .split(',')
+                        .filter(|item| {
+                            !item.is_empty()
+                                && !execution
+                                    .transitions
+                                    .iter()
+                                    .any(|observed| observed == item)
+                        })
+                        .collect();
+                    if !missing.is_empty() {
                         failures.push(format!(
                             "FAIL {}/{} expected transition {} got {:?}",
                             seed.target,

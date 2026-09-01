@@ -135,7 +135,7 @@
       "length": 16,
       "category": "IoEof",
       "behavior": "DesktopSize 32x32",
-      "transition": "framebuffer_resized"
+      "transition": "desktop_size_event,framebuffer_resized"
     },
     {
       "target": "rfb_session",
@@ -152,7 +152,7 @@
       "length": 36,
       "category": "IoEof",
       "behavior": "ExtendedDesktopSize one 32x32 screen",
-      "transition": "framebuffer_resized"
+      "transition": "desktop_size_event,framebuffer_resized"
     },
     {
       "target": "rfb_session",
