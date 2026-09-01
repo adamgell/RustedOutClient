@@ -234,6 +234,20 @@ fn write_hextile_invalid_subtype(root: &std::path::Path) {
     std::fs::write(root.join("rfb_hextile/invalid-subtype-bits.bin"), [0x20]).unwrap();
 }
 
+fn hextile_seed(file: &str) -> rustedoutclient_fuzz::SeedRecord {
+    rustedoutclient_fuzz::SeedRecord {
+        target: "rfb_hextile".to_string(),
+        file: file.to_string(),
+        sha256: "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068".to_string(),
+        length: 1,
+        category: rustedoutclient_fuzz::Category::Decoder,
+        transition: None,
+        fixture: None,
+        reason: None,
+        behavior: "unknown subtype bit 0x20".to_string(),
+    }
+}
+
 #[test]
 fn verify_length_mismatch_prints_token_without_lengths() {
     let root = tempfile::tempdir().unwrap();
@@ -369,6 +383,68 @@ fn verify_rejects_a_canonical_target_that_disagrees_with_the_file_directory() {
 }
 
 #[test]
+fn verify_invalid_basename_is_replaced_and_cannot_forge_a_second_line() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = canonical_manifest(hextile_seed("rfb_hextile/evil\nINJECT.bin"));
+    let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
+    assert_eq!(
+        failures,
+        vec!["FAIL rfb_hextile/invalid-name filename".to_string()]
+    );
+    assert!(!failures[0].contains("evil"));
+    assert!(!failures[0].contains("INJECT"));
+    assert!(!failures[0].contains('\n'));
+}
+
+#[test]
+fn verify_rejects_duplicate_file_strings_before_a_second_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    write_hextile_invalid_subtype(root.path());
+    let seed = hextile_seed("rfb_hextile/invalid-subtype-bits.bin");
+    let manifest = rustedoutclient_fuzz::CorpusManifest {
+        version: 1,
+        targets: CANONICAL_TARGETS
+            .iter()
+            .map(|target| (*target).to_string())
+            .collect(),
+        seeds: vec![seed.clone(), seed],
+    };
+    let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
+    assert_eq!(
+        failures,
+        vec!["FAIL rfb_hextile/invalid-subtype-bits.bin duplicate-file".to_string()]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_rejects_distinct_names_that_resolve_to_one_file() {
+    let root = tempfile::tempdir().unwrap();
+    write_hextile_invalid_subtype(root.path());
+    std::os::unix::fs::symlink(
+        "invalid-subtype-bits.bin",
+        root.path().join("rfb_hextile/alias.bin"),
+    )
+    .unwrap();
+    let manifest = rustedoutclient_fuzz::CorpusManifest {
+        version: 1,
+        targets: CANONICAL_TARGETS
+            .iter()
+            .map(|target| (*target).to_string())
+            .collect(),
+        seeds: vec![
+            hextile_seed("rfb_hextile/invalid-subtype-bits.bin"),
+            hextile_seed("rfb_hextile/alias.bin"),
+        ],
+    };
+    let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
+    assert_eq!(
+        failures,
+        vec!["FAIL rfb_hextile/alias.bin duplicate-file".to_string()]
+    );
+}
+
+#[test]
 fn load_manifest_missing_file_omits_path() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("missing.json");
@@ -475,6 +551,41 @@ fn verify_seeds_unknown_target_stderr_does_not_echo_manifest_input() {
     );
     assert!(!stderr.contains("secret-ticket"));
     assert!(!stderr.contains("/tmp"));
+    assert_eq!(stderr.lines().count(), 1);
+}
+
+#[test]
+fn verify_seeds_invalid_basename_stderr_is_one_fixed_line() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest_path = root.path().join("candidate-manifest.json");
+    std::fs::write(
+        &manifest_path,
+        r#"{
+  "version": 1,
+  "targets": ["rfb_handshake", "rfb_session", "rfb_zrle", "rfb_tight", "rfb_hextile"],
+  "seeds": [{
+    "target": "rfb_hextile",
+    "file": "rfb_hextile/evil\nINJECT.bin",
+    "sha256": "00",
+    "length": 1,
+    "category": "Decoder",
+    "behavior": "invalid basename"
+  }]
+}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_verify_seeds"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--root")
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr, "FAIL rfb_hextile/invalid-name filename\n");
+    assert!(!stderr.contains("evil"));
+    assert!(!stderr.contains("INJECT"));
     assert_eq!(stderr.lines().count(), 1);
 }
 

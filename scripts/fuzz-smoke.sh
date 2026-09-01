@@ -120,42 +120,97 @@ for dir in fuzz/corpus/*; do
 done
 
 python3 - "$ROOT" <<'PY'
-import json, subprocess, sys
+import json, re, subprocess, sys
 from pathlib import Path
 
-root = Path(sys.argv[1]).resolve()
-targets = ["rfb_handshake", "rfb_session", "rfb_zrle", "rfb_tight", "rfb_hextile"]
-manifest = json.loads((root / "fuzz" / "corpus-manifest.json").read_text())
-if manifest.get("targets") != targets:
-    raise SystemExit("manifest targets drifted from the canonical five")
-corpus_root = (root / "fuzz" / "corpus").resolve()
-listed = set()
-for seed in manifest.get("seeds", []):
-    relative = Path(seed["file"])
-    if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("corpus",):
-        raise SystemExit(f"unsafe seed path {relative}")
-    if len(relative.parts) != 3:
-        raise SystemExit(f"seed path must be corpus/<target>/<file>: {relative}")
-    _, target, name = relative.parts
-    if target not in targets or name in {".", ".."} or "/" in name:
-        raise SystemExit(f"invalid seed path {relative}")
-    path = (root / "fuzz" / relative).resolve()
+class ManifestError(Exception):
+    pass
+
+
+def reject(token):
+    raise ManifestError(token)
+
+
+def validate_manifest():
+    root = Path(sys.argv[1]).resolve()
+    targets = ["rfb_handshake", "rfb_session", "rfb_zrle", "rfb_tight", "rfb_hextile"]
     try:
-        path.relative_to(corpus_root)
-    except ValueError as exc:
-        raise SystemExit(f"seed path escaped corpus root: {relative}") from exc
-    listed.add(path)
-    if not path.is_file():
-        raise SystemExit(f"missing {relative}")
-    data = path.read_bytes()
-    if len(data) != int(seed["length"]):
-        raise SystemExit(f"length mismatch {relative}")
-    digest = subprocess.check_output(["shasum", "-a", "256", str(path)], text=True).split()[0]
-    if digest != seed["sha256"]:
-        raise SystemExit(f"hash mismatch {relative}")
-for path in corpus_root.rglob("*"):
-    if path.is_file() and path.resolve() not in listed:
-        raise SystemExit(f"orphan {path.relative_to(root)}")
+        manifest = json.loads((root / "fuzz" / "corpus-manifest.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        reject("parse")
+    if not isinstance(manifest, dict) or manifest.get("targets") != targets:
+        reject("targets")
+    seeds = manifest.get("seeds")
+    if not isinstance(seeds, list):
+        reject("schema")
+
+    corpus_root = (root / "fuzz" / "corpus").resolve()
+    listed_files = set()
+    listed_paths = set()
+    for seed in seeds:
+        if not isinstance(seed, dict):
+            reject("schema")
+        file_value = seed.get("file")
+        seed_target = seed.get("target")
+        if not isinstance(file_value, str) or not isinstance(seed_target, str):
+            reject("schema")
+        if file_value in listed_files:
+            reject("duplicate-file")
+        listed_files.add(file_value)
+
+        relative = Path(file_value)
+        if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("corpus",):
+            reject("unsafe-path")
+        if len(relative.parts) != 3:
+            reject("seed-path")
+        _, target, name = relative.parts
+        if target not in targets or seed_target not in targets:
+            reject("unknown-target")
+        if seed_target != target:
+            reject("target-mismatch")
+        if re.fullmatch(r"[A-Za-z0-9._-]+", name) is None or name in {".", ".."}:
+            reject("invalid-name")
+
+        path = (root / "fuzz" / relative).resolve()
+        try:
+            path.relative_to(corpus_root)
+        except ValueError:
+            reject("escaped-path")
+        if path in listed_paths:
+            reject("duplicate-file")
+        listed_paths.add(path)
+        if not path.is_file():
+            reject("missing-file")
+        try:
+            data = path.read_bytes()
+            expected_length = int(seed["length"])
+            expected_digest = seed["sha256"]
+        except (OSError, KeyError, TypeError, ValueError):
+            reject("schema")
+        if len(data) != expected_length:
+            reject("length-mismatch")
+        try:
+            digest = subprocess.check_output(
+                ["shasum", "-a", "256", str(path)], text=True
+            ).split()[0]
+        except (OSError, subprocess.SubprocessError, IndexError):
+            reject("hash-command")
+        if not isinstance(expected_digest, str) or digest != expected_digest:
+            reject("hash-mismatch")
+
+    for path in corpus_root.rglob("*"):
+        if path.is_file() and path.resolve() not in listed_paths:
+            reject("orphan-file")
+
+
+try:
+    validate_manifest()
+except ManifestError as error:
+    print(f"fuzz-smoke: manifest-{error}", file=sys.stderr)
+    raise SystemExit(1)
+except Exception:
+    print("fuzz-smoke: manifest-validation", file=sys.stderr)
+    raise SystemExit(1)
 PY
 
 

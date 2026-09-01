@@ -59,6 +59,12 @@ jobs:
           cargo +nightly-2026-08-29-aarch64-apple-darwin fmt --manifest-path fuzz/Cargo.toml -- --check
           RUSTFLAGS="--cfg fuzzing" cargo +nightly-2026-08-29-aarch64-apple-darwin clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
+      - name: Test fuzz harness contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="--cfg fuzzing" CARGO_NET_OFFLINE=true cargo +nightly-2026-08-29-aarch64-apple-darwin test --manifest-path fuzz/Cargo.toml --test harness_contract --locked --offline
+
       - name: Parser smoke gate
         timeout-minutes: 20
         shell: bash

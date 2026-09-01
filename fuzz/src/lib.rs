@@ -1,6 +1,7 @@
 //! Shared RFB fuzz harness. Session execution is gated on `cfg(fuzzing)`.
 
 use std::{
+    collections::HashSet,
     fs,
     future::Future,
     io::{Cursor, ErrorKind, Write},
@@ -1549,7 +1550,7 @@ fn resolve_seed_path(root: &Path, file: &str) -> Result<(PathBuf, String), Strin
     if !CANONICAL_TARGETS.contains(&target) {
         return Err("unknown".to_string());
     }
-    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+    if !is_allowed_seed_name(name) {
         return Err("filename".to_string());
     }
     let joined = root.join(relative);
@@ -1567,6 +1568,8 @@ fn resolve_seed_path(root: &Path, file: &str) -> Result<(PathBuf, String), Strin
 
 pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec<String>> {
     let mut failures = Vec::new();
+    let mut seen_files = HashSet::new();
+    let mut seen_paths = HashSet::new();
     if manifest.targets
         != CANONICAL_TARGETS
             .iter()
@@ -1576,6 +1579,10 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
         failures.push("manifest targets drifted from the canonical five".to_string());
     }
     for seed in &manifest.seeds {
+        if !seen_files.insert(seed.file.as_str()) {
+            failures.push(fail_seed(seed, "duplicate-file"));
+            continue;
+        }
         if !CANONICAL_TARGETS.contains(&seed.target.as_str()) {
             failures.push(fail_seed(seed, "unknown-target"));
             continue;
@@ -1587,6 +1594,10 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
                 continue;
             }
         };
+        if !seen_paths.insert(path.clone()) {
+            failures.push(fail_seed(seed, "duplicate-file"));
+            continue;
+        }
         if seed.target != file_target {
             failures.push(fail_seed(seed, "target-mismatch"));
             continue;
@@ -1654,10 +1665,24 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
 }
 
 fn seed_name(file: &str) -> &str {
-    Path::new(file)
+    let name = Path::new(file)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(file)
+        .unwrap_or("");
+    if is_allowed_seed_name(name) {
+        name
+    } else {
+        "invalid-name"
+    }
+}
+
+fn is_allowed_seed_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn fail_seed(seed: &SeedRecord, reason: &str) -> String {

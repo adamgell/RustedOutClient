@@ -52,6 +52,28 @@ fn parser_smoke_fetches_locked_fuzz_deps_before_offline_smoke() {
 }
 
 #[test]
+fn parser_smoke_runs_fuzz_harness_contracts_offline_before_smoke() {
+    let workflow = workflow();
+    let harness = workflow
+        .find("test --manifest-path fuzz/Cargo.toml --test harness_contract --locked --offline")
+        .expect("exact fuzz harness contract command");
+    let smoke = workflow
+        .find("./scripts/fuzz-smoke.sh 30")
+        .expect("exact smoke command");
+    assert!(workflow.contains("- name: Test fuzz harness contracts"));
+    assert!(workflow.contains("RUSTFLAGS=\"--cfg fuzzing\" CARGO_NET_OFFLINE=true"));
+    assert!(harness < smoke);
+    assert_eq!(
+        workflow
+            .matches(
+                "test --manifest-path fuzz/Cargo.toml --test harness_contract --locked --offline"
+            )
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn parser_smoke_lint_carries_cfg_fuzzing_and_exact_pins() {
     let workflow = workflow();
     assert!(workflow.contains("RUSTFLAGS=\"--cfg fuzzing\""));

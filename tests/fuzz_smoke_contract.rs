@@ -244,6 +244,169 @@ fn target_list_drift_exits_before_any_run() {
 }
 
 #[test]
+fn malicious_manifest_basename_is_one_fixed_error_and_skips_fuzzing() {
+    let harness = Harness::new();
+    harness.install_ok_tools();
+    fs::write(
+        harness.root.path().join("fuzz/corpus-manifest.json"),
+        r#"{
+  "version": 1,
+  "targets": ["rfb_handshake", "rfb_session", "rfb_zrle", "rfb_tight", "rfb_hextile"],
+  "seeds": [{
+    "target": "rfb_hextile",
+    "file": "corpus/rfb_hextile/evil\nINJECT.bin",
+    "sha256": "00",
+    "length": 1,
+    "category": "Decoder",
+    "behavior": "invalid basename"
+  }]
+}"#,
+    )
+    .unwrap();
+    let output = harness.command(&["30"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "fuzz-smoke: manifest-invalid-name\n");
+    assert!(!stderr(&output).contains("evil"));
+    assert!(!stderr(&output).contains("INJECT"));
+    assert!(harness.fuzz_invocations().is_empty());
+    assert!(harness.tmp_empty());
+}
+
+#[test]
+fn duplicate_manifest_file_is_rejected_before_verification_or_fuzzing() {
+    let harness = Harness::new();
+    harness.install_ok_tools();
+    fs::write(
+        harness
+            .root
+            .path()
+            .join("fuzz/corpus/rfb_hextile/duplicate.bin"),
+        [0x20],
+    )
+    .unwrap();
+    fs::write(
+        harness.root.path().join("fuzz/corpus-manifest.json"),
+        r#"{
+  "version": 1,
+  "targets": ["rfb_handshake", "rfb_session", "rfb_zrle", "rfb_tight", "rfb_hextile"],
+  "seeds": [
+    {
+      "target": "rfb_hextile",
+      "file": "corpus/rfb_hextile/duplicate.bin",
+      "sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+      "length": 1,
+      "category": "Decoder",
+      "behavior": "first"
+    },
+    {
+      "target": "rfb_hextile",
+      "file": "corpus/rfb_hextile/duplicate.bin",
+      "sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+      "length": 1,
+      "category": "Decoder",
+      "behavior": "second"
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+    let output = harness.command(&["30"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "fuzz-smoke: manifest-duplicate-file\n");
+    assert!(harness.fuzz_invocations().is_empty());
+    assert!(harness.tmp_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn distinct_manifest_names_resolving_to_one_file_are_rejected() {
+    let harness = Harness::new();
+    harness.install_ok_tools();
+    fs::write(
+        harness
+            .root
+            .path()
+            .join("fuzz/corpus/rfb_hextile/original.bin"),
+        [0x20],
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "original.bin",
+        harness
+            .root
+            .path()
+            .join("fuzz/corpus/rfb_hextile/alias.bin"),
+    )
+    .unwrap();
+    fs::write(
+        harness.root.path().join("fuzz/corpus-manifest.json"),
+        r#"{
+  "version": 1,
+  "targets": ["rfb_handshake", "rfb_session", "rfb_zrle", "rfb_tight", "rfb_hextile"],
+  "seeds": [
+    {
+      "target": "rfb_hextile",
+      "file": "corpus/rfb_hextile/original.bin",
+      "sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+      "length": 1,
+      "category": "Decoder",
+      "behavior": "original"
+    },
+    {
+      "target": "rfb_hextile",
+      "file": "corpus/rfb_hextile/alias.bin",
+      "sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+      "length": 1,
+      "category": "Decoder",
+      "behavior": "alias"
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+    let output = harness.command(&["30"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "fuzz-smoke: manifest-duplicate-file\n");
+    assert!(harness.fuzz_invocations().is_empty());
+    assert!(harness.tmp_empty());
+}
+
+#[test]
+fn manifest_target_must_match_its_corpus_directory_before_fuzzing() {
+    let harness = Harness::new();
+    harness.install_ok_tools();
+    fs::write(
+        harness
+            .root
+            .path()
+            .join("fuzz/corpus/rfb_hextile/mismatch.bin"),
+        [0x20],
+    )
+    .unwrap();
+    fs::write(
+        harness.root.path().join("fuzz/corpus-manifest.json"),
+        r#"{
+  "version": 1,
+  "targets": ["rfb_handshake", "rfb_session", "rfb_zrle", "rfb_tight", "rfb_hextile"],
+  "seeds": [{
+    "target": "rfb_handshake",
+    "file": "corpus/rfb_hextile/mismatch.bin",
+    "sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+    "length": 1,
+    "category": "IoEof",
+    "behavior": "target mismatch"
+  }]
+}"#,
+    )
+    .unwrap();
+    let output = harness.command(&["30"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "fuzz-smoke: manifest-target-mismatch\n");
+    assert!(harness.fuzz_invocations().is_empty());
+    assert!(harness.tmp_empty());
+}
+
+#[test]
 fn uncached_dependencies_print_guidance_and_skip_targets() {
     let harness = Harness::new();
     harness.install_ok_tools();
