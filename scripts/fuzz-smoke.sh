@@ -33,49 +33,20 @@ cleanup_fuzz_run_dir() {
   esac
 }
 
-restore_committed_corpus() {
-  command -v python3 >/dev/null 2>&1 || return 0
-  if [[ ! -f "$ROOT/fuzz/corpus-manifest.json" ]]; then
-    return 0
-  fi
-  python3 - "$ROOT" <<'PY'
-import json, sys
-from pathlib import Path
-root = Path(sys.argv[1]).resolve()
-manifest = json.loads((root / "fuzz" / "corpus-manifest.json").read_text())
-keep = set()
-for seed in manifest.get("seeds", []):
-    relative = Path(seed["file"])
-    if relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 3:
-        continue
-    keep.add((root / "fuzz" / relative).resolve())
-corpus = (root / "fuzz" / "corpus").resolve()
-if corpus.is_dir():
-    for path in corpus.rglob("*"):
-        if path.is_file() and path.resolve() not in keep:
-            path.unlink()
-PY
-}
-
-
-cleanup_all() {
-  restore_committed_corpus
-  cleanup_fuzz_run_dir
-}
-
 on_int() {
-  cleanup_all
+  cleanup_fuzz_run_dir
   exit 130
 }
 
 on_term() {
-  cleanup_all
+  cleanup_fuzz_run_dir
   exit 143
 }
 
-trap cleanup_all EXIT
+trap cleanup_fuzz_run_dir EXIT
 trap on_int INT
 trap on_term TERM
+
 
 
 if ! command -v cargo-fuzz >/dev/null 2>&1; then
@@ -216,8 +187,10 @@ fi
 passed=0
 for target in "${TARGETS[@]}"; do
   start="$(date +%s)"
+  mkdir -p "$FUZZ_RUN_DIR/corpus/$target"
+  cp -R "fuzz/corpus/$target/." "$FUZZ_RUN_DIR/corpus/$target/"
   set +e
-  cargo +"$FUZZ_CHANNEL" fuzz run "$target" -- \
+  cargo +"$FUZZ_CHANNEL" fuzz run "$target" "$FUZZ_RUN_DIR/corpus/$target" -- \
     -max_total_time="$DURATION" \
     -max_len=65536 \
     -timeout=5 \

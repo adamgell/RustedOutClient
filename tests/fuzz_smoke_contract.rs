@@ -339,15 +339,48 @@ fn successful_sequencing_runs_five_targets_and_removes_temp() {
             invocations[index]
         );
         assert!(
+            invocations[index].contains(&format!("/corpus/{target}")),
+            "{}",
+            invocations[index]
+        );
+        assert!(
+            !invocations[index].contains("fuzz/corpus/"),
+            "{}",
+            invocations[index]
+        );
+        assert!(
             invocations[index].contains("-max_total_time=30"),
             "{}",
             invocations[index]
         );
     }
+
     let combined = stdout(&output);
     for target in TARGETS {
         assert!(combined.contains(&format!("PASS {target}")));
     }
     assert!(combined.contains("fuzz-smoke: 5/5 targets passed"));
+    assert!(harness.tmp_empty());
+}
+
+#[test]
+fn successful_run_leaves_source_corpus_untouched() {
+    let harness = Harness::new();
+    harness.install_ok_tools();
+    let output = harness.command(&["30"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    for target in TARGETS {
+        let dir = harness.root.path().join("fuzz/corpus").join(target);
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            0,
+            "source corpus {target} must stay empty"
+        );
+    }
     assert!(harness.tmp_empty());
 }
