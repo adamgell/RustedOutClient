@@ -49,6 +49,10 @@ if [ "$master" = true ]; then
         exit 255
     fi
     if [ -f "${socket}.never_master_ready" ]; then
+        if [ -f "${socket}.leave_control_socket_on_kill" ]; then
+            sleep 0.025
+            : > "$socket"
+        fi
         trap 'rm -f "$pid_file"; exit 0' TERM INT HUP
         while :; do
             sleep 0.05

@@ -342,13 +342,20 @@ impl SshMaster {
         }
 
         self.child.take();
-        if finish_capture(
-            self.stderr_task.take(),
-            cleanup_faults,
-            policy.pipe_drain_timeout,
-        )
-        .await
-        .is_err()
+        let socket_cleanup_failed =
+            match tokio::fs::remove_file(self.factory.control_socket()).await {
+                Ok(()) => false,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            };
+        if socket_cleanup_failed
+            || finish_capture(
+                self.stderr_task.take(),
+                cleanup_faults,
+                policy.pipe_drain_timeout,
+            )
+            .await
+            .is_err()
         {
             cleanup_result = Err(SshMasterError::CleanupFailed);
         }
@@ -752,6 +759,13 @@ mod tests {
             b"synthetic startup timeout\n",
         )
         .unwrap();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("leave_control_socket_on_kill"),
+            b"synthetic stale socket\n",
+        )
+        .unwrap();
 
         let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
         wait_for(&runtime.control_socket().with_extension("pid")).await;
@@ -769,6 +783,7 @@ mod tests {
         let argv = fs::read_to_string(runtime.control_socket().with_extension("argv")).unwrap();
         assert!(!argv.lines().any(|line| line == "exit"));
         assert!(!master.is_running());
+        assert!(!runtime.control_socket().exists());
     }
 
     #[cfg(unix)]
