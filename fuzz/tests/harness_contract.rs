@@ -210,10 +210,7 @@ fn verify_rejects_parent_directory_seed_paths() {
         }],
     };
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
-    assert_eq!(
-        failures,
-        vec!["FAIL rfb_handshake/secret.bin unsafe".to_string()]
-    );
+    assert_eq!(failures, vec!["FAIL seed unsafe".to_string()]);
 }
 
 fn canonical_manifest(
@@ -264,10 +261,7 @@ fn verify_length_mismatch_prints_token_without_lengths() {
         behavior: "unknown subtype bit 0x20".to_string(),
     });
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
-    assert_eq!(
-        failures,
-        vec!["FAIL rfb_hextile/invalid-subtype-bits.bin length-mismatch".to_string()]
-    );
+    assert_eq!(failures, vec!["FAIL seed length-mismatch".to_string()]);
 }
 
 #[test]
@@ -286,10 +280,7 @@ fn verify_hash_mismatch_prints_token_without_digests() {
         behavior: "unknown subtype bit 0x20".to_string(),
     });
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
-    assert_eq!(
-        failures,
-        vec!["FAIL rfb_hextile/invalid-subtype-bits.bin hash-mismatch".to_string()]
-    );
+    assert_eq!(failures, vec!["FAIL seed hash-mismatch".to_string()]);
 }
 
 #[test]
@@ -308,10 +299,7 @@ fn verify_transition_mismatch_prints_token_without_debug_collection() {
         behavior: "unknown subtype bit 0x20".to_string(),
     });
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
-    assert_eq!(
-        failures,
-        vec!["FAIL rfb_hextile/invalid-subtype-bits.bin transition-mismatch".to_string()]
-    );
+    assert_eq!(failures, vec!["FAIL seed transition-mismatch".to_string()]);
 }
 
 #[test]
@@ -329,10 +317,7 @@ fn verify_missing_seed_prints_token_without_path() {
         behavior: "missing".to_string(),
     });
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
-    assert_eq!(
-        failures,
-        vec!["FAIL rfb_hextile/absent.bin missing".to_string()]
-    );
+    assert_eq!(failures, vec!["FAIL seed missing".to_string()]);
 }
 
 #[test]
@@ -351,10 +336,7 @@ fn verify_unknown_target_does_not_echo_arbitrary_manifest_input() {
         behavior: "unknown subtype bit 0x20".to_string(),
     });
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
-    assert_eq!(
-        failures,
-        vec!["FAIL unknown-target/invalid-subtype-bits.bin unknown-target".to_string()]
-    );
+    assert_eq!(failures, vec!["FAIL seed unknown-target".to_string()]);
     assert!(!failures[0].contains("secret-ticket"));
     assert!(!failures[0].contains("/tmp"));
     assert!(!failures[0].contains('\n'));
@@ -376,10 +358,7 @@ fn verify_rejects_a_canonical_target_that_disagrees_with_the_file_directory() {
         behavior: "target mismatch".to_string(),
     });
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
-    assert_eq!(
-        failures,
-        vec!["FAIL rfb_handshake/invalid-subtype-bits.bin target-mismatch".to_string()]
-    );
+    assert_eq!(failures, vec!["FAIL seed target-mismatch".to_string()]);
 }
 
 #[test]
@@ -387,10 +366,7 @@ fn verify_invalid_basename_is_replaced_and_cannot_forge_a_second_line() {
     let root = tempfile::tempdir().unwrap();
     let manifest = canonical_manifest(hextile_seed("rfb_hextile/evil\nINJECT.bin"));
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
-    assert_eq!(
-        failures,
-        vec!["FAIL rfb_hextile/invalid-name filename".to_string()]
-    );
+    assert_eq!(failures, vec!["FAIL seed filename".to_string()]);
     assert!(!failures[0].contains("evil"));
     assert!(!failures[0].contains("INJECT"));
     assert!(!failures[0].contains('\n'));
@@ -410,10 +386,7 @@ fn verify_rejects_duplicate_file_strings_before_a_second_dispatch() {
         seeds: vec![seed.clone(), seed],
     };
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
-    assert_eq!(
-        failures,
-        vec!["FAIL rfb_hextile/invalid-subtype-bits.bin duplicate-file".to_string()]
-    );
+    assert_eq!(failures, vec!["FAIL seed duplicate-file".to_string()]);
 }
 
 #[cfg(unix)]
@@ -438,10 +411,7 @@ fn verify_rejects_distinct_names_that_resolve_to_one_file() {
         ],
     };
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
-    assert_eq!(
-        failures,
-        vec!["FAIL rfb_hextile/alias.bin duplicate-file".to_string()]
-    );
+    assert_eq!(failures, vec!["FAIL seed duplicate-file".to_string()]);
 }
 
 #[test]
@@ -509,10 +479,53 @@ fn verify_seeds_length_mismatch_stderr_is_token_only() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        stderr,
-        "FAIL rfb_hextile/invalid-subtype-bits.bin length-mismatch\n"
-    );
+    assert_eq!(stderr, "FAIL seed length-mismatch\n");
+}
+
+#[test]
+fn verify_seeds_failed_manifest_emits_no_seed_names_or_partial_success() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("rfb_hextile")).unwrap();
+    std::fs::write(root.path().join("rfb_hextile/customer-ticket.bin"), [0x20]).unwrap();
+    let manifest_path = root.path().join("candidate-manifest.json");
+    std::fs::write(
+        &manifest_path,
+        r#"{
+  "version": 1,
+  "targets": ["rfb_handshake", "rfb_session", "rfb_zrle", "rfb_tight", "rfb_hextile"],
+  "seeds": [{
+    "target": "rfb_hextile",
+    "file": "rfb_hextile/customer-ticket.bin",
+    "sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+    "length": 1,
+    "category": "Decoder",
+    "behavior": "valid first record"
+  }, {
+    "target": "rfb_hextile",
+    "file": "rfb_hextile/secret-session.bin",
+    "sha256": "00",
+    "length": 1,
+    "category": "Decoder",
+    "behavior": "failing second record"
+  }]
+}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_verify_seeds"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--root")
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "FAIL seed missing\n");
+    let combined = format!("{stdout}{stderr}");
+    assert!(!combined.contains("customer-ticket"));
+    assert!(!combined.contains("secret-session"));
 }
 
 #[test]
@@ -545,10 +558,7 @@ fn verify_seeds_unknown_target_stderr_does_not_echo_manifest_input() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        stderr,
-        "FAIL unknown-target/invalid-subtype-bits.bin unknown-target\n"
-    );
+    assert_eq!(stderr, "FAIL seed unknown-target\n");
     assert!(!stderr.contains("secret-ticket"));
     assert!(!stderr.contains("/tmp"));
     assert_eq!(stderr.lines().count(), 1);
@@ -583,7 +593,7 @@ fn verify_seeds_invalid_basename_stderr_is_one_fixed_line() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr, "FAIL rfb_hextile/invalid-name filename\n");
+    assert_eq!(stderr, "FAIL seed filename\n");
     assert!(!stderr.contains("evil"));
     assert!(!stderr.contains("INJECT"));
     assert_eq!(stderr.lines().count(), 1);

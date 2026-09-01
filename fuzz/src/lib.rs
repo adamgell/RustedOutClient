@@ -1568,6 +1568,7 @@ fn resolve_seed_path(root: &Path, file: &str) -> Result<(PathBuf, String), Strin
 
 pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec<String>> {
     let mut failures = Vec::new();
+    let mut passes = Vec::new();
     let mut seen_files = HashSet::new();
     let mut seen_paths = HashSet::new();
     if manifest.targets
@@ -1580,55 +1581,52 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
     }
     for seed in &manifest.seeds {
         if !seen_files.insert(seed.file.as_str()) {
-            failures.push(fail_seed(seed, "duplicate-file"));
+            failures.push(fail_seed("duplicate-file"));
             continue;
         }
         if !CANONICAL_TARGETS.contains(&seed.target.as_str()) {
-            failures.push(fail_seed(seed, "unknown-target"));
+            failures.push(fail_seed("unknown-target"));
             continue;
         }
         let (path, file_target) = match resolve_seed_path(root, &seed.file) {
             Ok(resolved) => resolved,
             Err(error) => {
-                failures.push(fail_seed(seed, &error));
+                failures.push(fail_seed(&error));
                 continue;
             }
         };
         if !seen_paths.insert(path.clone()) {
-            failures.push(fail_seed(seed, "duplicate-file"));
+            failures.push(fail_seed("duplicate-file"));
             continue;
         }
         if seed.target != file_target {
-            failures.push(fail_seed(seed, "target-mismatch"));
+            failures.push(fail_seed("target-mismatch"));
             continue;
         }
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(_) => {
-                failures.push(fail_seed(seed, "missing"));
+                failures.push(fail_seed("missing"));
                 continue;
             }
         };
         if bytes.len() as u64 != seed.length {
-            failures.push(fail_seed(seed, "length-mismatch"));
+            failures.push(fail_seed("length-mismatch"));
             continue;
         }
         let digest = sha256_hex(&bytes);
         if digest != seed.sha256 {
-            failures.push(fail_seed(seed, "hash-mismatch"));
+            failures.push(fail_seed("hash-mismatch"));
             continue;
         }
         match execute_target(&seed.target, &bytes) {
             Ok(execution) => {
                 if execution.category != seed.category {
-                    failures.push(fail_seed(
-                        seed,
-                        &format!(
-                            "expected {} got {}",
-                            seed.category.as_str(),
-                            execution.category.as_str()
-                        ),
-                    ));
+                    failures.push(fail_seed(&format!(
+                        "expected {} got {}",
+                        seed.category.as_str(),
+                        execution.category.as_str()
+                    )));
                     continue;
                 }
                 if let Some(expected) = &seed.transition {
@@ -1643,21 +1641,24 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
                         })
                         .collect();
                     if !missing.is_empty() {
-                        failures.push(fail_seed(seed, "transition-mismatch"));
+                        failures.push(fail_seed("transition-mismatch"));
                         continue;
                     }
                 }
-                println!(
+                passes.push(format!(
                     "PASS {}/{} {}",
                     seed.target,
                     seed_name(&seed.file),
                     execution.category.as_str()
-                );
+                ));
             }
-            Err(error) => failures.push(fail_seed(seed, &error)),
+            Err(error) => failures.push(fail_seed(&error)),
         }
     }
     if failures.is_empty() {
+        for pass in passes {
+            println!("{pass}");
+        }
         Ok(())
     } else {
         Err(failures)
@@ -1685,13 +1686,8 @@ fn is_allowed_seed_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn fail_seed(seed: &SeedRecord, reason: &str) -> String {
-    let target = CANONICAL_TARGETS
-        .iter()
-        .copied()
-        .find(|target| *target == seed.target)
-        .unwrap_or("unknown-target");
-    format!("FAIL {target}/{} {reason}", seed_name(&seed.file))
+fn fail_seed(reason: &str) -> String {
+    format!("FAIL seed {reason}")
 }
 
 pub fn load_manifest(path: &Path) -> Result<CorpusManifest, String> {
