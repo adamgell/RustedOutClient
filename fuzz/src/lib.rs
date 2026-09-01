@@ -455,10 +455,10 @@ pub fn execute_target(target: &str, data: &[u8]) -> Result<Execution, String> {
             #[cfg(not(fuzzing))]
             {
                 let _ = data;
-                Err("rfb_session verification requires --cfg fuzzing".to_string())
+                Err("fuzzing".to_string())
             }
         }
-        other => Err(format!("unknown target {other}")),
+        _ => Err("unknown".to_string()),
     }
 }
 
@@ -1524,7 +1524,7 @@ pub fn write_candidates(output_dir: &Path) -> Result<CorpusManifest, String> {
 fn resolve_seed_path(root: &Path, file: &str) -> Result<PathBuf, String> {
     let relative = Path::new(file);
     if relative.is_absolute() {
-        return Err(format!("seed path must be relative: {file}"));
+        return Err("relative".to_string());
     }
     if relative.components().any(|component| {
         matches!(
@@ -1532,7 +1532,7 @@ fn resolve_seed_path(root: &Path, file: &str) -> Result<PathBuf, String> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         )
     }) {
-        return Err(format!("seed path is unsafe: {file}"));
+        return Err("unsafe".to_string());
     }
     let parts: Vec<_> = relative
         .components()
@@ -1544,28 +1544,20 @@ fn resolve_seed_path(root: &Path, file: &str) -> Result<PathBuf, String> {
     let (target, name) = match parts.as_slice() {
         [target, name] => (*target, *name),
         ["corpus", target, name] => (*target, *name),
-        _ => {
-            return Err(format!(
-                "seed path must be <target>/<file> or corpus/<target>/<file>: {file}"
-            ))
-        }
+        _ => return Err("path".to_string()),
     };
     if !CANONICAL_TARGETS.contains(&target) {
-        return Err(format!("unknown target in seed path: {file}"));
+        return Err("unknown".to_string());
     }
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-        return Err(format!("invalid seed filename: {file}"));
+        return Err("filename".to_string());
     }
     let joined = root.join(relative);
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|_| "could not canonicalize corpus root".to_string())?;
+    let canonical_root = root.canonicalize().map_err(|_| "root".to_string())?;
     if joined.exists() {
-        let canonical = joined
-            .canonicalize()
-            .map_err(|_| format!("could not canonicalize {file}"))?;
+        let canonical = joined.canonicalize().map_err(|_| "canonical".to_string())?;
         if !canonical.starts_with(&canonical_root) {
-            return Err(format!("seed path escaped corpus root: {file}"));
+            return Err("escaped".to_string());
         }
         Ok(canonical)
     } else {
@@ -1587,44 +1579,36 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
         let path = match resolve_seed_path(root, &seed.file) {
             Ok(path) => path,
             Err(error) => {
-                failures.push(format!("FAIL {}/{} {error}", seed.target, seed.file));
+                failures.push(fail_seed(seed, &error));
                 continue;
             }
         };
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(_) => {
-                failures.push(format!("missing {}", seed.file));
+                failures.push(fail_seed(seed, "missing"));
                 continue;
             }
         };
         if bytes.len() as u64 != seed.length {
-            failures.push(format!(
-                "FAIL {}/{} expected length {} got {}",
-                seed.target,
-                seed.file,
-                seed.length,
-                bytes.len()
-            ));
+            failures.push(fail_seed(seed, "length-mismatch"));
             continue;
         }
         let digest = sha256_hex(&bytes);
         if digest != seed.sha256 {
-            failures.push(format!(
-                "FAIL {}/{} expected hash {} got {}",
-                seed.target, seed.file, seed.sha256, digest
-            ));
+            failures.push(fail_seed(seed, "hash-mismatch"));
             continue;
         }
         match execute_target(&seed.target, &bytes) {
             Ok(execution) => {
                 if execution.category != seed.category {
-                    failures.push(format!(
-                        "FAIL {}/{} expected {} got {}",
-                        seed.target,
-                        seed_name(&seed.file),
-                        seed.category.as_str(),
-                        execution.category.as_str()
+                    failures.push(fail_seed(
+                        seed,
+                        &format!(
+                            "expected {} got {}",
+                            seed.category.as_str(),
+                            execution.category.as_str()
+                        ),
                     ));
                     continue;
                 }
@@ -1640,13 +1624,7 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
                         })
                         .collect();
                     if !missing.is_empty() {
-                        failures.push(format!(
-                            "FAIL {}/{} expected transition {} got {:?}",
-                            seed.target,
-                            seed_name(&seed.file),
-                            expected,
-                            execution.transitions
-                        ));
+                        failures.push(fail_seed(seed, "transition-mismatch"));
                         continue;
                     }
                 }
@@ -1657,7 +1635,7 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
                     execution.category.as_str()
                 );
             }
-            Err(error) => failures.push(format!("FAIL {}/{} {error}", seed.target, seed.file)),
+            Err(error) => failures.push(fail_seed(seed, &error)),
         }
     }
     if failures.is_empty() {
@@ -1674,7 +1652,11 @@ fn seed_name(file: &str) -> &str {
         .unwrap_or(file)
 }
 
+fn fail_seed(seed: &SeedRecord, reason: &str) -> String {
+    format!("FAIL {}/{} {reason}", seed.target, seed_name(&seed.file))
+}
+
 pub fn load_manifest(path: &Path) -> Result<CorpusManifest, String> {
-    let bytes = fs::read(path).map_err(|_| format!("could not read {}", path.display()))?;
-    serde_json::from_slice(&bytes).map_err(|_| format!("could not parse {}", path.display()))
+    let bytes = fs::read(path).map_err(|_| "could not read manifest".to_string())?;
+    serde_json::from_slice(&bytes).map_err(|_| "could not parse manifest".to_string())
 }

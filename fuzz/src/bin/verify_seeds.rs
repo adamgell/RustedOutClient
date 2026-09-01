@@ -14,9 +14,9 @@ fn main() {
             "--root" => {
                 root = Some(required_value("--root", args.next()));
             }
-            other => {
+            _ => {
                 eprintln!("usage: verify_seeds [--manifest PATH] [--root DIR]");
-                eprintln!("unknown argument {other}");
+                eprintln!("unknown argument");
                 process::exit(2);
             }
         }
