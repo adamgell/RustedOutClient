@@ -769,6 +769,7 @@ mod tests {
 
         let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
         wait_for(&runtime.control_socket().with_extension("pid")).await;
+        wait_for(runtime.control_socket()).await;
         assert!(matches!(
             master
                 .check_with_test_policy(TestControlPolicy::short_startup())
