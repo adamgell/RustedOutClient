@@ -12,6 +12,8 @@ pub use client::{
     parse_extended_desktop_size, read_server_init, ExtendedDesktopSize, ServerInit, VncClient,
     VncOptions,
 };
+#[cfg(fuzzing)]
+pub use client::{fuzz_run_session, FuzzSessionObservation};
 pub use framebuffer::{CheckedRect, Framebuffer};
 pub use input::{ClipboardText, InputController, InputError, InputSink, CLIPBOARD_TEXT_LIMIT};
 pub use limits::{validate_framebuffer_layout, FramebufferLayout, ProtocolLimits};

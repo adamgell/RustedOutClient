@@ -792,6 +792,68 @@ where
     }
 }
 
+/// Bounded, payload-free evidence returned only to in-memory fuzz harnesses.
+#[cfg(fuzzing)]
+pub struct FuzzSessionObservation {
+    pub result: Result<(), RfbError>,
+    pub final_width: u16,
+    pub final_height: u16,
+    pub framebuffer_events: u32,
+    pub desktop_size_events: u32,
+    pub resize_outcome_events: u32,
+}
+
+/// Exercises the production session dispatcher without exposing its internal
+/// queue or clipboard types in ordinary builds.
+#[cfg(fuzzing)]
+pub async fn fuzz_run_session<S>(
+    reader: &mut RfbReader<S>,
+    framebuffer: &mut Framebuffer,
+) -> FuzzSessionObservation
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let limits = reader.limits();
+    let (connection, channels) = crate::connection::bounded_vnc_channels();
+    let mut events = EventQueue::new(channels.event_tx, limits);
+    let result = run_session(
+        reader,
+        framebuffer,
+        &mut events,
+        &channels.command_rx,
+        limits,
+        &channels.clipboard,
+        false,
+    )
+    .await;
+
+    let mut framebuffer_events = 0;
+    let mut desktop_size_events = 0;
+    let mut resize_outcome_events = 0;
+    for _ in 0..VNC_QUEUE_CAPACITY {
+        let Ok(event) = connection.event_rx.try_recv() else {
+            break;
+        };
+        match event {
+            VncEvent::FramebufferRects(_) => framebuffer_events += 1,
+            VncEvent::DesktopSize(_) => desktop_size_events += 1,
+            VncEvent::ResizeOutcome(_) => resize_outcome_events += 1,
+            VncEvent::DesktopName(_) | VncEvent::Error(_) | VncEvent::Disconnected => {}
+        }
+    }
+    let (final_width, final_height) = framebuffer.dimensions();
+    drop(connection);
+
+    FuzzSessionObservation {
+        result,
+        final_width,
+        final_height,
+        framebuffer_events,
+        desktop_size_events,
+        resize_outcome_events,
+    }
+}
+
 async fn run_session<S>(
     reader: &mut RfbReader<S>,
     framebuffer: &mut Framebuffer,
