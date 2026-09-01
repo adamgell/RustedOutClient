@@ -122,7 +122,12 @@ fn extended_desktop_size_distinguishes_pending_actual_rejected_and_unsupported()
     assert_eq!(
         parse_extended_desktop_size(1, 0, target, &exact, limits).unwrap(),
         ExtendedDesktopSize::Pending(target),
-        "client-reason success only means QEMU forwarded the request"
+        "client-reason success only means the server accepted the request"
+    );
+    assert_eq!(
+        parse_extended_desktop_size(1, 4, target, &exact, limits).unwrap(),
+        ExtendedDesktopSize::Pending(target),
+        "QEMU result 4 means the request was forwarded to a resize-capable display"
     );
     assert_eq!(
         parse_extended_desktop_size(0, 0, target, &exact, limits).unwrap(),

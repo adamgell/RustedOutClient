@@ -80,8 +80,8 @@
       ]
     },
     "rfb_session": {
-      "candidate_count": 15,
-      "minimized_count": 15,
+      "candidate_count": 16,
+      "minimized_count": 16,
       "final_filenames": [
         "bell.bin",
         "clipboard-invalid-utf8.bin",
@@ -90,6 +90,7 @@
         "colour-map-entries.bin",
         "desktop-size-resize.bin",
         "extended-desktop-size-malformed.bin",
+        "extended-desktop-size-qemu-forwarded.bin",
         "extended-desktop-size-valid.bin",
         "rect-count-over-limit.bin",
         "rect-out-of-bounds.bin",
@@ -99,7 +100,7 @@
         "valid-mixed-encodings.bin",
         "valid-raw-rect.bin"
       ],
-      "final_count": 15,
+      "final_count": 16,
       "files": [
         {
           "file": "bell.bin",
@@ -142,6 +143,12 @@
           "sha256": "4d880d677e58a8f0c7b5aa1c76600a4bd5b991fb367b96ca39bc8bf95390ee03",
           "length": 20,
           "category": "Protocol"
+        },
+        {
+          "file": "extended-desktop-size-qemu-forwarded.bin",
+          "sha256": "9e08e44ce429af4f3371dc3b920728a04c862792ea9841d55872651cc9a3b007",
+          "length": 36,
+          "category": "IoEof"
         },
         {
           "file": "extended-desktop-size-valid.bin",

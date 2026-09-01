@@ -162,6 +162,21 @@ continue working even when the guest cannot resize.
 An `Applied` result depends on the VM display device and guest video driver.
 RustedOutClient does not alter VM hardware or install guest drivers.
 
+QEMU's VNC server forwards `SetDesktopSize` only when the selected virtual
+display implements QEMU UI-info updates. A Proxmox `virtio` display maps to
+`virtio-vga` and provides that path; the legacy `default`/`std` VGA path
+rejects the request as an invalid screen layout. QEMU reports a forwarded
+request with ExtendedDesktopSize result `4`. RustedOutClient treats that reply
+as `Pending` even when it still carries the old framebuffer dimensions, and
+does not report `Applied` until a later server update matches the requested
+size. The guest must also have a working VirtIO GPU driver and honor the
+display event; capable VM hardware alone is not acceptance.
+
+This handling follows the
+[RFB ExtendedDesktopSize result contract](https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#extendeddesktopsize-pseudo-encoding)
+and the
+[QEMU 10.1.2 SetDesktopSize implementation](https://gitlab.com/qemu-project/qemu/-/blob/v10.1.2/ui/vnc.c).
+
 ## Clipboard
 
 Clipboard integration defaults off. Enabling it merely makes the explicit

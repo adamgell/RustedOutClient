@@ -895,7 +895,11 @@ where
         }
         let mut release_replacement = false;
         match outcome {
-            ResizeProtocolOutcome::Forwarded(size) if size == in_flight.requested => {
+            ResizeProtocolOutcome::Forwarded(_) => {
+                // QEMU's result-4 reply carries its current layout, not necessarily
+                // the requested layout. With one ordered request in flight, the
+                // reply is correlated to that request rather than to these fields.
+                let size = in_flight.requested;
                 if in_flight.actual_observed {
                     self.sessions[index].resize.in_flight = None;
                     self.sessions[index].resize.outcome = ResizeOutcomeState::Applied(size);
@@ -911,7 +915,7 @@ where
                     });
                 }
             }
-            ResizeProtocolOutcome::Forwarded(_) | ResizeProtocolOutcome::Unsupported => {
+            ResizeProtocolOutcome::Unsupported => {
                 self.sessions[index].resize.in_flight = None;
                 self.sessions[index].resize.stop_automatic_retries();
                 self.sessions[index].resize.outcome = ResizeOutcomeState::Unsupported;

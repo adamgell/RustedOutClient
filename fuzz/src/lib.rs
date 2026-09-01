@@ -787,6 +787,22 @@ fn session_candidates() -> Vec<Candidate> {
     push_u16(&mut extended, 32);
     push_u32(&mut extended, 0);
 
+    let mut qemu_forwarded = fb_update(1);
+    qemu_forwarded.extend_from_slice(&rect_header(
+        1,
+        4,
+        64,
+        64,
+        messages::encoding::EXTENDED_DESKTOP_SIZE,
+    ));
+    qemu_forwarded.extend_from_slice(&[1, 0, 0, 0]);
+    push_u32(&mut qemu_forwarded, 0);
+    push_u16(&mut qemu_forwarded, 0);
+    push_u16(&mut qemu_forwarded, 0);
+    push_u16(&mut qemu_forwarded, 64);
+    push_u16(&mut qemu_forwarded, 64);
+    push_u32(&mut qemu_forwarded, 0);
+
     let mut extended_malformed = fb_update(1);
     extended_malformed.extend_from_slice(&rect_header(
         0,
@@ -870,6 +886,14 @@ fn session_candidates() -> Vec<Candidate> {
             Some("desktop_size_event,framebuffer_resized"),
             "ExtendedDesktopSize one 32x32 screen",
             extended,
+        ),
+        candidate(
+            "rfb_session",
+            "extended-desktop-size-qemu-forwarded.bin",
+            Category::IoEof,
+            Some("resize_outcome_event"),
+            "QEMU ExtendedDesktopSize request forwarded result 4",
+            qemu_forwarded,
         ),
         candidate(
             "rfb_session",
@@ -1480,9 +1504,9 @@ pub fn validate_output_dir(path: &Path) -> Result<PathBuf, String> {
 pub fn write_candidates(output_dir: &Path) -> Result<CorpusManifest, String> {
     let output_dir = validate_output_dir(output_dir)?;
     let candidates = all_candidates();
-    if candidates.len() != 62 {
+    if candidates.len() != 63 {
         return Err(format!(
-            "expected 62 candidates, generated {}",
+            "expected 63 candidates, generated {}",
             candidates.len()
         ));
     }

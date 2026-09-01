@@ -157,6 +157,23 @@ fn session_resize_fixtures_require_desktop_size_and_framebuffer_resized() {
 
 #[cfg(fuzzing)]
 #[test]
+fn session_qemu_forwarded_resize_seed_emits_only_a_pending_outcome() {
+    let candidate = all_candidates()
+        .into_iter()
+        .find(|candidate| {
+            candidate.target == "rfb_session"
+                && candidate.name == "extended-desktop-size-qemu-forwarded.bin"
+        })
+        .expect("missing QEMU request-forwarded seed");
+    assert_eq!(candidate.transition, Some("resize_outcome_event"));
+
+    let execution = rustedoutclient_fuzz::execute_rfb_session(&candidate.bytes);
+    assert_eq!(execution.category.as_str(), "IoEof");
+    assert_eq!(execution.transitions, ["resize_outcome_event"]);
+}
+
+#[cfg(fuzzing)]
+#[test]
 fn session_dispatcher_consumes_a_cursor_rectangle_as_typed_eof() {
     let mut bytes = vec![0, 0, 0, 1];
     bytes.extend_from_slice(&0_u16.to_be_bytes());
@@ -179,7 +196,7 @@ fn typed_builders_are_deterministic_across_two_private_directories() {
     let second = tempfile::tempdir().unwrap();
     let first_manifest = write_candidates(first.path()).unwrap();
     let second_manifest = write_candidates(second.path()).unwrap();
-    assert_eq!(first_manifest.seeds.len(), 62);
+    assert_eq!(first_manifest.seeds.len(), 63);
     assert_eq!(first_manifest.seeds, second_manifest.seeds);
     for seed in &first_manifest.seeds {
         let left = std::fs::read(first.path().join(&seed.file)).unwrap();

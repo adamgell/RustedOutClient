@@ -147,6 +147,15 @@
     },
     {
       "target": "rfb_session",
+      "file": "corpus/rfb_session/extended-desktop-size-qemu-forwarded.bin",
+      "sha256": "9e08e44ce429af4f3371dc3b920728a04c862792ea9841d55872651cc9a3b007",
+      "length": 36,
+      "category": "IoEof",
+      "behavior": "QEMU ExtendedDesktopSize request forwarded result 4",
+      "transition": "resize_outcome_event"
+    },
+    {
+      "target": "rfb_session",
       "file": "corpus/rfb_session/extended-desktop-size-valid.bin",
       "sha256": "43cf5650136e363cf88054e3262b4dace9923bef0ab8f4d5987f01505019bce9",
       "length": 36,

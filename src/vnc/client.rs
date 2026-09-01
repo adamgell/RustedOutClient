@@ -317,8 +317,9 @@ pub fn parse_extended_desktop_size(
             "extended desktop size payload",
         ));
     }
+    // Result 4 is the asynchronous "Request forwarded" outcome used by QEMU.
     if !matches!(reason, 0..=2)
-        || (reason == 1 && !matches!(result, 0..=3))
+        || (reason == 1 && !matches!(result, 0..=4))
         || (reason != 1 && result != 0)
     {
         return Err(RfbError::new(
@@ -1973,10 +1974,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_parser_keeps_forwarded_resize_pending_until_later_server_size() {
+    async fn production_parser_keeps_qemu_forwarded_resize_pending_until_later_server_size() {
         let mut updates = vec![server_msg::FB_UPDATE, 0];
         updates.extend_from_slice(&1_u16.to_be_bytes());
-        push_one_screen_extended_size(&mut updates, 1, 0, 1_600, 900);
+        push_one_screen_extended_size(&mut updates, 1, 4, 640, 480);
         updates.extend_from_slice(&[server_msg::FB_UPDATE, 0]);
         updates.extend_from_slice(&1_u16.to_be_bytes());
         push_one_screen_extended_size(&mut updates, 0, 0, 1_600, 900);
@@ -2008,8 +2009,8 @@ mod tests {
             event_rx.try_recv(),
             Ok(VncEvent::ResizeOutcome(
                 crate::connection::ResizeProtocolOutcome::Forwarded(DesktopSize {
-                    width: 1_600,
-                    height: 900
+                    width: 640,
+                    height: 480
                 })
             ))
         ));
