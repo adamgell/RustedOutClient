@@ -114,7 +114,7 @@ pub fn emit_session_event(event: SessionLogEvent) {
             vmid = vmid.get(),
             width = size.width,
             height = size.height,
-            "dynamic resolution request timed out"
+            "dynamic resolution request timed out; the guest VirtIO resize helper may be missing or blocked"
         ),
         SessionLogEvent::Terminal {
             vmid,

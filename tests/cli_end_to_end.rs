@@ -52,6 +52,12 @@ fn inventory(stale: bool, second_status: VmStatus) -> InventorySnapshot {
 enum CommandFact {
     Open(VmId),
     Close(SessionId),
+    ViewportChanged {
+        session_id: SessionId,
+        width: u32,
+        height: u32,
+    },
+    RetryDynamicResolution(SessionId),
     Other,
 }
 
@@ -105,6 +111,18 @@ impl CliRuntime for SyntheticRuntime {
         let fact = match command {
             AppCommand::Open { vmid, .. } => CommandFact::Open(vmid),
             AppCommand::Close { session_id } => CommandFact::Close(session_id),
+            AppCommand::ViewportChanged {
+                session_id,
+                backing_width,
+                backing_height,
+            } => CommandFact::ViewportChanged {
+                session_id,
+                width: backing_width,
+                height: backing_height,
+            },
+            AppCommand::RetryDynamicResolution { session_id } => {
+                CommandFact::RetryDynamicResolution(session_id)
+            }
             _ => CommandFact::Other,
         };
         self.evidence.lock().unwrap().commands.push(fact);
@@ -191,6 +209,7 @@ async fn probe_uses_live_selection_observes_one_frame_closes_exact_session_then_
         Command::Probe {
             selector: "107".to_owned(),
             timeout_seconds: 30,
+            resize: None,
             json: true,
         },
         runtime,
@@ -216,6 +235,131 @@ async fn probe_uses_live_selection_observes_one_frame_closes_exact_session_then_
     assert_eq!(evidence.shutdowns, 1);
 }
 
+#[tokio::test]
+async fn probe_resize_waits_for_the_requested_guest_size_before_reporting_a_frame() {
+    let session_id = SessionId::new();
+    let target = DesktopSize::new(1_920, 1_080);
+    let mut resized = snapshot(session_id, SessionPhase::Ready);
+    resized.guest_size = Some(target);
+    resized.resize_status = ResizeStatus::Applied(target);
+    let (runtime, evidence) = SyntheticRuntime::new([
+        AppEvent::LiveInventory(inventory(false, VmStatus::Stopped)),
+        AppEvent::SessionChanged(snapshot(session_id, SessionPhase::Opening)),
+        AppEvent::SessionChanged(snapshot(session_id, SessionPhase::Ready)),
+        AppEvent::Framebuffer {
+            session_id,
+            rects: vec![FbRect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 1,
+                rgba: vec![0, 0, 0, 255, 9, 8, 7, 255],
+            }],
+        },
+        AppEvent::SessionChanged(resized),
+        AppEvent::Framebuffer {
+            session_id,
+            rects: vec![FbRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+                rgba: vec![9, 8, 7, 255],
+            }],
+        },
+        AppEvent::SessionChanged(snapshot(session_id, SessionPhase::Disconnecting)),
+        AppEvent::SessionChanged(snapshot(session_id, SessionPhase::Disconnected)),
+    ]);
+    let mut output = Vec::new();
+
+    let exit = execute_headless(
+        Command::Probe {
+            selector: "107".to_owned(),
+            timeout_seconds: 30,
+            resize: Some(target),
+            json: true,
+        },
+        runtime,
+        &mut output,
+    )
+    .await;
+
+    assert!(exit.success());
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["frame_width"], 1_920);
+    assert_eq!(value["frame_height"], 1_080);
+    assert_eq!(value["result"], "success");
+    assert_eq!(
+        evidence.lock().unwrap().commands,
+        [
+            CommandFact::Open(vmid(107)),
+            CommandFact::ViewportChanged {
+                session_id,
+                width: 1_920,
+                height: 1_080,
+            },
+            CommandFact::Close(session_id),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn probe_resize_retries_once_after_timeout_before_accepting_the_target() {
+    let session_id = SessionId::new();
+    let target = DesktopSize::new(1_920, 1_080);
+    let mut timed_out = snapshot(session_id, SessionPhase::Ready);
+    timed_out.resize_status = ResizeStatus::TimedOut;
+    let mut resized = snapshot(session_id, SessionPhase::Ready);
+    resized.guest_size = Some(target);
+    resized.resize_status = ResizeStatus::Applied(target);
+    let (runtime, evidence) = SyntheticRuntime::new([
+        AppEvent::LiveInventory(inventory(false, VmStatus::Stopped)),
+        AppEvent::SessionChanged(snapshot(session_id, SessionPhase::Ready)),
+        AppEvent::SessionChanged(timed_out),
+        AppEvent::SessionChanged(resized),
+        AppEvent::Framebuffer {
+            session_id,
+            rects: vec![FbRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+                rgba: vec![9, 8, 7, 255],
+            }],
+        },
+        AppEvent::SessionChanged(snapshot(session_id, SessionPhase::Disconnecting)),
+        AppEvent::SessionChanged(snapshot(session_id, SessionPhase::Disconnected)),
+    ]);
+    let mut output = Vec::new();
+
+    let exit = execute_headless(
+        Command::Probe {
+            selector: "107".to_owned(),
+            timeout_seconds: 30,
+            resize: Some(target),
+            json: true,
+        },
+        runtime,
+        &mut output,
+    )
+    .await;
+
+    assert!(exit.success());
+    assert_eq!(
+        evidence.lock().unwrap().commands,
+        [
+            CommandFact::Open(vmid(107)),
+            CommandFact::ViewportChanged {
+                session_id,
+                width: 1_920,
+                height: 1_080,
+            },
+            CommandFact::RetryDynamicResolution(session_id),
+            CommandFact::Close(session_id),
+        ]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn probe_timeout_is_typed_safe_nonzero_and_still_shuts_down() {
     let (runtime, evidence) = SyntheticRuntime::pending_after([AppEvent::LiveInventory(
@@ -227,6 +371,7 @@ async fn probe_timeout_is_typed_safe_nonzero_and_still_shuts_down() {
         Command::Probe {
             selector: "107".to_owned(),
             timeout_seconds: 1,
+            resize: None,
             json: true,
         },
         runtime,
@@ -309,6 +454,7 @@ async fn closed_probe_channel_fails_promptly_attempts_exact_close_and_shuts_down
             Command::Probe {
                 selector: "107".to_owned(),
                 timeout_seconds: 30,
+                resize: None,
                 json: true,
             },
             runtime,
@@ -340,6 +486,7 @@ async fn direct_runtime_timeout_overflow_is_typed_instead_of_panicking() {
             Command::Probe {
                 selector: "107".to_owned(),
                 timeout_seconds: u64::MAX,
+                resize: None,
                 json: true,
             },
             runtime,

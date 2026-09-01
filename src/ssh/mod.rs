@@ -14,6 +14,7 @@ pub use inventory::{
 };
 pub use master::{SshMaster, SshMasterError, VerifiedSshMaster};
 pub use proxy::{ProxyOpenError, ProxyTicket, TrustedSshProxy};
+pub(crate) use stream::proxy_cleanup_budget;
 pub use stream::{
     ProxyCleanupFailure, ProxyCleanupStage, ProxyIoFailure, ProxyIoStage, ProxyReapState,
     ProxyStream, ProxyStreamError,

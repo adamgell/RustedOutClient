@@ -28,8 +28,8 @@ use crate::{
     model::{PveProfile, VmId},
     runtime::RuntimeDir,
     ssh::{
-        InventoryError, InventorySnapshot, ProxyOpenError, SshCommandFactory, SshFailureKind,
-        SshMaster, SshMasterError, TrustedSshProxy,
+        proxy_cleanup_budget, InventoryError, InventorySnapshot, ProxyOpenError, SshCommandFactory,
+        SshFailureKind, SshMaster, SshMasterError, TrustedSshProxy,
     },
     vnc::{
         normalize_resize_request, ClipboardText, InputController, InputError, RfbError,
@@ -49,6 +49,7 @@ const MAX_ACTIVE_FALLBACK_SESSIONS: usize = 2;
 const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 const RESIZE_OUTCOME_DEADLINE: Duration = Duration::from_secs(2);
+const SESSION_CLOSE_OVERHEAD_BUDGET: Duration = Duration::from_secs(1);
 
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -1617,8 +1618,12 @@ fn graceful_close_timeout() -> Duration {
     }
     #[cfg(not(test))]
     {
-        Duration::from_secs(3)
+        production_graceful_close_timeout()
     }
+}
+
+fn production_graceful_close_timeout() -> Duration {
+    proxy_cleanup_budget().saturating_add(SESSION_CLOSE_OVERHEAD_BUDGET)
 }
 
 fn compose_release_and_transport(
@@ -1819,6 +1824,10 @@ mod tests {
 
     fn close_deadline() -> Instant {
         Instant::now() + super::graceful_close_timeout()
+    }
+
+    fn production_close_deadline() -> Instant {
+        Instant::now() + super::production_graceful_close_timeout()
     }
 
     fn production_session(
@@ -3207,6 +3216,82 @@ mod tests {
         assert_production_key_release_wire_order(ProductionCloseCase::Reconnect).await;
 
         assert_eq!(ProxyTicket::test_generation_count(), before + 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_close_budget_covers_proxy_forced_cleanup_after_graceful_ack() {
+        let _process_guard = crate::ssh::process_test_guard().await;
+        let runtime = RuntimeDir::create().unwrap();
+        let (_fixture_directory, executable) = fake_ssh();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("proxy_rfb_input_capture"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime
+                .control_socket()
+                .with_extension("proxy_input_capture_hang_after_keyup"),
+            b"synthetic fixture control\n",
+        )
+        .unwrap();
+        let factory =
+            SshCommandFactory::new_for_test(executable, runtime.control_socket().to_owned());
+        let mut master = SshMaster::start(factory, fixture_profile()).await.unwrap();
+        wait_for(&runtime.control_socket().with_extension("state")).await;
+        let mut verified = master.verify().await.unwrap();
+        let proxy = TrustedSshProxy::connect(&mut verified, VmId::new(107).unwrap())
+            .await
+            .unwrap();
+        let mut session = ProductionSession::spawn(proxy, OpenOptions::default()).unwrap();
+        let proxy_pid_path = runtime.control_socket().with_extension("proxy.pid");
+        wait_for(&proxy_pid_path).await;
+        let proxy_pid = helper_pid(&proxy_pid_path);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    session.try_recv().unwrap(),
+                    Some(SessionTransportEvent::Framebuffer(ref rects)) if !rects.is_empty()
+                ) {
+                    session.mark_ready();
+                    return;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("real stalled-shutdown session did not become ready");
+        session
+            .send_input(InputAction::Key {
+                down: true,
+                keysym: 0xffe3,
+            })
+            .unwrap();
+        wait_for_fixture_marker(
+            &runtime
+                .control_socket()
+                .with_extension("proxy.key-down-read"),
+        )
+        .await;
+
+        let result = timeout(
+            Duration::from_secs(7),
+            session.close(production_close_deadline()),
+        )
+        .await
+        .expect("production close exceeded its outer bound");
+
+        wait_for_fixture_marker(&runtime.control_socket().with_extension("proxy.key-up-read"))
+            .await;
+        assert_exact_pid_is_gone(proxy_pid).await;
+        master.close().await.unwrap();
+        assert!(
+            result.is_ok(),
+            "normal proxy kill/reap/drain was misreported as a cleanup failure: {result:?}"
+        );
     }
 
     #[cfg(unix)]

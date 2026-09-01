@@ -30,6 +30,12 @@ const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+pub(crate) fn proxy_cleanup_budget() -> Duration {
+    GRACEFUL_CLOSE_TIMEOUT
+        .saturating_add(REAP_TIMEOUT)
+        .saturating_add(PIPE_DRAIN_TIMEOUT)
+}
+
 #[cfg(test)]
 static ACTIVE_OWNER_TASKS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
