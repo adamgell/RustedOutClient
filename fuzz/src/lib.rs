@@ -1521,7 +1521,7 @@ pub fn write_candidates(output_dir: &Path) -> Result<CorpusManifest, String> {
     Ok(manifest)
 }
 
-fn resolve_seed_path(root: &Path, file: &str) -> Result<PathBuf, String> {
+fn resolve_seed_path(root: &Path, file: &str) -> Result<(PathBuf, String), String> {
     let relative = Path::new(file);
     if relative.is_absolute() {
         return Err("relative".to_string());
@@ -1559,9 +1559,9 @@ fn resolve_seed_path(root: &Path, file: &str) -> Result<PathBuf, String> {
         if !canonical.starts_with(&canonical_root) {
             return Err("escaped".to_string());
         }
-        Ok(canonical)
+        Ok((canonical, target.to_string()))
     } else {
-        Ok(joined)
+        Ok((joined, target.to_string()))
     }
 }
 
@@ -1576,13 +1576,21 @@ pub fn verify_manifest(manifest: &CorpusManifest, root: &Path) -> Result<(), Vec
         failures.push("manifest targets drifted from the canonical five".to_string());
     }
     for seed in &manifest.seeds {
-        let path = match resolve_seed_path(root, &seed.file) {
-            Ok(path) => path,
+        if !CANONICAL_TARGETS.contains(&seed.target.as_str()) {
+            failures.push(fail_seed(seed, "unknown-target"));
+            continue;
+        }
+        let (path, file_target) = match resolve_seed_path(root, &seed.file) {
+            Ok(resolved) => resolved,
             Err(error) => {
                 failures.push(fail_seed(seed, &error));
                 continue;
             }
         };
+        if seed.target != file_target {
+            failures.push(fail_seed(seed, "target-mismatch"));
+            continue;
+        }
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(_) => {
@@ -1653,7 +1661,12 @@ fn seed_name(file: &str) -> &str {
 }
 
 fn fail_seed(seed: &SeedRecord, reason: &str) -> String {
-    format!("FAIL {}/{} {reason}", seed.target, seed_name(&seed.file))
+    let target = CANONICAL_TARGETS
+        .iter()
+        .copied()
+        .find(|target| *target == seed.target)
+        .unwrap_or("unknown-target");
+    format!("FAIL {target}/{} {reason}", seed_name(&seed.file))
 }
 
 pub fn load_manifest(path: &Path) -> Result<CorpusManifest, String> {

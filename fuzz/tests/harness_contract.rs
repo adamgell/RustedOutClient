@@ -322,11 +322,11 @@ fn verify_missing_seed_prints_token_without_path() {
 }
 
 #[test]
-fn verify_unknown_target_prints_token_without_path() {
+fn verify_unknown_target_does_not_echo_arbitrary_manifest_input() {
     let root = tempfile::tempdir().unwrap();
     write_hextile_invalid_subtype(root.path());
     let manifest = canonical_manifest(rustedoutclient_fuzz::SeedRecord {
-        target: "bogus".to_string(),
+        target: "/tmp/secret-ticket\nINJECT".to_string(),
         file: "rfb_hextile/invalid-subtype-bits.bin".to_string(),
         sha256: "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068".to_string(),
         length: 1,
@@ -339,7 +339,32 @@ fn verify_unknown_target_prints_token_without_path() {
     let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
     assert_eq!(
         failures,
-        vec!["FAIL bogus/invalid-subtype-bits.bin unknown".to_string()]
+        vec!["FAIL unknown-target/invalid-subtype-bits.bin unknown-target".to_string()]
+    );
+    assert!(!failures[0].contains("secret-ticket"));
+    assert!(!failures[0].contains("/tmp"));
+    assert!(!failures[0].contains('\n'));
+}
+
+#[test]
+fn verify_rejects_a_canonical_target_that_disagrees_with_the_file_directory() {
+    let root = tempfile::tempdir().unwrap();
+    write_hextile_invalid_subtype(root.path());
+    let manifest = canonical_manifest(rustedoutclient_fuzz::SeedRecord {
+        target: "rfb_handshake".to_string(),
+        file: "rfb_hextile/invalid-subtype-bits.bin".to_string(),
+        sha256: "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068".to_string(),
+        length: 1,
+        category: rustedoutclient_fuzz::Category::IoEof,
+        transition: None,
+        fixture: None,
+        reason: None,
+        behavior: "target mismatch".to_string(),
+    });
+    let failures = rustedoutclient_fuzz::verify_manifest(&manifest, root.path()).unwrap_err();
+    assert_eq!(
+        failures,
+        vec!["FAIL rfb_handshake/invalid-subtype-bits.bin target-mismatch".to_string()]
     );
 }
 
@@ -412,6 +437,45 @@ fn verify_seeds_length_mismatch_stderr_is_token_only() {
         stderr,
         "FAIL rfb_hextile/invalid-subtype-bits.bin length-mismatch\n"
     );
+}
+
+#[test]
+fn verify_seeds_unknown_target_stderr_does_not_echo_manifest_input() {
+    let root = tempfile::tempdir().unwrap();
+    write_hextile_invalid_subtype(root.path());
+    let manifest_path = root.path().join("candidate-manifest.json");
+    std::fs::write(
+        &manifest_path,
+        r#"{
+  "version": 1,
+  "targets": ["rfb_handshake", "rfb_session", "rfb_zrle", "rfb_tight", "rfb_hextile"],
+  "seeds": [{
+    "target": "/tmp/secret-ticket\nINJECT",
+    "file": "rfb_hextile/invalid-subtype-bits.bin",
+    "sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+    "length": 1,
+    "category": "Decoder",
+    "behavior": "unknown target"
+  }]
+}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_verify_seeds"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--root")
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr,
+        "FAIL unknown-target/invalid-subtype-bits.bin unknown-target\n"
+    );
+    assert!(!stderr.contains("secret-ticket"));
+    assert!(!stderr.contains("/tmp"));
+    assert_eq!(stderr.lines().count(), 1);
 }
 
 #[cfg(fuzzing)]
