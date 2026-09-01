@@ -306,6 +306,52 @@ fn explicit_fallback_requires_configuration_and_targets_tab_before_running_inven
 }
 
 #[test]
+fn cached_running_rows_are_display_only_until_live_inventory_arrives() {
+    let mut configured = config();
+    configured.fallback_viewer = Some(PathBuf::from("/synthetic/vncviewer"));
+    let mut state = AppState::from_config(&configured);
+    state
+        .apply(AppEvent::CachedInventory(inventory(1_000, true)))
+        .unwrap();
+    state.select_inventory(Some(vmid(107)));
+
+    let cached_row = state
+        .inventory_rows()
+        .into_iter()
+        .find(|row| row.vmid == vmid(107))
+        .unwrap();
+    assert!(!cached_row.can_open());
+    let cached = state.action_availability();
+    assert!(!cached.open);
+    assert!(!cached.open_in_tigervnc);
+
+    let sink = FallbackSink::default();
+    let mut clipboard = RecordingClipboard::default();
+    assert_eq!(
+        dispatch_action(&mut state, &sink, &mut clipboard, UiAction::Open),
+        DispatchOutcome::NotAvailable
+    );
+    assert_eq!(
+        dispatch_action(&mut state, &sink, &mut clipboard, UiAction::OpenInTigerVnc,),
+        DispatchOutcome::NotAvailable
+    );
+    assert!(sink.commands.borrow().is_empty());
+
+    state
+        .apply(AppEvent::LiveInventory(inventory(2_000, false)))
+        .unwrap();
+    let live_row = state
+        .inventory_rows()
+        .into_iter()
+        .find(|row| row.vmid == vmid(107))
+        .unwrap();
+    assert!(live_row.can_open());
+    let live = state.action_availability();
+    assert!(live.open);
+    assert!(live.open_in_tigervnc);
+}
+
+#[test]
 fn dynamic_resolution_requires_a_ready_native_session_and_valid_usable_viewport() {
     let mut state = configured_state();
     let session_id = SessionId::new();

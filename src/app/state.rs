@@ -386,7 +386,7 @@ pub struct InventoryRow {
 
 impl InventoryRow {
     pub fn can_open(&self) -> bool {
-        self.status == VmStatus::Running
+        !self.stale && self.status == VmStatus::Running
     }
 }
 
@@ -693,11 +693,11 @@ impl AppState {
 
     pub(crate) fn selected_inventory_item(&self) -> Option<&VmInventoryItem> {
         let selected = self.selected_inventory?;
-        self.inventory
-            .as_ref()?
-            .vms
-            .iter()
-            .find(|item| item.vmid == selected)
+        let inventory = self.inventory.as_ref()?;
+        if inventory.stale {
+            return None;
+        }
+        inventory.vms.iter().find(|item| item.vmid == selected)
     }
 
     pub(crate) fn selected_resize_is_actionable(&self) -> bool {
