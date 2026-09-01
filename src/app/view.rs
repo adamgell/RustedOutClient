@@ -1481,6 +1481,9 @@ fn render_status_rail(ctx: &egui::Context, state: &AppState) {
                                 MUTED_TELEMETRY
                             },
                         );
+                        if let Some(error) = tab.last_error {
+                            status(ui, &format!("ERROR · {error:?}"), PROXMOX_ORANGE);
+                        }
                         status(ui, &format!("{:?}", tab.scale_mode), MUTED_TELEMETRY);
                         if let Some(size) = tab.snapshot.guest_size {
                             status(
@@ -1591,6 +1594,13 @@ fn render_diagnostics(ctx: &egui::Context, state: &mut AppState, actions: &mut V
         .open(&mut open)
         .resizable(true)
         .show(ctx, |ui| {
+            ui.label(
+                RichText::new(
+                    "Private rolling log: ~/Library/Application Support/RustedOutClient/diagnostics.log",
+                )
+                .monospace()
+                .color(MUTED_TELEMETRY),
+            );
             let mut diagnostics = state.diagnostics_summary();
             ui.add(
                 egui::TextEdit::multiline(&mut diagnostics)

@@ -1,12 +1,12 @@
-use std::time::Duration;
+use std::{io, time::Duration};
 
 use serde::Serialize;
 
 use crate::{
     connection::{DesktopSize, FbRect},
     model::{NodeName, VmId},
-    session::{PublicError, PublicErrorKind, SessionPhase},
-    vnc::{validate_framebuffer_layout, ProtocolLimits},
+    session::{PublicError, PublicErrorKind, RfbFailureDetail, SessionPhase},
+    vnc::{validate_framebuffer_layout, ProtocolLimits, RfbErrorKind, RfbPhase},
 };
 
 pub const UPSTREAM_BASE_SHA: &str = "999e00e3a3672efdbf8e8f307e7bd60875dee67e";
@@ -160,6 +160,7 @@ impl From<PublicErrorKind> for DiagnosticErrorCategory {
 pub struct DiagnosticFailure {
     category: DiagnosticErrorCategory,
     cleanup_failed: bool,
+    rfb_failure: Option<RfbFailureDetail>,
 }
 
 impl DiagnosticFailure {
@@ -167,6 +168,7 @@ impl DiagnosticFailure {
         Self {
             category: error.kind().into(),
             cleanup_failed: error.has_cleanup_failure(),
+            rfb_failure: error.rfb_failure(),
         }
     }
 
@@ -176,6 +178,133 @@ impl DiagnosticFailure {
 
     pub const fn cleanup_failed(self) -> bool {
         self.cleanup_failed
+    }
+
+    pub const fn rfb_failure(self) -> Option<RfbFailureDetail> {
+        self.rfb_failure
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticRfbPhase {
+    Banner,
+    SecurityTypes,
+    Authentication,
+    SecurityResult,
+    ServerInit,
+    Framebuffer,
+    Encoding,
+    Session,
+    EventQueue,
+    Cleanup,
+}
+
+impl From<RfbPhase> for DiagnosticRfbPhase {
+    fn from(phase: RfbPhase) -> Self {
+        match phase {
+            RfbPhase::Banner => Self::Banner,
+            RfbPhase::SecurityTypes => Self::SecurityTypes,
+            RfbPhase::Authentication => Self::Authentication,
+            RfbPhase::SecurityResult => Self::SecurityResult,
+            RfbPhase::ServerInit => Self::ServerInit,
+            RfbPhase::Framebuffer => Self::Framebuffer,
+            RfbPhase::Encoding => Self::Encoding,
+            RfbPhase::Session => Self::Session,
+            RfbPhase::EventQueue => Self::EventQueue,
+            RfbPhase::Cleanup => Self::Cleanup,
+        }
+    }
+}
+
+impl DiagnosticRfbPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Banner => "banner",
+            Self::SecurityTypes => "security_types",
+            Self::Authentication => "authentication",
+            Self::SecurityResult => "security_result",
+            Self::ServerInit => "server_init",
+            Self::Framebuffer => "framebuffer",
+            Self::Encoding => "encoding",
+            Self::Session => "session",
+            Self::EventQueue => "event_queue",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticRfbErrorKind {
+    ProtocolBanner,
+    SecurityAllowlist,
+    SecurityFailure,
+    Limit,
+    Allocation,
+    ServerInit,
+    Decoder,
+    Protocol,
+    Queue,
+    Io,
+}
+
+impl From<RfbErrorKind> for DiagnosticRfbErrorKind {
+    fn from(kind: RfbErrorKind) -> Self {
+        match kind {
+            RfbErrorKind::ProtocolBanner => Self::ProtocolBanner,
+            RfbErrorKind::SecurityAllowlist => Self::SecurityAllowlist,
+            RfbErrorKind::SecurityFailure => Self::SecurityFailure,
+            RfbErrorKind::Limit => Self::Limit,
+            RfbErrorKind::Allocation => Self::Allocation,
+            RfbErrorKind::ServerInit => Self::ServerInit,
+            RfbErrorKind::Decoder => Self::Decoder,
+            RfbErrorKind::Protocol => Self::Protocol,
+            RfbErrorKind::Queue => Self::Queue,
+            RfbErrorKind::Io => Self::Io,
+        }
+    }
+}
+
+impl DiagnosticRfbErrorKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProtocolBanner => "protocol_banner",
+            Self::SecurityAllowlist => "security_allowlist",
+            Self::SecurityFailure => "security_failure",
+            Self::Limit => "limit",
+            Self::Allocation => "allocation",
+            Self::ServerInit => "server_init",
+            Self::Decoder => "decoder",
+            Self::Protocol => "protocol",
+            Self::Queue => "queue",
+            Self::Io => "io",
+        }
+    }
+}
+
+const fn io_kind_name(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::NotFound => "not_found",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::ConnectionRefused => "connection_refused",
+        io::ErrorKind::ConnectionReset => "connection_reset",
+        io::ErrorKind::ConnectionAborted => "connection_aborted",
+        io::ErrorKind::NotConnected => "not_connected",
+        io::ErrorKind::AddrInUse => "address_in_use",
+        io::ErrorKind::AddrNotAvailable => "address_not_available",
+        io::ErrorKind::BrokenPipe => "broken_pipe",
+        io::ErrorKind::AlreadyExists => "already_exists",
+        io::ErrorKind::WouldBlock => "would_block",
+        io::ErrorKind::InvalidInput => "invalid_input",
+        io::ErrorKind::InvalidData => "invalid_data",
+        io::ErrorKind::TimedOut => "timed_out",
+        io::ErrorKind::WriteZero => "write_zero",
+        io::ErrorKind::Interrupted => "interrupted",
+        io::ErrorKind::Unsupported => "unsupported",
+        io::ErrorKind::UnexpectedEof => "unexpected_eof",
+        io::ErrorKind::OutOfMemory => "out_of_memory",
+        _ => "other",
     }
 }
 
@@ -196,6 +325,14 @@ pub struct DiagnosticRecord {
     error_category: Option<DiagnosticErrorCategory>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cleanup_failed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rfb_phase: Option<DiagnosticRfbPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rfb_error_kind: Option<DiagnosticRfbErrorKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rfb_io_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rfb_cleanup_io_kind: Option<&'static str>,
 }
 
 impl DiagnosticRecord {
@@ -207,6 +344,7 @@ impl DiagnosticRecord {
         child_exit_status: Option<ChildExitStatus>,
         failure: Option<DiagnosticFailure>,
     ) -> Self {
+        let rfb_failure = failure.and_then(DiagnosticFailure::rfb_failure);
         Self {
             app_version: env!("CARGO_PKG_VERSION"),
             upstream_base_sha: UPSTREAM_BASE_SHA,
@@ -219,6 +357,14 @@ impl DiagnosticRecord {
             child_exit_status,
             error_category: failure.map(DiagnosticFailure::category),
             cleanup_failed: failure.map(DiagnosticFailure::cleanup_failed),
+            rfb_phase: rfb_failure.map(|detail| detail.phase().into()),
+            rfb_error_kind: rfb_failure.map(|detail| detail.kind().into()),
+            rfb_io_kind: rfb_failure
+                .and_then(RfbFailureDetail::io_kind)
+                .map(io_kind_name),
+            rfb_cleanup_io_kind: rfb_failure
+                .and_then(RfbFailureDetail::cleanup_io_kind)
+                .map(io_kind_name),
         }
     }
 
@@ -253,6 +399,18 @@ impl DiagnosticRecord {
         }
         if let Some(cleanup_failed) = self.cleanup_failed {
             lines.push(format!("Cleanup failure: {cleanup_failed}"));
+        }
+        if let Some(phase) = self.rfb_phase {
+            lines.push(format!("RFB phase: {}", phase.as_str()));
+        }
+        if let Some(kind) = self.rfb_error_kind {
+            lines.push(format!("RFB error: {}", kind.as_str()));
+        }
+        if let Some(kind) = self.rfb_io_kind {
+            lines.push(format!("RFB I/O: {kind}"));
+        }
+        if let Some(kind) = self.rfb_cleanup_io_kind {
+            lines.push(format!("RFB cleanup I/O: {kind}"));
         }
         lines.join("\n")
     }

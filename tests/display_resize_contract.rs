@@ -423,6 +423,47 @@ fn latest_resize_status(events: Vec<AppEvent>, session_id: SessionId) -> Option<
 }
 
 #[tokio::test(start_paused = true)]
+async fn matching_existing_guest_size_is_applied_without_a_wire_request_or_timeout() {
+    let control = FakeControl::default();
+    let mut manager = SessionManager::spawn(
+        app_config(),
+        FakeBackend {
+            control: control.clone(),
+        },
+    );
+    settle().await;
+    drain(&mut manager);
+    let session_id = open_ready_session(&mut manager, &control, OpenOptions::default()).await;
+    drain(&mut manager);
+
+    manager
+        .send(AppCommand::ViewportChanged {
+            session_id,
+            backing_width: 1_024,
+            backing_height: 768,
+        })
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    settle().await;
+
+    assert!(
+        control.resize_requests().is_empty(),
+        "a viewport already matching the guest must not enter the RFB request pipeline"
+    );
+    assert_eq!(
+        latest_resize_status(drain(&mut manager), session_id),
+        Some(ResizeStatus::Applied(size(1_024, 768)))
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(3)).await;
+    settle().await;
+    assert!(control.resize_requests().is_empty());
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn worker_debounces_a_storm_keeps_one_in_flight_and_requires_an_actual_size_to_apply() {
     let control = FakeControl::default();
     let mut manager = SessionManager::spawn(

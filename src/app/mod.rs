@@ -374,15 +374,27 @@ impl eframe::App for RustedOutClient {
                 }
             }
         }
-        if self.has_active_session() {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        } else if self.manager.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(50));
+        if let Some(interval) = repaint_interval(self.has_active_session(), self.manager.is_some())
+        {
+            ctx.request_repaint_after(interval);
         }
     }
 }
 
 pub type RustedOutClientApp = RustedOutClient;
+
+const fn repaint_interval(has_active_session: bool, manager_present: bool) -> Option<Duration> {
+    if has_active_session {
+        // Remote updates are polled from the UI loop. Thirty frames per second
+        // keeps console input and display responsive without forcing a full
+        // OpenGL redraw every 16 ms while the guest is idle.
+        Some(Duration::from_millis(33))
+    } else if manager_present {
+        Some(Duration::from_millis(50))
+    } else {
+        None
+    }
+}
 
 fn load_application() -> (AppState, Option<SessionManager>) {
     let path = match default_config_path() {
@@ -427,10 +439,23 @@ mod close_coordinator_tests {
 
     use super::view::ViewResources;
     use super::{
-        configured_startup_command, dispatch_rendered_actions, AppCommand, AppCommandSink,
-        AppState, ClipboardAdapter, ClipboardAdapterError, CloseCoordinator, CommandQueueError,
-        NativeCloseAction, StartupAction, UiAction,
+        configured_startup_command, dispatch_rendered_actions, repaint_interval, AppCommand,
+        AppCommandSink, AppState, ClipboardAdapter, ClipboardAdapterError, CloseCoordinator,
+        CommandQueueError, NativeCloseAction, StartupAction, UiAction,
     };
+
+    #[test]
+    fn active_console_polling_is_bounded_to_thirty_frames_per_second() {
+        assert_eq!(
+            repaint_interval(true, true),
+            Some(std::time::Duration::from_millis(33))
+        );
+        assert_eq!(
+            repaint_interval(false, true),
+            Some(std::time::Duration::from_millis(50))
+        );
+        assert_eq!(repaint_interval(false, false), None);
+    }
 
     #[test]
     fn native_startup_preserves_configured_clipboard_and_absent_view_only_policy() {

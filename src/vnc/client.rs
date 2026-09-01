@@ -502,6 +502,7 @@ impl DirtyRegion {
 struct EventQueue {
     sender: Sender<VncEvent>,
     pending_dirty: Option<DirtyRegion>,
+    last_desktop_size: Option<DesktopSize>,
     limits: ProtocolLimits,
 }
 
@@ -510,6 +511,7 @@ impl EventQueue {
         Self {
             sender,
             pending_dirty: None,
+            last_desktop_size: None,
             limits,
         }
     }
@@ -523,6 +525,15 @@ impl EventQueue {
             TrySendError::Full(_) => Self::queue_error("event queue full"),
             TrySendError::Disconnected(_) => Self::queue_error("event queue disconnected"),
         })
+    }
+
+    fn send_desktop_size(&mut self, size: DesktopSize) -> Result<(), RfbError> {
+        if self.last_desktop_size == Some(size) {
+            return Ok(());
+        }
+        self.send_lossless(VncEvent::DesktopSize(size))?;
+        self.last_desktop_size = Some(size);
+        Ok(())
     }
 
     fn coalesce(&mut self, framebuffer: &Framebuffer, rects: &[FbRect]) -> Result<(), RfbError> {
@@ -756,10 +767,7 @@ where
     let mut framebuffer = Framebuffer::from_pixels(width, height, limits, pixels)
         .map_err(encoding::map_framebuffer_error)?;
     let mut events = EventQueue::new(event_tx, limits);
-    events.send_lossless(VncEvent::DesktopSize(DesktopSize::new(
-        framebuffer.width(),
-        framebuffer.height(),
-    )))?;
+    events.send_desktop_size(DesktopSize::new(framebuffer.width(), framebuffer.height()))?;
     events.send_lossless(VncEvent::DesktopName(desktop_name))?;
 
     send_fb_update_request(reader, false, 0, 0, width, height).await?;
@@ -1010,10 +1018,10 @@ where
                             }
                             events.flush_pending(framebuffer)?;
                             encoding::decode_desktop_size(framebuffer, width, height)?;
-                            events.send_lossless(VncEvent::DesktopSize(DesktopSize::new(
+                            events.send_desktop_size(DesktopSize::new(
                                 framebuffer.width(),
                                 framebuffer.height(),
-                            )))?;
+                            ))?;
                             send_fb_update_request(reader, false, 0, 0, width, height).await?;
                         }
                         enc::EXTENDED_DESKTOP_SIZE => {
@@ -1068,7 +1076,7 @@ where
                                         size.width,
                                         size.height,
                                     )?;
-                                    events.send_lossless(VncEvent::DesktopSize(size))?;
+                                    events.send_desktop_size(size)?;
                                     send_fb_update_request(
                                         reader,
                                         false,
@@ -1100,7 +1108,7 @@ where
                                         size.width,
                                         size.height,
                                     )?;
-                                    events.send_lossless(VncEvent::DesktopSize(size))?;
+                                    events.send_desktop_size(size)?;
                                     events.send_lossless(VncEvent::ResizeOutcome(
                                         ResizeProtocolOutcome::ServerUnsupported,
                                     ))?;
@@ -1501,7 +1509,7 @@ mod tests {
     use crate::{
         connection::{
             bounded_vnc_channels, ClipboardSlot, DesktopSize, FbRect, ResizeProtocolOutcome,
-            VncCommand, VncEvent,
+            VncCommand, VncEvent, VNC_QUEUE_CAPACITY,
         },
         ssh::ProxyTicket,
         vnc::{
@@ -1803,6 +1811,49 @@ mod tests {
         assert_eq!(error.io_kind(), Some(io::ErrorKind::UnexpectedEof));
         assert!(connection.event_rx.try_recv().is_err());
         assert_eq!(channels.clipboard.retained_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_unchanged_extended_sizes_preserve_pixels_and_do_not_exhaust_the_event_queue()
+    {
+        let mut wire = Vec::new();
+        for _ in 0..=VNC_QUEUE_CAPACITY {
+            wire.extend_from_slice(&[server_msg::FB_UPDATE, 0]);
+            wire.extend_from_slice(&1_u16.to_be_bytes());
+            push_one_screen_extended_size(&mut wire, 0, 0, 1, 1);
+        }
+
+        let (client, mut peer) = duplex(64 * 1024);
+        peer.write_all(&wire).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let limits = ProtocolLimits::default();
+        let mut reader = RfbReader::new(client, limits);
+        let mut framebuffer = Framebuffer::from_pixels(1, 1, limits, vec![7, 8, 9, 255]).unwrap();
+        let (connection, channels) = bounded_vnc_channels();
+        let mut events = EventQueue::new(channels.event_tx, limits);
+
+        let error = run_session(
+            &mut reader,
+            &mut framebuffer,
+            &mut events,
+            &channels.command_rx,
+            limits,
+            &channels.clipboard,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.phase(), RfbPhase::Session);
+        assert_eq!(error.kind(), RfbErrorKind::Io);
+        assert_eq!(error.io_kind(), Some(io::ErrorKind::UnexpectedEof));
+        assert_eq!(framebuffer.pixels(), [7, 8, 9, 255]);
+        let desktop_sizes = connection
+            .event_rx
+            .try_iter()
+            .filter(|event| matches!(event, VncEvent::DesktopSize(_)))
+            .count();
+        assert_eq!(desktop_sizes, 1);
     }
 
     #[tokio::test]

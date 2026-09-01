@@ -67,6 +67,23 @@ process before using the app. Runtime SSH uses strict host-key checking and
 fails closed for unknown or changed keys; RustedOutClient does not offer an
 accept-new or trust-bypass switch.
 
+### Private diagnostic log
+
+The application writes a bounded local event log beside the configuration:
+
+```text
+~/Library/Application Support/RustedOutClient/diagnostics.log
+```
+
+The file is mode `0600` inside the mode-`0700` application directory. It rolls
+to `diagnostics.log.1` before crossing one MiB. Events contain only typed
+connection phases, VMID, dimensions, resize outcomes, public error categories,
+and bounded RFB/OS error enums. They never contain SSH targets, VM names,
+tickets, passwords, fingerprints, raw stderr or I/O messages, process IDs,
+session UUIDs, clipboard text, guest pixels, or framebuffer payloads. The
+in-app **Session → Diagnostics** panel shows the same typed terminal failure
+detail and remains safe to copy.
+
 ### Legacy import boundary
 
 The source includes a narrow importer that can propose only `ssh_target`,

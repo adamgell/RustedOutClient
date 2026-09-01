@@ -24,6 +24,7 @@ use crate::{
     fallback::{
         FallbackError, FallbackErrorKind, FallbackPreferences, FallbackSession, TigerVncFallback,
     },
+    logging::{emit_session_event, SessionLogEvent},
     model::{PveProfile, VmId},
     runtime::RuntimeDir,
     ssh::{
@@ -563,6 +564,13 @@ where
             return;
         }
 
+        emit_session_event(SessionLogEvent::OpenRequested {
+            vmid,
+            dynamic_resolution: options.dynamic_resolution,
+            view_only: options.view_only,
+            clipboard_enabled: options.clipboard_enabled,
+        });
+
         let session_id = SessionId::new();
         let snapshot = SessionSnapshot::opening_with_options(
             session_id,
@@ -846,6 +854,10 @@ where
     }
 
     async fn handle_desktop_size(&mut self, index: usize, size: DesktopSize) {
+        emit_session_event(SessionLogEvent::GuestSize {
+            vmid: self.sessions[index].snapshot.vmid,
+            size,
+        });
         self.sessions[index].snapshot.guest_size = Some(size);
         let matching = self.sessions[index]
             .resize
@@ -880,6 +892,10 @@ where
     }
 
     async fn handle_resize_outcome(&mut self, index: usize, outcome: ResizeProtocolOutcome) {
+        emit_session_event(SessionLogEvent::ResizeOutcome {
+            vmid: self.sessions[index].snapshot.vmid,
+            outcome,
+        });
         if outcome == ResizeProtocolOutcome::ServerUnsupported {
             self.sessions[index].resize.cancel_unsent_work();
             self.sessions[index].resize.automatic_allowed = false;
@@ -968,6 +984,10 @@ where
                     record.resize.outcome = if request.actual_observed {
                         ResizeOutcomeState::Applied(request.requested)
                     } else {
+                        emit_session_event(SessionLogEvent::ResizeTimedOut {
+                            vmid: record.snapshot.vmid,
+                            size: request.requested,
+                        });
                         ResizeOutcomeState::TimedOut
                     };
                     if request.protocol == ResizeProtocolState::Forwarded {
@@ -1011,6 +1031,18 @@ where
         {
             return;
         }
+        if self.sessions[index].snapshot.guest_size == Some(requested) {
+            let resize = &mut self.sessions[index].resize;
+            if resize.explicit_retry_armed {
+                resize.automatic_allowed = true;
+            }
+            resize.explicit_retry_armed = false;
+            resize.pending_replacement = None;
+            resize.outcome = ResizeOutcomeState::Applied(requested);
+            resize.server_layout_unsupported = false;
+            self.emit_session_snapshot(index).await;
+            return;
+        }
         let result = self.sessions[index]
             .session
             .as_mut()
@@ -1018,6 +1050,10 @@ where
             .and_then(|session| session.request_resize(requested));
         match result {
             Ok(()) => {
+                emit_session_event(SessionLogEvent::ResizeRequested {
+                    vmid: self.sessions[index].snapshot.vmid,
+                    size: requested,
+                });
                 if self.sessions[index].resize.explicit_retry_armed {
                     self.sessions[index].resize.automatic_allowed = true;
                 }
@@ -1078,6 +1114,10 @@ where
             (Some(primary), Ok(())) => Err(primary),
             (None, result) => result,
         };
+        emit_session_event(SessionLogEvent::Terminal {
+            vmid: self.sessions[index].snapshot.vmid,
+            failure: result.err(),
+        });
         if let Err(error) = result {
             if !self.sessions[index].error_emitted {
                 self.sessions[index].error_emitted = true;
@@ -1105,6 +1145,12 @@ where
             previous,
             transitioned_at.saturating_duration_since(self.sessions[index].phase_started),
         );
+        emit_session_event(SessionLogEvent::PhaseChanged {
+            vmid: self.sessions[index].snapshot.vmid,
+            from: previous,
+            to: phase,
+            duration: transitioned_at.saturating_duration_since(self.sessions[index].phase_started),
+        });
         self.sessions[index].phase_started = transitioned_at;
         let session_id = self.sessions[index].snapshot.session_id;
         self.emit_critical(AppEvent::PhaseTiming { session_id, timing })
@@ -1689,6 +1735,7 @@ fn public_ssh_failure(kind: SshFailureKind) -> PublicError {
 }
 
 fn public_rfb_error(error: RfbError) -> PublicError {
+    let detail = crate::session::RfbFailureDetail::from_error(&error);
     let has_cleanup_failure = error.has_cleanup_failure();
     let kind = match (error.kind(), error.phase()) {
         (_, RfbPhase::Cleanup) => PublicErrorKind::Cleanup,
@@ -1700,7 +1747,7 @@ fn public_rfb_error(error: RfbError) -> PublicError {
         (RfbErrorKind::Queue, RfbPhase::EventQueue) => PublicErrorKind::Queue,
         _ => PublicErrorKind::RfbProtocol,
     };
-    let error = PublicError::new(kind);
+    let error = PublicError::new(kind).with_rfb_failure(detail);
     if has_cleanup_failure {
         error.with_cleanup_failure()
     } else {
