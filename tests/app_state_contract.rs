@@ -395,9 +395,10 @@ fn inventory_favorites_search_staleness_and_tab_identity_are_deterministic() {
     let rows = first.inventory_rows();
     assert_eq!(
         rows.iter().map(|row| row.vmid.get()).collect::<Vec<_>>(),
-        vec![107, 205, 300]
+        vec![107, 300, 205],
+        "running VMs must precede stopped VMs without losing favorite ordering within a group"
     );
-    assert!(rows[0].favorite && rows[1].favorite && !rows[2].favorite);
+    assert!(rows[0].favorite && !rows[1].favorite && rows[2].favorite);
     assert_eq!(rows[0].alias.as_deref(), Some("Primary Lab"));
     assert!(rows.iter().all(|row| row.stale));
     assert!(rows.iter().all(|row| row.observed_at_unix_ms == 1_000));
@@ -427,6 +428,15 @@ fn inventory_favorites_search_staleness_and_tab_identity_are_deterministic() {
         .apply(AppEvent::LiveInventory(inventory(2_000, false)))
         .unwrap();
     assert_eq!(first.inventory_age_source(), Some((2_000, false)));
+    assert_eq!(
+        first
+            .inventory_rows()
+            .iter()
+            .map(|row| row.vmid.get())
+            .collect::<Vec<_>>(),
+        vec![107, 300, 205],
+        "a live refresh must preserve the running-first ordering used by cached inventory"
+    );
 
     let session_a = SessionId::new();
     let session_b = SessionId::new();
@@ -496,6 +506,23 @@ fn inventory_favorites_search_staleness_and_tab_identity_are_deterministic() {
         .tabs()
         .iter()
         .all(|tab| tab.snapshot.session_id != session_b));
+}
+
+#[test]
+fn running_first_inventory_preserves_favorite_order_within_the_running_group() {
+    let mut snapshot = inventory(2_000, false);
+    for item in &mut snapshot.vms {
+        item.status = VmStatus::Running;
+    }
+    let mut state = AppState::from_config(&config());
+    state.apply(AppEvent::LiveInventory(snapshot)).unwrap();
+
+    let rows = state.inventory_rows();
+    assert_eq!(
+        rows.iter().map(|row| row.vmid.get()).collect::<Vec<_>>(),
+        vec![107, 205, 300]
+    );
+    assert!(rows[0].favorite && rows[1].favorite && !rows[2].favorite);
 }
 
 #[test]

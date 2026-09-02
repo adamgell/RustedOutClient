@@ -629,17 +629,24 @@ impl AppState {
                 })
             })
             .collect::<Vec<_>>();
-        rows.sort_by(
-            |left, right| match (self.favorite(left.vmid), self.favorite(right.vmid)) {
-                (Some(left_favorite), Some(right_favorite)) => left_favorite
-                    .sort_position
-                    .cmp(&right_favorite.sort_position)
-                    .then_with(|| left.vmid.cmp(&right.vmid)),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => left.vmid.cmp(&right.vmid),
-            },
-        );
+        rows.sort_by(|left, right| {
+            match (left.status, right.status) {
+                (VmStatus::Running, VmStatus::Stopped) => Ordering::Less,
+                (VmStatus::Stopped, VmStatus::Running) => Ordering::Greater,
+                _ => Ordering::Equal,
+            }
+            .then_with(|| {
+                match (self.favorite(left.vmid), self.favorite(right.vmid)) {
+                    (Some(left_favorite), Some(right_favorite)) => left_favorite
+                        .sort_position
+                        .cmp(&right_favorite.sort_position)
+                        .then_with(|| left.vmid.cmp(&right.vmid)),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => left.vmid.cmp(&right.vmid),
+                }
+            })
+        });
         rows
     }
 

@@ -1,0 +1,196 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "RustedOutClient: GUI",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--locked",
+          "--bin",
+          "rustedoutclient"
+        ],
+        "filter": {
+          "name": "rustedoutclient",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      },
+      "sourceLanguages": [
+        "rust"
+      ],
+      "terminal": "integrated"
+    },
+    {
+      "name": "RustedOutClient: Open Native VM",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--locked",
+          "--bin",
+          "rustedoutclient"
+        ],
+        "filter": {
+          "name": "rustedoutclient",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "open",
+        "${input:vmSelector}",
+        "--viewer",
+        "native"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      },
+      "sourceLanguages": [
+        "rust"
+      ],
+      "terminal": "integrated"
+    },
+    {
+      "name": "RustedOutClient: Open TigerVNC VM",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--locked",
+          "--bin",
+          "rustedoutclient"
+        ],
+        "filter": {
+          "name": "rustedoutclient",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "open",
+        "${input:vmSelector}",
+        "--viewer",
+        "tiger-vnc"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      },
+      "sourceLanguages": [
+        "rust"
+      ],
+      "terminal": "integrated"
+    },
+    {
+      "name": "RustedOutClient: Probe VM",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--locked",
+          "--bin",
+          "rustedoutclient"
+        ],
+        "filter": {
+          "name": "rustedoutclient",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "probe",
+        "${input:vmSelector}",
+        "--json"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      },
+      "sourceLanguages": [
+        "rust"
+      ],
+      "terminal": "integrated"
+    },
+    {
+      "name": "RustedOutClient: Probe VM Resize",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--locked",
+          "--bin",
+          "rustedoutclient"
+        ],
+        "filter": {
+          "name": "rustedoutclient",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "probe",
+        "${input:vmSelector}",
+        "--resize",
+        "${input:probeResolution}",
+        "--json"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      },
+      "sourceLanguages": [
+        "rust"
+      ],
+      "terminal": "integrated"
+    },
+    {
+      "name": "RustedOutClient: List VMs",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--locked",
+          "--bin",
+          "rustedoutclient"
+        ],
+        "filter": {
+          "name": "rustedoutclient",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "list"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      },
+      "sourceLanguages": [
+        "rust"
+      ],
+      "terminal": "integrated"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "vmSelector",
+      "type": "promptString",
+      "description": "VMID or unambiguous VM name"
+    },
+    {
+      "id": "probeResolution",
+      "type": "promptString",
+      "description": "Probe resolution in WIDTHxHEIGHT format",
+      "default": "1920x1080"
+    }
+  ]
+}

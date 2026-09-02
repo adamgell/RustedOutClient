@@ -24,7 +24,7 @@ use crate::{
     fallback::{
         FallbackError, FallbackErrorKind, FallbackPreferences, FallbackSession, TigerVncFallback,
     },
-    logging::{emit_session_event, SessionLogEvent},
+    logging::{emit_fallback_event, emit_session_event, FallbackLogEvent, SessionLogEvent},
     model::{PveProfile, VmId},
     runtime::RuntimeDir,
     ssh::{
@@ -606,6 +606,7 @@ where
     }
 
     async fn open_fallback(&mut self, vmid: VmId, preferences: FallbackPreferences) {
+        emit_fallback_event(FallbackLogEvent::OpenRequested { vmid, preferences });
         self.poll_fallbacks().await;
         if self.fallbacks.iter().any(|record| record.vmid == vmid)
             || self.fallbacks.len() >= MAX_ACTIVE_FALLBACK_SESSIONS
@@ -617,8 +618,15 @@ where
             return;
         }
         match self.backend.open_fallback(vmid, preferences).await {
-            Ok(session) => self.fallbacks.push(FallbackRecord { vmid, session }),
+            Ok(session) => {
+                emit_fallback_event(FallbackLogEvent::Opened { vmid });
+                self.fallbacks.push(FallbackRecord { vmid, session });
+            }
             Err(error) => {
+                emit_fallback_event(FallbackLogEvent::OpenFailed {
+                    vmid,
+                    failure: error,
+                });
                 self.emit_critical(AppEvent::Error(error)).await;
             }
         }
@@ -632,7 +640,11 @@ where
             }
         }
         for (index, result) in completed.into_iter().rev() {
-            self.fallbacks.remove(index);
+            let record = self.fallbacks.remove(index);
+            emit_fallback_event(FallbackLogEvent::Terminal {
+                vmid: record.vmid,
+                failure: result.err(),
+            });
             if let Err(error) = result {
                 self.emit_critical(AppEvent::Error(public_fallback_error(error)))
                     .await;
@@ -1780,6 +1792,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
     use tokio::sync::oneshot;
     use tokio::time::{sleep, timeout, Instant};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::{
         BackendFuture, ManagedSession, OpenOptions, ProductionSession, SessionBackend,
@@ -1788,7 +1801,10 @@ mod tests {
     use crate::{
         config::AppConfig,
         connection::{bounded_vnc_channels, FbRect, VncCommand, VncEvent, VNC_QUEUE_CAPACITY},
-        fallback::{FallbackPreferences, FallbackSession, TestFallbackCompletion},
+        fallback::{
+            FallbackError, FallbackErrorKind, FallbackPreferences, FallbackSession,
+            TestFallbackCompletion,
+        },
         model::{NodeName, PveProfile, SshTarget, VmId},
         runtime::RuntimeDir,
         session::{
@@ -1805,6 +1821,28 @@ mod tests {
     };
 
     struct DropProbe(Arc<AtomicBool>);
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedLogBuffer {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     impl Drop for DropProbe {
         fn drop(&mut self) {
@@ -3581,6 +3619,114 @@ mod tests {
         })
         .await
         .expect("typed manager error was not published")
+    }
+
+    #[tokio::test]
+    async fn fallback_lifecycle_emits_payload_free_typed_diagnostics() {
+        let output = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .with_env_filter("rustedoutclient::logging=info")
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let opens = Arc::new(Mutex::new(Vec::new()));
+        let native_opens = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let master_closed = Arc::new(AtomicBool::new(false));
+        let (session, completion) = FallbackSession::pending_for_test(Arc::clone(&closed));
+        let backend = FallbackAdmissionBackend {
+            sessions: VecDeque::from([session]),
+            opens: Arc::clone(&opens),
+            native_opens,
+            closed: vec![Arc::clone(&closed)],
+            master_closed: Arc::clone(&master_closed),
+        };
+        let mut manager = SessionManager::spawn(AppConfig::new(fixture_profile()), backend);
+        timeout(Duration::from_secs(2), async {
+            while !matches!(manager.recv().await, Some(AppEvent::LiveInventory(_))) {}
+        })
+        .await
+        .unwrap();
+
+        let vmid = VmId::new(107).unwrap();
+        manager
+            .send(AppCommand::OpenInTigerVnc {
+                vmid,
+                preferences: FallbackPreferences {
+                    fullscreen: true,
+                    view_only: true,
+                },
+            })
+            .await
+            .unwrap();
+        wait_for_fallback_opens(&opens, 1).await;
+        completion.finish(Err(FallbackError::new(FallbackErrorKind::ViewerSnapshot)));
+        let public = next_public_error(&mut manager).await;
+        assert_eq!(public.kind(), PublicErrorKind::ViewerFallback);
+        manager.shutdown().await.unwrap();
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(master_closed.load(Ordering::SeqCst));
+
+        let rendered = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(rendered.contains("event=\"fallback_open_requested\""));
+        assert!(rendered.contains("vmid=107"));
+        assert!(rendered.contains("fullscreen=true"));
+        assert!(rendered.contains("view_only=true"));
+        assert!(rendered.contains("event=\"fallback_opened\""));
+        assert!(rendered.contains("event=\"fallback_terminal_error\""));
+        assert!(rendered.contains("error_kind=ViewerSnapshot"));
+        assert!(rendered.contains("cleanup_failed=false"));
+    }
+
+    #[tokio::test]
+    async fn fallback_open_failure_logs_the_public_category_without_payloads() {
+        let output = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .with_env_filter("rustedoutclient::logging=info")
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let opens = Arc::new(Mutex::new(Vec::new()));
+        let master_closed = Arc::new(AtomicBool::new(false));
+        let backend = FallbackAdmissionBackend {
+            sessions: VecDeque::new(),
+            opens: Arc::clone(&opens),
+            native_opens: Arc::new(AtomicUsize::new(0)),
+            closed: Vec::new(),
+            master_closed: Arc::clone(&master_closed),
+        };
+        let mut manager = SessionManager::spawn(AppConfig::new(fixture_profile()), backend);
+        timeout(Duration::from_secs(2), async {
+            while !matches!(manager.recv().await, Some(AppEvent::LiveInventory(_))) {}
+        })
+        .await
+        .unwrap();
+
+        manager
+            .send(AppCommand::OpenInTigerVnc {
+                vmid: VmId::new(107).unwrap(),
+                preferences: FallbackPreferences::default(),
+            })
+            .await
+            .unwrap();
+        let public = next_public_error(&mut manager).await;
+        assert_eq!(public.kind(), PublicErrorKind::ViewerFallback);
+        manager.shutdown().await.unwrap();
+        assert!(master_closed.load(Ordering::SeqCst));
+
+        let rendered = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(rendered.contains("event=\"fallback_open_failed\""));
+        assert!(rendered.contains("vmid=107"));
+        assert!(rendered.contains("error_category=ViewerFallback"));
+        assert!(rendered.contains("cleanup_failed=false"));
+        assert!(!rendered.contains("path="));
+        assert!(!rendered.contains("ticket="));
     }
 
     #[tokio::test]

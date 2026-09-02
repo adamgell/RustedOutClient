@@ -16,6 +16,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::{
     config::config_directory,
     connection::{DesktopSize, ResizeProtocolOutcome},
+    fallback::{FallbackError, FallbackPreferences},
     model::VmId,
     session::{PublicError, SessionPhase},
 };
@@ -58,6 +59,69 @@ pub enum SessionLogEvent {
         vmid: VmId,
         failure: Option<PublicError>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FallbackLogEvent {
+    OpenRequested {
+        vmid: VmId,
+        preferences: FallbackPreferences,
+    },
+    Opened {
+        vmid: VmId,
+    },
+    OpenFailed {
+        vmid: VmId,
+        failure: PublicError,
+    },
+    Terminal {
+        vmid: VmId,
+        failure: Option<FallbackError>,
+    },
+}
+
+/// Emits fallback lifecycle fields whose types cannot carry paths, tickets,
+/// guest data, or inherited environment values.
+pub fn emit_fallback_event(event: FallbackLogEvent) {
+    match event {
+        FallbackLogEvent::OpenRequested { vmid, preferences } => tracing::info!(
+            event = "fallback_open_requested",
+            vmid = vmid.get(),
+            fullscreen = preferences.fullscreen,
+            view_only = preferences.view_only,
+            "TigerVNC fallback requested"
+        ),
+        FallbackLogEvent::Opened { vmid } => tracing::info!(
+            event = "fallback_opened",
+            vmid = vmid.get(),
+            "TigerVNC fallback opened"
+        ),
+        FallbackLogEvent::OpenFailed { vmid, failure } => tracing::warn!(
+            event = "fallback_open_failed",
+            vmid = vmid.get(),
+            error_category = ?failure.kind(),
+            cleanup_failed = failure.has_cleanup_failure(),
+            "TigerVNC fallback could not open"
+        ),
+        FallbackLogEvent::Terminal {
+            vmid,
+            failure: None,
+        } => tracing::info!(
+            event = "fallback_disconnected_cleanly",
+            vmid = vmid.get(),
+            "TigerVNC fallback disconnected"
+        ),
+        FallbackLogEvent::Terminal {
+            vmid,
+            failure: Some(failure),
+        } => tracing::warn!(
+            event = "fallback_terminal_error",
+            vmid = vmid.get(),
+            error_kind = ?failure.kind(),
+            cleanup_failed = failure.has_cleanup_failure(),
+            "TigerVNC fallback ended with a typed error"
+        ),
+    }
 }
 
 /// Emits only fields whose types cannot carry raw transport or guest data.

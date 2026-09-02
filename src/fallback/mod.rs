@@ -1270,6 +1270,11 @@ while :; do sleep 1; done
         let pid = channels.pid.await.unwrap();
         let mut viewer = TcpStream::connect(address).await.unwrap();
         channels.accepted.await.unwrap();
+        assert_eq!(
+            password_files(&runtime).len(),
+            1,
+            "TigerVNC must be able to read its password file after connecting"
+        );
         assert!(TcpStream::connect(address).await.is_err());
 
         viewer.write_all(b"viewer-bytes").await.unwrap();
@@ -1359,18 +1364,17 @@ while :; do sleep 1; done
         let mut banner = [0_u8; 12];
         client.read_exact(&mut banner).await.unwrap();
         assert_eq!(&banner, b"RFB 003.008\n");
+        assert_eq!(
+            password_files(&runtime).len(),
+            1,
+            "the password file must remain available during viewer authentication"
+        );
         client.write_all(b"x").await.unwrap();
-        timeout(Duration::from_secs(2), async {
-            while !password_files(&runtime).is_empty() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
         assert!(TcpStream::connect(address).await.is_err());
         drop(client);
 
         completed(&mut session).await.unwrap();
+        assert_password_files_are_gone(&runtime).await;
         assert_exact_pid_is_gone(viewer_pid).await;
         assert_exact_pid_is_gone(proxy_pid).await;
         assert_owner_is_gone().await;
@@ -1442,7 +1446,7 @@ while :; do sleep 1; done
 
         let runtime = RuntimeDir::create().unwrap();
         let fixture = ViewerFixture::new(ViewerBehavior::Hang);
-        let (proxy, _peer) = duplex(64);
+        let (proxy, peer) = duplex(64);
         let (mut policy, channels) = test_policy(Duration::from_secs(1), Duration::from_secs(1));
         policy.fail_password_remove = true;
         let mut session = open_test(
@@ -1456,7 +1460,11 @@ while :; do sleep 1; done
         .unwrap();
         let address = channels.bound.await.unwrap();
         let pid = channels.pid.await.unwrap();
-        let _viewer = TcpStream::connect(address).await.unwrap();
+        let viewer = TcpStream::connect(address).await.unwrap();
+        channels.accepted.await.unwrap();
+        assert_eq!(password_files(&runtime).len(), 1);
+        drop(viewer);
+        drop(peer);
         let error = completed(&mut session).await.unwrap_err();
         assert_eq!(error.kind(), FallbackErrorKind::PasswordFile);
         assert!(error.has_cleanup_failure());

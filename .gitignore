@@ -15,4 +15,5 @@ sessions.json
 Thumbs.db
 *.swp
 .idea/
-.vscode/
+.vscode/*
+!.vscode/launch.json

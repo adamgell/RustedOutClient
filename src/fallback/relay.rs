@@ -112,13 +112,6 @@ where
                     false,
                     Some(client),
                 )
-            } else if password_file.remove().is_err() {
-                (
-                    Err(FallbackError::new(FallbackErrorKind::PasswordFile).with_cleanup_failure()),
-                    Instant::now() + close_timeout,
-                    false,
-                    Some(client),
-                )
             } else {
                 #[cfg(test)]
                 if let Some(accepted) = accepted_signal.take() {
@@ -234,13 +227,17 @@ where
     } else {
         Ok(())
     };
-    let cleanup_failed = password_result.is_err()
+    let password_cleanup_failed = password_result.is_err();
+    let cleanup_failed = password_cleanup_failed
         || viewer_result.is_err()
         || snapshot_result.is_err()
         || proxy_result.is_err();
     match (primary, cleanup_failed) {
         (Err(error), true) => Err(error.with_cleanup_failure()),
         (Err(error), false) => Err(error),
+        (Ok(()), true) if password_cleanup_failed => {
+            Err(FallbackError::new(FallbackErrorKind::PasswordFile).with_cleanup_failure())
+        }
         (Ok(()), true) => Err(FallbackError::new(FallbackErrorKind::Cleanup)),
         (Ok(()), false) => Ok(()),
     }
